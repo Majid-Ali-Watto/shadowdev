@@ -1,0 +1,671 @@
+import hashlib
+import hmac
+import http.client
+import json
+import re
+import tempfile
+import threading
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+from shadowdev.app import build_app, database
+from shadowdev.config import Config
+from shadowdev.models.tokens import Tokens
+from shadowdev.models.user import Site
+from shadowdev.repositories.projects import ProjectRepository
+from shadowdev.repositories.runs import RunRepository
+from shadowdev.repositories.sessions import SessionRepository
+from shadowdev.repositories.users import UserRepository
+from shadowdev.server import Server, make_handler
+from shadowdev.services import accounts, projects as project_service, run_queue, runs
+from shadowdev.services.run_queue import RunQueue
+from shadowdev.services.webhook import matching_issue, verify_signature
+from tests.helpers import HOME, OFFICE, add_developer, add_project, join, make_cfg, repo
+
+ME = "acc-majid"
+ME_HOME = "acc-majid-home"  # the same person's personal Atlassian account
+
+
+def payload(event="jira:issue_created", key="MAR-12", type_="Bug", assignee=ME, site=OFFICE):
+    issue = {"key": key, "fields": {"issuetype": {"name": type_}, "assignee": {"accountId": assignee}}}
+    if site:
+        issue["self"] = f"{site.url}/rest/api/2/issue/10001"
+    return {"webhookEvent": event, "issue": issue}
+
+
+class Env(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = make_cfg(self.tmp)
+        db = database(self.cfg)
+        self.users, self.projects, self.runs = UserRepository(db), ProjectRepository(db), RunRepository(db)
+        self.sessions = SessionRepository(db)
+
+    def developer(self, account_id=ME, mode="bugs", project=None):
+        """A developer in the office project (created on first use), with office accounts."""
+        uid = add_developer(self.users, account_id)
+        self.market = getattr(self, "market", None) or add_project(self.projects, uid, "marketplace", ["MAR", "MARS"])
+        join(self.users, uid, project or self.market, account_id, mode)
+        return uid
+
+
+class WebhookTest(Env):
+    def test_signature(self):
+        body = b'{"a":1}'
+        good = "sha256=" + hmac.new(b"s3cret", body, hashlib.sha256).hexdigest()
+        self.assertTrue(verify_signature("s3cret", body, good))
+        self.assertFalse(verify_signature("other", body, good))
+        self.assertFalse(verify_signature("s3cret", body, None))
+        self.assertFalse(verify_signature("s3cret", body, good.removeprefix("sha256=")))
+
+    def test_routes_to_the_project_on_its_site_and_the_developer_of_that_jira_account(self):
+        me = self.developer(ME, mode="all")
+        billing = add_project(self.projects, me, "billing", ["BIL"], repos=[repo("billing")])
+        join(self.users, me, billing, ME, "all")
+        # The same person's personal Jira, GitHub and Claude, for a personal project that also uses MAR.
+        add_developer(self.users, ME_HOME, sites=(HOME,), user_id=me)
+        side = add_project(self.projects, me, "side", ["MAR"], site=HOME)
+        join(self.users, me, side, ME_HOME)
+        sara = self.developer("acc-sara")
+        add_developer(self.users, "acc-new")  # signed in, but in no project
+        match = lambda project=None, **kw: matching_issue(payload(**kw), self.projects, self.users, project)
+
+        self.assertEqual(match(), ("MAR-12", self.market, me))
+        self.assertEqual(match(key="MARS-3", assignee="acc-sara"), ("MARS-3", self.market, sara))
+        self.assertEqual(match(key="BIL-7", type_="Story"), ("BIL-7", billing, me))
+        self.assertEqual(match(event="jira:issue_updated", type_="bug")[0], "MAR-12")
+        # MAR-12 at home is the personal project's, for the personal Jira account only.
+        self.assertEqual(match(site=HOME, assignee=ME_HOME), ("MAR-12", side, me))
+        self.assertIsNone(match(site=HOME, assignee=ME))
+        self.assertIsNone(match(site=HOME, assignee=ME_HOME, type_="Story"))  # bugs only there
+        self.assertEqual(match(project=side, site=None, assignee=ME_HOME), ("MAR-12", side, me))  # per-project URL
+        self.assertIsNone(match(project=side, key="BIL-1", site=None, assignee=ME_HOME))
+        self.assertIsNone(match(site=Site("x", "https://elsewhere.atlassian.net", "x")))
+        self.assertIsNone(match(site=None))  # shared URL: the site must be known
+        self.assertIsNone(match(key="BIL-7", assignee="acc-sara"))  # not in billing
+        self.assertIsNone(match(type_="Task", assignee="acc-sara"))  # bugs only
+        self.assertIsNone(match(type_="Epic"))
+        self.assertIsNone(match(assignee="acc-new"))
+        self.assertIsNone(match(assignee="acc-unknown"))
+        self.assertIsNone(match(key="HR-1"))  # no project
+        self.assertIsNone(match(event="comment_created"))
+        # Keys become branch and directory names, so anything odd is rejected.
+        self.assertIsNone(match(key="MAR-1; rm -rf /"))
+        self.assertIsNone(match(key="../MAR-1"))
+        self.assertIsNone(match(key="MAR-1\n"))
+
+
+class WebTest(Env):
+    """Drives the real HTTP server through Jira OAuth sign-in, accounts and projects. Atlassian,
+    Jira, GitHub and Claude are faked."""
+
+    def setUp(self):
+        super().setUp()
+        self.queued = []
+        self.pool = mock.Mock(submit=lambda project, keys, uid: self.queued.append((project.name, keys, uid)))
+        self.oauth = mock.Mock()
+        self.oauth.authorize_url.side_effect = lambda state: f"https://auth.atlassian.com/authorize?state={state}"
+        self.oauth.exchange.return_value = Tokens("access-1", "refresh-1", time.time() + 3600)
+        self.oauth.sites.return_value = [OFFICE]
+        self.app = build_app(self.cfg, self.oauth, self.pool)
+        server = Server(("127.0.0.1", 0), make_handler(self.app))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.port = server.server_address[1]
+        self.cookies = {}
+
+        self.me_jira = {"accountId": ME, "displayName": "Majid", "accountType": "atlassian", "emailAddress": "majid@example.com"}
+        self.jira = mock.Mock()
+        self.jira.myself.side_effect = lambda: self.me_jira
+        self.jira.get_issue.side_effect = lambda key: {"fields": {"assignee": {"accountId": "acc-sara" if key.endswith("-9") else ME}}}
+        self.github = mock.Mock()
+        self.github.user.return_value = {"login": "majid", "id": 7, "name": "Majid Ali", "email": None}
+        self.github.can_push.return_value = True
+        self.github.repo.side_effect = lambda owner_repo: {"description": f"{owner_repo} on GitHub", "permissions": {"push": True}}
+        patches = [mock.patch.object(accounts, "GitHub", return_value=self.github),
+                   mock.patch.object(project_service, "GitHub", return_value=self.github),
+                   mock.patch.object(accounts, "Jira", return_value=self.jira),
+                   mock.patch.object(project_service, "jira_client", return_value=self.jira),
+                   mock.patch.object(runs, "jira_client", return_value=self.jira),
+                   mock.patch.object(accounts, "check_token"),
+                   mock.patch.object(project_service.gitops, "remote_branch_exists", lambda owner_repo, token, b: b == "develop")]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def request(self, method, path, form=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+        body = urlencode(form, doseq=True) if form is not None else None
+        cookie = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+        conn.request(method, path, body, {"Cookie": cookie, "Content-Type": "application/x-www-form-urlencoded",
+                                          **(headers or {})})
+        resp = conn.getresponse()
+        text = resp.read().decode()
+        conn.close()
+        self.set_cookies = resp.headers.get_all("Set-Cookie") or []
+        for c in self.set_cookies:
+            name, _, value = c.split(";")[0].partition("=")
+            if "Max-Age=0" in c:
+                self.cookies.pop(name, None)
+            else:
+                self.cookies[name] = value
+        self.headers = resp.headers
+        return resp.status, resp.getheader("Location"), text
+
+    def oauth_round_trip(self, location):
+        state = parse_qs(urlsplit(location).query)["state"][0]
+        return self.request("GET", f"/oauth/jira/callback?code=c0de&state={state}")
+
+    def sign_in(self):
+        status, location, _ = self.request("GET", "/login/jira")
+        self.assertEqual(status, 303)
+        return self.oauth_round_trip(location)
+
+    def csrf(self):
+        return re.search(r'name="csrf" value="([^"]+)"', self.request("GET", "/")[2]).group(1)
+
+    def me(self):
+        return self.users.get(self.users.owner_of(ME))
+
+    def test_sign_in_with_jira_oauth(self):
+        page = self.request("GET", "/")[2]
+        self.assertIn(f'href="{self.cfg.public_url}/login/jira"', page)
+
+        # The button sends the browser to Atlassian with a one-time state, also kept in a cookie.
+        status, location, _ = self.request("GET", "/login/jira")
+        self.assertTrue(location.startswith("https://auth.atlassian.com/authorize?state="))
+        state = parse_qs(urlsplit(location).query)["state"][0]
+        self.assertEqual(self.cookies["shadowdev_oauth_state"], f"signin.{state}")
+
+        # A callback with someone else's state, or a refusal, signs nobody in.
+        self.assertIn("expired or was started elsewhere",
+                      self.request("GET", "/oauth/jira/callback?code=c0de&state=forged")[2])
+        self.assertIn("not granted", self.request("GET", "/oauth/jira/callback?error=access_denied&state=x")[2])
+        self.oauth.exchange.assert_not_called()
+
+        status, location, _ = self.sign_in()
+        self.assertEqual((status, location), (303, self.cfg.public_url + "/"))
+        self.oauth.exchange.assert_called_once_with("c0de")
+        self.assertTrue(any("shadowdev_session=" in c and "HttpOnly; SameSite=Lax" in c for c in self.set_cookies))
+        self.assertNotIn("shadowdev_oauth_state", self.cookies)  # one-time
+        user = self.me()
+        self.assertEqual((user.display_name, user.email, list(user.sites)), ("Majid", "majid@example.com", [OFFICE.cloud_id]))
+        self.assertEqual(self.users.jira_tokens(user.jira_accounts[0].id).refresh_token, "refresh-1")
+        self.assertIn("Signed in as Majid (majid@example.com)", self.request("GET", "/")[2])
+
+    def test_sign_in_needs_a_site_this_server_allows(self):
+        self.oauth.sites.return_value = [Site("x", "https://someone-else.atlassian.net", "x")]
+        self.assertIn("None of the Jira sites you granted is enabled", self.sign_in()[2])
+        self.assertIsNone(self.users.owner_of(ME))
+
+    def test_personal_and_office_accounts_and_projects(self):
+        self.sign_in()
+        csrf = self.csrf()
+        self.assertIn("Not active yet", self.request("GET", "/")[2])
+
+        # Connect the personal Jira account: a CSRF-checked POST, then Atlassian, then back as the same developer.
+        status, location, _ = self.request("POST", "/jira/connect", {"csrf": csrf})
+        self.assertTrue(self.cookies["shadowdev_oauth_state"].startswith("connect."))
+        self.me_jira = {"accountId": ME_HOME, "displayName": "Majid", "accountType": "atlassian"}
+        self.oauth.sites.return_value = [HOME]
+        self.assertEqual(self.oauth_round_trip(location)[1], self.cfg.public_url + "/?ok=jira")
+        me = self.me()
+        self.assertEqual(([a.account_id for a in me.jira_accounts], set(me.sites)), ([ME, ME_HOME], {OFFICE.cloud_id, HOME.cloud_id}))
+        self.assertEqual(self.users.owner_of(ME_HOME), me.id)
+
+        # Forms without the session's CSRF token, or from another origin, are refused.
+        self.request("POST", "/github", {"csrf": "forged", "github_token": "gh"})
+        self.assertEqual(self.me().github_accounts, ())
+        self.assertEqual(self.request("POST", "/github", {"csrf": csrf, "github_token": "gh"},
+                                      {"Origin": "https://evil.example"})[0], 403)
+
+        # Office and personal GitHub and Claude accounts.
+        self.github.user.return_value = {"login": "majid-office", "id": 8, "name": "Majid Ali", "email": "majid@example.com"}
+        self.assertEqual(self.request("POST", "/github", {"csrf": csrf, "github_token": "gh-office", "github_label": "office"})[1],
+                         "/?ok=github")
+        self.github.user.return_value = {"login": "majid", "id": 7, "name": "Majid", "email": None}
+        self.request("POST", "/github", {"csrf": csrf, "github_token": "gh-home", "github_label": "personal"})
+        self.assertIn("not a Claude token", self.request("POST", "/claude", {"csrf": csrf, "claude_token": "abc"})[2])
+        # A token copied from a wrapped terminal line, with a space and a line break in it.
+        self.assertEqual(self.request("POST", "/claude", {"csrf": csrf, "claude_token": " sk-ant-oat01-ab cd\r\nef ",
+                                                          "claude_label": "office"})[1], "/?ok=claude")
+        self.assertEqual(accounts.check_token.call_args.args[0], "sk-ant-oat01-abcdef")
+        self.request("POST", "/claude", {"csrf": csrf, "claude_token": "sk-ant-api03-home", "claude_label": "personal"})
+        me = self.me()
+        gh = {g.label: g for g in me.github_accounts}
+        cl = {c.label: c for c in me.claude_accounts}
+        self.assertEqual((gh["office"].login, gh["office"].git_email, gh["personal"].git_email),
+                         ("majid-office", "majid@example.com", "7+majid@users.noreply.github.com"))
+        self.assertEqual((cl["office"].token, cl["personal"].token), ("sk-ant-oat01-abcdef", "sk-ant-api03-home"))
+        self.assertNotEqual(cl["office"].config_key, cl["personal"].config_key)
+
+        # Add the office project from the page: repo URLs pasted, names and descriptions filled in.
+        self.assertIn("Add a project", self.request("GET", "/project")[2])
+        form = {"csrf": csrf, "name": "marketplace", "cloud_id": OFFICE.cloud_id, "jira_keys": "mar, mars",
+                "github_account_id": gh["office"].id,
+                "repo_github": ["https://github.com/acme/market-place-fe.git", "acme/services", ""],
+                "repo_name": ["fe", "", ""], "repo_description": ["", "Python services", ""],
+                "repo_release_prefix": ["", "", ""], "repo_setup": ["npm ci", "", ""], "repo_test": ["npm test", "", ""]}
+        self.assertEqual(self.request("POST", "/project/save", form)[1], "/?ok=project")
+        (market,) = self.app.project_service.visible(self.me())
+        self.assertEqual((market.name, market.jira_projects, market.owner_id, market.cloud_id),
+                         ("marketplace", {"MAR", "MARS"}, me.id, OFFICE.cloud_id))
+        self.assertEqual([(r.name, r.github, r.description, r.setup, r.test) for r in market.repos],
+                         [("fe", "acme/market-place-fe", "acme/market-place-fe on GitHub", "npm ci", "npm test"),
+                          ("services", "acme/services", "Python services", None, None)])
+        self.assertEqual(self.github.can_push.call_count, 2)
+        # The owner joined it, with the GitHub account the repos were checked with.
+        self.assertEqual(self.me().subscriptions[market.id].github_account_id, gh["office"].id)
+        # The personal project uses MAR too, on the personal site; a second office one can't.
+        self.assertEqual(self.request("POST", "/project/save", {**form, "name": "side", "cloud_id": HOME.cloud_id,
+                                                                "jira_keys": "MAR", "github_account_id": gh["personal"].id})[1],
+                         "/?ok=project")
+        page = self.request("POST", "/project/save", {**form, "name": "copy", "jira_keys": "MAR"})[2]
+        self.assertIn("Jira project MAR is already handled by the project marketplace on office", page)
+        self.assertIn('value="copy"', page)  # the form keeps what was typed
+        side = next(p for p in self.app.project_service.visible(self.me()) if p.name == "side")
+
+        # Join each with its own accounts; base branches must exist.
+        join_form = lambda project, g, c, **kw: {"csrf": csrf, "project_id": project.id, "github_account_id": g.id,
+                                                 "claude_account_id": c.id, "mode": "all", **kw}
+        self.assertIn("does not exist", self.request("POST", "/project/join", join_form(
+            market, gh["office"], cl["office"], **{"base:fe": "no-such-branch"}))[2])
+        self.assertEqual(self.request("POST", "/project/join", join_form(
+            market, gh["office"], cl["office"], **{"base:fe": "develop"}))[1], "/?ok=joined")
+        self.request("POST", "/project/join", {**join_form(side, gh["personal"], cl["personal"]), "mode": "bugs"})
+        me = self.me()
+        office, personal = me.actor(market.id), me.actor(side.id)
+        self.assertEqual((office.jira_account_id, office.github.login, office.claude.label, office.mode, office.base_branches),
+                         (ME, "majid-office", "office", "all", {"fe": "develop"}))
+        self.assertEqual((personal.jira_account_id, personal.github.login, personal.claude.label, personal.mode),
+                         (ME_HOME, "majid", "personal", "bugs"))
+        page = self.request("GET", "/")[2]
+        self.assertIn("Active in 2 projects", page)
+        for secret in ("gh-office", "gh-home", "sk-ant-oat01-abcdef"):
+            self.assertNotIn(secret, page)  # tokens are never shown back
+        self.assertIn(f"/webhook?project={market.id}", page)  # the owner sees each project's webhook
+        self.assertIn(self.projects.webhook_secret(market.id), page)
+
+        # MAR-1 exists on both sites: the project decides.
+        self.assertIn("MAR-1 is in several of your projects", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "mar-1"})[2])
+        self.assertEqual(self.request("POST", "/run", {"csrf": csrf, "issue_keys": "mar-1", "project_id": market.id})[1], "/?ok=queued")
+        self.assertEqual(self.queued, [("marketplace", ["MAR-1"], me.id)])
+        self.queued.clear()
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1, MARS-2", "grouping": "together"})
+        self.assertEqual(self.queued, [("marketplace", ["MARS-1", "MARS-2"], me.id)])
+        self.assertIn("HR-1 is not in one of your projects", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "HR-1"})[2])
+        self.assertIn("Not an issue key: ../X", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 ../x"})[2])
+        # Only issues assigned to you (to the Jira account you joined with) can be queued.
+        self.queued.clear()
+        self.assertIn("MARS-9 is not assigned to you",
+                      self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-9"})[2])
+        self.assertEqual(self.queued, [])
+
+        # Removing the personal GitHub account leaves that project waiting for another one.
+        self.request("POST", "/github/remove", {"csrf": csrf, "github_account_id": gh["personal"].id})
+        self.assertIsNone(self.me().actor(side.id))
+        self.assertIn("Active in 1 project:", self.request("GET", "/")[2])
+        self.assertEqual(self.request("POST", "/project/leave", {"csrf": csrf, "project_id": side.id})[1], "/?ok=left")
+        self.assertNotIn(side.id, self.me().subscriptions)
+
+        self.request("POST", "/logout", {"csrf": csrf})
+        self.assertIn("Sign in with Jira", self.request("GET", "/")[2])
+
+    def test_only_the_owner_edits_and_only_site_members_see_a_project(self):
+        sara = add_developer(self.users, "acc-sara")
+        market = add_project(self.projects, sara, "marketplace", ["MAR"])
+        stranger = add_developer(self.users, "acc-home-only", sites=(HOME,))
+        self.sign_in()
+        csrf = self.csrf()
+        self.assertIn("marketplace", self.request("GET", "/")[2])  # same site: visible, joinable
+        self.assertNotIn(f"/project?id={market.id}", self.request("GET", "/")[2])
+        self.assertEqual(self.request("GET", f"/project?id={market.id}")[1], "/")
+        page = self.request("POST", "/project/save", {"csrf": csrf, "project_id": market.id, "name": "mine",
+                                                      "jira_keys": "MAR", "repo_github": ["acme/x"], "repo_test": ["true"]})[2]
+        self.assertIn("Only the project&#x27;s owner can change it", page)
+        self.assertIn("Only the project&#x27;s owner", self.request("POST", "/project/delete", {"csrf": csrf, "project_id": market.id})[2])
+        self.assertEqual(self.projects.get(market.id).name, "marketplace")
+        # A developer without access to the office site can't see or join it.
+        self.cookies = {"shadowdev_session": self.sessions.create(stranger)}
+        csrf = self.csrf()
+        self.assertNotIn("marketplace", self.request("GET", "/")[2])
+        self.assertIn("No such project", self.request("POST", "/project/join", {"csrf": csrf, "project_id": market.id})[2])
+
+    def test_no_access_to_project_repos_or_jira_is_reported(self):
+        self.sign_in()
+        csrf = self.csrf()
+        self.request("POST", "/github", {"csrf": csrf, "github_token": "gh-tok"})
+        github_id = self.me().github_accounts[0].id
+        self.github.can_push.side_effect = lambda owner_repo: owner_repo != "acme/billing"
+        def jira_project(key):
+            if key == "HID":
+                raise project_service.HTTPError("not found", 404)
+            return {}
+        self.jira.project.side_effect = jira_project
+        page = self.request("POST", "/project/save", {
+            "csrf": csrf, "name": "billing", "cloud_id": OFFICE.cloud_id, "jira_keys": "BIL, HID",
+            "github_account_id": github_id, "repo_github": ["acme/billing", "acme/ok"], "repo_test": ["true", "true"]})[2]
+        self.assertIn("GitHub account majid cannot push to acme/billing", page)
+        self.assertIn("cannot see Jira project HID on office", page)
+        self.assertEqual(self.app.project_service.visible(self.me()), [])
+        for bad, message in (("not a repo", "give the GitHub repo as owner/name"), ("../..", "give the GitHub repo")):
+            page = self.request("POST", "/project/save", {"csrf": csrf, "name": "x", "cloud_id": OFFICE.cloud_id,
+                                                          "jira_keys": "X1", "github_account_id": github_id,
+                                                          "repo_github": [bad], "repo_test": [""]})[2]
+            self.assertIn(message, page)
+
+    def test_connecting_another_developers_jira_account_is_refused(self):
+        add_developer(self.users, "acc-sara")
+        self.sign_in()
+        _, location, _ = self.request("POST", "/jira/connect", {"csrf": self.csrf()})
+        self.me_jira = {"accountId": "acc-sara", "displayName": "Sara", "accountType": "atlassian"}
+        self.assertIn("already connected to another ShadowDev account", self.oauth_round_trip(location)[2])
+        self.assertEqual(len(self.me().jira_accounts), 1)
+        # Connecting needs a signed-in browser: a "connect" state without a session signs nobody in.
+        self.cookies.pop("shadowdev_session")
+        self.cookies["shadowdev_oauth_state"] = "connect.abc"
+        self.assertIn("expired or was started elsewhere", self.request("GET", "/oauth/jira/callback?code=c&state=abc")[2])
+
+    def test_pages_let_browsers_send_their_origin(self):
+        # With Referrer-Policy: no-referrer, browsers send "Origin: null" on form posts, which the
+        # Origin check rejects: no form would work.
+        self.sign_in()
+        csrf = self.csrf()
+        self.assertEqual(self.headers["Referrer-Policy"], "same-origin")
+        self.assertEqual(self.request("POST", "/github", {"csrf": csrf, "github_token": "gh"}, {"Origin": "null"})[0], 403)
+        self.assertEqual(self.request("POST", "/github", {"csrf": csrf, "github_token": "gh"},
+                                      {"Origin": f"http://127.0.0.1:{self.port}", "Host": f"127.0.0.1:{self.port}"})[0], 303)
+        # Behind a proxy that rewrites Host, the public URL is the origin.
+        self.assertEqual(self.request("POST", "/github", {"csrf": csrf, "github_token": "gh"},
+                                      {"Origin": self.cfg.public_url, "Host": "127.0.0.1:9"})[0], 303)
+
+    def test_bad_requests_are_answered_not_crashed(self):
+        self.sign_in()
+        self.assertEqual(self.request("POST", "/github", headers={"Content-Length": "x"})[0], 413)
+        with mock.patch.object(self.app.accounts, "set_paused", side_effect=RuntimeError("bug")), \
+                self.assertLogs("shadowdev", "ERROR"):
+            self.assertEqual(self.request("POST", "/pause", {"csrf": self.csrf()})[0], 500)
+        self.assertEqual(self.request("GET", "/")[0], 200)
+
+    def test_delete_account_stops_runs_and_removes_everything(self):
+        self.sign_in()
+        uid = self.me().id
+        self.request("POST", "/delete-account", {"csrf": self.csrf()})
+        self.pool.stop_runs.assert_called_once_with(uid)
+        self.assertIsNone(self.users.get(uid))
+        self.assertIn("Sign in with Jira", self.request("GET", "/")[2])
+
+    def test_stop_button(self):
+        self.sign_in()
+        csrf = self.csrf()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        run_id = self.runs.add("MAR-1", uid, market.id, "marketplace")
+        page = self.request("GET", "/")[2]
+        self.assertIn(f'name="run_id" value="{run_id}"', page)  # queued: has a Stop button
+        self.assertIn(f'href="{OFFICE.url}/browse/MAR-1"', page)
+        self.assertEqual(self.request("POST", "/stop", {"csrf": csrf, "run_id": str(run_id)})[1], "/?ok=stopping")
+        self.pool.stop_run.assert_called_once_with(run_id, uid)
+        self.pool.stop_run.return_value = False
+        self.assertIn("already finished, or is not yours", self.request("POST", "/stop", {"csrf": csrf, "run_id": "999"})[2])
+        self.assertIn("already finished, or is not yours", self.request("POST", "/stop", {"csrf": csrf, "run_id": "x"})[2])
+        self.runs.update(run_id, "done", "ok")
+        self.assertNotIn(f'name="run_id" value="{run_id}"', self.request("GET", "/")[2])  # finished: no button
+
+    def test_pause_and_resume(self):
+        self.sign_in()
+        csrf = self.csrf()
+        uid = self.me().id
+        add_developer(self.users, ME, user_id=uid)  # office GitHub and Claude accounts
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        join(self.users, uid, market, ME)
+        self.assertIn("Pause automation", self.request("GET", "/")[2])
+
+        self.assertEqual(self.request("POST", "/pause", {"csrf": csrf})[1], "/?ok=paused")
+        page = self.request("GET", "/")[2]
+        self.assertIn("Paused: nothing runs for you", page)
+        self.assertIn("Resume automation", page)
+        self.assertTrue(self.me().paused)
+        self.assertIn(market.id, self.me().subscriptions)  # settings kept
+        self.assertIsNone(matching_issue(payload(), self.projects, self.users))  # webhooks ignored
+        self.assertIn("automation is paused", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-1"})[2])
+        self.assertEqual(self.queued, [])
+
+        self.assertEqual(self.request("POST", "/resume", {"csrf": csrf})[1], "/?ok=resumed")
+        self.assertFalse(self.me().paused)
+        self.assertIsNotNone(matching_issue(payload(), self.projects, self.users))
+
+
+def fake_process_factory(record=None, block: threading.Event | None = None):
+    def fake_process(keys, project, actor, cfg, jira, github, cancel=None):
+        if record is not None:
+            record.append((actor.display_name, tuple(keys)))
+        if block:
+            while not cancel.cancelled and not block.is_set():
+                time.sleep(0.01)
+            cancel.check()
+        return "done", "ok"
+    return fake_process
+
+
+class QueueEnv(Env):
+    def pool(self, fake_process, max_parallel_runs=5, start=True):
+        cfg = Config(**{**self.cfg.__dict__, "max_parallel_runs": max_parallel_runs})
+        pool = RunQueue(cfg, self.users, self.projects, self.runs, mock.Mock())
+        for p in (mock.patch.object(run_queue, "process_issues", fake_process), mock.patch.object(run_queue, "jira_client")):
+            p.start()
+            self.addCleanup(p.stop)
+        if start:
+            pool.start()
+        return pool
+
+    def wait_for(self, condition):
+        for _ in range(250):
+            if condition():
+                return
+            time.sleep(0.02)
+        self.fail("timed out")
+
+
+class RunQueueTest(QueueEnv):
+    def test_runs_up_to_the_limit_in_parallel_and_never_one_issue_twice(self):
+        me = self.developer()
+        running, peak, lock, release = set(), [0], threading.Lock(), threading.Event()
+
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None):
+            with lock:
+                running.add(tuple(keys))
+                peak[0] = max(peak[0], len(running))
+            release.wait(5)
+            with lock:
+                running.discard(tuple(keys))
+            return "done", "ok"
+
+        pool = self.pool(fake_process)
+        for n in range(1, 7):
+            self.assertIsNone(pool.submit(self.market, [f"MAR-{n}"], me))
+        self.assertEqual(pool.submit(self.market, ["MAR-1"], me), "already queued or running: MAR-1")
+        self.assertIn("MAR-2", pool.submit(self.market, ["MAR-7", "MAR-2"], me))  # MAR-2 is in another job
+        self.wait_for(lambda: len(running) == 5)  # the sixth waits for a free slot
+        release.set()
+        done = lambda: all(r["status"] == "done" for r in self.runs.recent(me))
+        self.wait_for(done)
+        self.assertEqual(peak[0], 5)
+        self.assertEqual(sorted(r["issue_key"] for r in self.runs.recent(me)), [f"MAR-{n}" for n in range(1, 7)])
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))  # finished, so it can run again
+        self.wait_for(done)
+
+    def test_the_same_key_on_two_sites_runs_at_once(self):
+        me = self.developer()
+        add_developer(self.users, ME_HOME, sites=(HOME,), user_id=me)
+        side = add_project(self.projects, me, "side", ["MAR"], site=HOME)
+        join(self.users, me, side, ME_HOME)
+        pool = self.pool(fake_process_factory(block=threading.Event()), start=False)
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.assertIsNone(pool.submit(side, ["MAR-1"], me))
+
+    def test_developers_take_turns(self):
+        me, sara = self.developer(), self.developer("acc-sara")
+        order = []
+        pool = self.pool(fake_process_factory(order), max_parallel_runs=1, start=False)
+        for n in (1, 2, 3):
+            pool.submit(self.market, [f"MAR-{n}"], me)
+        pool.submit(self.market, ["MAR-9"], sara)
+        pool.start()
+        self.wait_for(lambda: len(order) == 4)
+        self.assertEqual([keys[0] for _, keys in order], ["MAR-1", "MAR-9", "MAR-2", "MAR-3"])
+
+    def test_queued_runs_survive_a_restart(self):
+        me = self.developer()
+        waiting = self.runs.add("MAR-1, MAR-2", me, self.market.id, "marketplace")  # left by the previous server
+        gone = self.runs.add("MAR-3", me, None, "deleted project")
+        ran = []
+        self.pool(fake_process_factory(ran))
+        self.wait_for(lambda: ran)
+        self.assertEqual(ran, [(ME, ("MAR-1", "MAR-2"))])
+        status = {r["id"]: (r["status"], r["message"]) for r in self.runs.recent(me)}
+        self.wait_for(lambda: self.runs.recent(me)[-1]["status"] == "done")
+        self.assertEqual(status[gone][0], "failed")
+        self.assertIn("project was deleted", status[gone][1])
+        self.assertIn(waiting, status)
+
+    def test_runs_use_the_project_and_accounts_as_they_are_when_they_start(self):
+        me = self.developer()
+        seen = []
+        pool = self.pool(lambda keys, project, actor, *a, **k: seen.append((project.name, actor.github.login)) or ("done", ""),
+                         start=False)
+        pool.submit(self.market, ["MAR-1"], me)
+        self.users.remove_github(me, self.users.get(me).github_accounts[0].id)  # before it starts
+        pool.start()
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "skipped")
+        self.assertEqual(seen, [])
+        self.assertIn("GitHub or Claude account was removed", self.runs.recent(me)[0]["message"])
+
+
+class StopAndPauseTest(QueueEnv):
+    def test_stop_runs_stops_a_run_in_progress(self):
+        me = self.developer()
+        started = []
+        pool = self.pool(fake_process_factory(started, block=threading.Event()))
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.wait_for(lambda: started)
+        self.assertEqual(pool.stop_runs(me), 1)
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "stopped")
+        self.assertEqual(pool.stop_runs(me), 0)
+
+    def test_a_developer_stops_one_of_their_runs(self):
+        me, sara = self.developer(), self.developer("acc-sara")
+        started = []
+        pool = self.pool(fake_process_factory(started, block=threading.Event()), max_parallel_runs=1)
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.assertIsNone(pool.submit(self.market, ["MAR-2"], me))  # waits behind MAR-1
+        self.wait_for(lambda: started)
+        running, queued = sorted(r["id"] for r in self.runs.recent(me))
+        self.assertFalse(pool.stop_run(running, sara))  # not hers
+        self.assertTrue(pool.stop_run(queued, me))  # never starts
+        self.assertTrue(pool.stop_run(running, me))
+        status = lambda run_id: next(r for r in self.runs.recent(me) if r["id"] == run_id)
+        self.wait_for(lambda: status(running)["status"] == "stopped" and status(queued)["status"] == "stopped")
+        self.assertEqual(status(queued)["message"], "stopped before it started")
+        self.assertIn("the ticket was left as it was", status(running)["message"])
+        self.assertFalse(pool.stop_run(running, me))  # finished
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))  # can run again
+        again = max(r["id"] for r in self.runs.recent(me))
+        self.assertTrue(pool.stop_run(again, me))
+        self.wait_for(lambda: status(again)["status"] == "stopped")
+
+    def test_stopping_a_projects_runs(self):
+        me = self.developer()
+        pool = self.pool(fake_process_factory(), start=False)
+        pool.submit(self.market, ["MAR-1"], me)
+        self.assertEqual(pool.stop_runs(project_ids={self.market.id + 1}), 0)
+        self.assertEqual(pool.stop_runs(project_ids={self.market.id}), 1)
+
+    def test_a_paused_developers_queued_runs_are_skipped(self):
+        me = self.developer()
+        self.users.set_paused(me, True)
+        ran = []
+        pool = self.pool(fake_process_factory(ran))
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "skipped")
+        self.assertEqual((ran, self.runs.recent(me)[0]["message"]), ([], "automation is paused"))
+
+
+class LimitsTest(Env):
+    def test_a_developer_can_have_at_most_ten_runs_queued(self):
+        me = self.developer()
+        pool = RunQueue(self.cfg, self.users, self.projects, self.runs, mock.Mock())  # not started: all stay queued
+        for n in range(1, 11):
+            self.assertIsNone(pool.submit(self.market, [f"MAR-{n}"], me))
+        self.assertEqual(pool.submit(self.market, ["MAR-11"], me), "you already have 10 runs queued or running")
+        self.assertIsNone(pool.submit(self.market, ["MAR-11"], self.developer("acc-sara")))  # others are not affected
+
+    def test_webhooks_are_signed_fresh_and_accepted_once_also_across_restarts(self):
+        self.developer()
+        queued = []
+        pool = mock.Mock(submit=lambda project, keys, uid: queued.append((project.name, keys[0])))
+
+        def serve():
+            server = Server(("127.0.0.1", 0), make_handler(build_app(self.cfg, mock.Mock(), pool)))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            return server.server_address[1]
+
+        def send(port, body: dict, path="/webhook", secret="hook-secret"):
+            raw = json.dumps(body).encode()
+            sig = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+            conn = http.client.HTTPConnection("127.0.0.1", port)
+            conn.request("POST", path, raw, {"X-Hub-Signature": sig, "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            result = resp.status, json.loads(resp.read())["status"]
+            conn.close()
+            return result
+
+        port = serve()
+        now = int(time.time() * 1000)
+        event = {**payload(), "timestamp": now}
+        self.assertEqual(send(port, {**payload()}), (400, "stale or missing timestamp"))
+        self.assertEqual(send(port, {**payload(), "timestamp": now - 2 * 3600 * 1000}), (400, "stale or missing timestamp"))
+        self.assertEqual(send(port, event), (202, "queued"))
+        self.assertEqual(send(port, event), (200, "duplicate event"))  # a replay of the same signed event
+        self.assertEqual(send(serve(), event), (200, "duplicate event"))  # also after a restart
+
+        # Per project: its own URL and secret; the shared secret, or another project's, doesn't work there.
+        secret = self.projects.webhook_secret(self.market.id)
+        hook = f"/webhook?project={self.market.id}"
+        event2 = {**payload(key="MAR-13", site=None), "timestamp": now}
+        self.assertEqual(send(port, event2, hook), (401, "bad signature"))
+        self.assertEqual(send(port, event2, "/webhook?project=999", secret), (401, "bad signature"))
+        self.assertEqual(send(port, event2, hook, secret), (202, "queued"))
+        self.assertEqual(queued, [("marketplace", "MAR-12"), ("marketplace", "MAR-13")])
+
+    def test_without_a_shared_secret_only_project_webhooks_work(self):
+        cfg = Config(**{**self.cfg.__dict__, "webhook_secret": None})
+        status, _ = build_app(cfg, mock.Mock(), mock.Mock()).webhooks.handle(b"{}", "sha256=x")
+        self.assertEqual(status, 401)
+
+    def test_config(self):
+        env = {"JIRA_SITES": "https://office.atlassian.net, https://home.atlassian.net/", "ATLASSIAN_CLIENT_ID": "a",
+               "ATLASSIAN_CLIENT_SECRET": "b", "SHADOWDEV_SECRET_KEY": "d"}
+        cfg = Config.from_env(env)
+        self.assertEqual((cfg.jira_sites, cfg.webhook_secret), ((OFFICE.url, HOME.url), None))
+        self.assertTrue(cfg.allows_site(HOME.url + "/"))
+        self.assertFalse(cfg.allows_site("https://other.atlassian.net"))
+        legacy = {**env, "JIRA_SITES": "", "JIRA_BASE_URL": "https://acme.atlassian.net"}
+        self.assertEqual(Config.from_env(legacy).jira_sites, ("https://acme.atlassian.net",))
+        self.assertTrue(Config.from_env({**env, "JIRA_SITES": "*"}).allows_site("https://anything.atlassian.net"))
+        with self.assertRaisesRegex(SystemExit, "must look like"):
+            Config.from_env({**env, "JIRA_SITES": "http://insecure.example"})
+        with self.assertRaisesRegex(SystemExit, "must be https"):
+            Config.from_env({**env, "PUBLIC_URL": "http://shadowdev.internal:8080"})
+        self.assertEqual(Config.from_env({**env, "PUBLIC_URL": "http://localhost:8080"}).public_url, "http://localhost:8080")
+        self.assertEqual(Config.from_env({**env, "PUBLIC_URL": "https://shadowdev.example.com"}).public_url, "https://shadowdev.example.com")
+
+
+if __name__ == "__main__":
+    unittest.main()
