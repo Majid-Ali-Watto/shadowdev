@@ -1,0 +1,21 @@
+[project]
+name = "shadowdev"
+version = "0.2.0"
+description = "Automates Jira bugs and tasks with Claude Code: analysis, change, tests, pull request"
+requires-python = ">=3.11"
+dependencies = ["cryptography>=42"]
+
+[project.scripts]
+shadowdev = "shadowdev.__main__:main"
+
+# ShadowDev runs from its checkout (it reads projects/ and .env there), so install it editable:
+#   pip install -e .     or     uv run shadowdev
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["shadowdev*"]
+
+[tool.setuptools.package-data]
+"shadowdev.views" = ["style.css"]
