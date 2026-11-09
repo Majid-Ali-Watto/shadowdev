@@ -55,6 +55,18 @@ def login_page(public_url: str, error: str = "") -> str:
 </section>""")
 
 
+def continue_page(url: str, nonce: str) -> str:
+    """Opens `url` (Atlassian's consent page) at once; the link is there if scripts are off."""
+    return page("Connecting Jira · ShadowDev", f"""
+<section class="card login">
+  {MARK}
+  <h1>Connecting another Jira account</h1>
+  <p class="lead">Opening Atlassian… Choose the Jira site and account to connect, and press Accept.</p>
+  <a class="button block" id="continue" href="{esc(url)}">Continue to Atlassian</a>
+</section>
+<script nonce="{esc(nonce)}">location.replace(document.getElementById("continue").href);</script>""")
+
+
 def card_head(step: int, title: str, done: bool, tag: str = "") -> str:
     """A setup step's heading: its number (a check once done), title, and a tag on the right."""
     return (f'<div class="card-head"><span class="step{" done" if done else ""}" aria-hidden="true">{step}</span>'
@@ -251,8 +263,9 @@ def settings_page(cfg: Config, user: User, projects: list[Project], secrets: dic
 {accounts_section(user, hidden)}
 
 <h2 class="section">Projects</h2>
-<p class="muted">The projects on your Jira sites. Join one with the accounts it should use: your office
-  GitHub and Claude for work, your personal ones for your own. <a href="/project">Add a project</a>.</p>
+<div class="row intro"><p class="muted">The projects on your Jira sites. Join one with the accounts it should use:
+  your office GitHub and Claude for work, your personal ones for your own.</p>
+  <a class="button" href="/project">Add a project</a></div>
 {cards}
 
 <h2 class="section">Runs</h2>
@@ -322,7 +335,7 @@ def issue_links(run) -> str:
 
 def repo_fields(repo: dict) -> str:
     v = lambda k: esc(repo.get(k) or "")
-    return f"""<fieldset class="repo"><legend>Repo</legend>
+    return f"""<fieldset class="repo"><legend>{v('github') or "New repo"}</legend>
   <label>GitHub repo <input name="repo_github" value="{v('github')}" placeholder="owner/name or https://github.com/owner/name" spellcheck="false" autocomplete="off"></label>
   <details class="more"><summary>Folder name, description, release branches</summary>
     <label>Folder name <input name="repo_name" value="{v('name')}" placeholder="default: the repo name" spellcheck="false" autocomplete="off"></label>
@@ -333,6 +346,7 @@ def repo_fields(repo: dict) -> str:
     <textarea name="repo_setup" spellcheck="false">{v('setup')}</textarea></label>
   <label>Test command <span class="muted">(optional; writes JUnit XML to $SHADOWDEV_REPORT_DIR)</span>
     <textarea name="repo_test" spellcheck="false" placeholder="pytest --junitxml=&quot;$SHADOWDEV_REPORT_DIR/tests.xml&quot;">{v('test')}</textarea></label>
+  <button type="button" class="secondary small" data-remove-repo>Remove repo</button>
 </fieldset>"""
 
 
@@ -381,9 +395,14 @@ def project_page(cfg: Config, user: User, form: dict, project: Project | None, s
 {f'<section class="card"><div class="row"><div><h3>Delete project</h3><p class="muted">For every member.</p></div>{delete}</div></section>' if delete else ""}
 <template id="repo-template">{repo_fields({})}</template>
 <script nonce="{esc(nonce)}">
-  document.getElementById("add-repo").addEventListener("click", () => {{
-    const row = document.getElementById("repo-template").content.cloneNode(true);
-    document.getElementById("repos").appendChild(row);
+  const repos = document.getElementById("repos");
+  const addRepo = () => repos.appendChild(document.getElementById("repo-template").content.cloneNode(true));
+  document.getElementById("add-repo").addEventListener("click", addRepo);
+  repos.addEventListener("click", e => {{
+    const remove = e.target.closest("[data-remove-repo]");
+    if (!remove) return;
+    remove.closest("fieldset").remove();
+    if (!repos.querySelector("fieldset")) addRepo();  // always at least one to fill in
   }});
 </script>
 {CONFIRM_SCRIPT.format(nonce=esc(nonce))}""")

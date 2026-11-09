@@ -18,7 +18,7 @@ def project_values(project: Project) -> dict:
             "review_statuses": ", ".join(project.review_statuses),
             "repos": [{"github": r.github, "name": r.name, "description": r.description,
                        "release_prefix": r.release_prefix, "setup": r.setup or "", "test": r.test or ""}
-                      for r in project.repos] + [{}]}
+                      for r in project.repos]}
 
 
 def show_editor(req: Request, user, csrf: str, project: Project | None, values: dict, error: str = "",
