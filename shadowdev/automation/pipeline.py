@@ -23,7 +23,8 @@ from pathlib import Path
 
 from . import gitops, rules
 from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, ClaudeSession, claude_config_dir, claude_env, forget_claude_sessions
-from .cancel import NEVER, CancelToken
+from .cancel import NEVER, CancelToken, Cancelled
+from .timing import Timings
 from .prompts import (CHANGE_SCHEMA, analysis_problem, analysis_prompt, analysis_schema, ask_usable, change_prompt,
                       retry_prompt, summary_problem)
 from .verify import NOT_TESTED, Checkout, changed, check
@@ -111,22 +112,38 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     """Work on the issues together, on one branch. Returns (status, message): status "done",
     "skipped" or "failed". Raises on errors, and Cancelled when `cancel` stops the run. With
     publish=False (dry run) it stops once the tests pass: nothing is committed, pushed or
-    opened, and the change stays in the workspace."""
+    opened, and the change stays in the workspace. Each step's time is logged, and at the end
+    the outcome with the whole run's time."""
     if not 1 <= len(keys) <= MAX_GROUP:
         raise ValueError(f"between 1 and {MAX_GROUP} issues at a time")
-    issues, skipped = select_issues(keys, project, actor, jira)
+    timings = Timings(branch_name(keys))
+    outcome = "failed"
+    try:
+        outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings)
+        return outcome, message
+    except Cancelled:
+        outcome = "stopped"
+        raise
+    finally:
+        timings.report(outcome)
 
-    # Issues already worked on (alone or in a group) have a branch on GitHub. One request per
-    # repo, at the same time.
-    token = actor.github.token
-    with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
-        listed = pool.map(lambda r: gitops.remote_branches(r.github, token), project.repos)
-        remote = dict(zip((r.name for r in project.repos), listed))
-    for issue in list(issues):
-        existing = next((b for names in remote.values() for b in names if handled_by(b, issue.key)), None)
-        if existing:
-            issues.remove(issue)
-            skipped.append(f"{issue.key}: already handled on branch {existing}")
+
+def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
+             publish: bool, cancel: CancelToken, timings: Timings) -> tuple[str, str]:
+    with timings.step("Jira and GitHub checks"):
+        issues, skipped = select_issues(keys, project, actor, jira)
+
+        # Issues already worked on (alone or in a group) have a branch on GitHub. One request per
+        # repo, at the same time.
+        token = actor.github.token
+        with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
+            listed = pool.map(lambda r: gitops.remote_branches(r.github, token), project.repos)
+            remote = dict(zip((r.name for r in project.repos), listed))
+        for issue in list(issues):
+            existing = next((b for names in remote.values() for b in names if handled_by(b, issue.key)), None)
+            if existing:
+                issues.remove(issue)
+                skipped.append(f"{issue.key}: already handled on branch {existing}")
     if not issues:
         return "skipped", "; ".join(skipped)
     branch = branch_name([i.key for i in issues])
@@ -137,23 +154,25 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
              "; ".join(f"{i.key} ({i.type_name}) {i.summary}" for i in issues))
 
     # Resolve and check every repo before creating anything.
-    targets = []
-    for repo in project.repos:
-        base = resolve_base(repo, actor.base_branches.get(repo.name), remote[repo.name], token)
-        if not base:
-            raise RuntimeError(f"{repo.name}: no base branch on {repo.github} (no '{repo.release_prefix}*' "
-                               "branch and no default branch)")
-        if base not in remote[repo.name]:
-            raise RuntimeError(f"{repo.name}: your base branch {base} does not exist on {repo.github}")
-        targets.append((repo, base))
-    with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
-        no_push = [r.github for r, ok in zip(project.repos, pool.map(lambda r: github.can_push(r.github), project.repos))
-                   if not ok]
-    if no_push:
-        raise RuntimeError(f"your GitHub account {actor.github.login} cannot push to {', '.join(no_push)}")
+    with timings.step("base branches and push access"):
+        targets = []
+        for repo in project.repos:
+            base = resolve_base(repo, actor.base_branches.get(repo.name), remote[repo.name], token)
+            if not base:
+                raise RuntimeError(f"{repo.name}: no base branch on {repo.github} (no '{repo.release_prefix}*' "
+                                   "branch and no default branch)")
+            if base not in remote[repo.name]:
+                raise RuntimeError(f"{repo.name}: your base branch {base} does not exist on {repo.github}")
+            targets.append((repo, base))
+        with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
+            no_push = [r.github for r, ok in zip(project.repos, pool.map(lambda r: github.can_push(r.github), project.repos))
+                       if not ok]
+        if no_push:
+            raise RuntimeError(f"your GitHub account {actor.github.login} cannot push to {', '.join(no_push)}")
     cancel.check()
-    for issue in issues:
-        move_issue(jira, issue.key, project.start_statuses)
+    with timings.step("Jira status to start"):
+        for issue in issues:
+            move_issue(jira, issue.key, project.start_statuses)
 
     # The run's code lives only in the workspace (Claude's) and scratch (baselines, reports),
     # side by side so Claude can't see scratch and `git add -A` never picks it up. Both, and
@@ -167,7 +186,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     workspace.mkdir(mode=0o700)
     try:
         return _work(issues, skipped, branch, targets, workspace, scratch, claude_dir, project, actor, cfg, jira, github,
-                     publish, cancel)
+                     publish, cancel, timings)
     finally:
         if publish:
             remove_code(workspace, scratch, claude_dir)
@@ -187,7 +206,7 @@ def tested(c: Checkout) -> str:
 
 def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tuple[Repo, str]], workspace: Path,
           scratch: Path, claude_dir: Path, project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-          publish: bool, cancel: CancelToken) -> tuple[str, str]:
+          publish: bool, cancel: CancelToken, timings: Timings) -> tuple[str, str]:
     label = branch
     token = actor.github.token
 
@@ -196,8 +215,9 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     for repo, base in targets:
         cancel.check()
         worktree = workspace / repo.name
-        commit = gitops.clone(repo.github, base, worktree, token)
-        gitops.git(worktree, "checkout", "--quiet", "-b", branch)
+        with timings.step(f"clone {repo.name}"):
+            commit = gitops.clone(repo.github, base, worktree, token)
+            gitops.git(worktree, "checkout", "--quiet", "-b", branch)
         checkouts.append(Checkout(label, repo, base, commit, worktree, cancel=cancel))
         log.info("%s: %s cloned at %s (%s), on branch %s", label, repo.name, base, commit[:10], branch)
 
@@ -205,36 +225,39 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     claude = ClaudeSession(workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg, cancel=cancel)
     log.info("%s: Claude analysing", label)
     keys_here = [i.key for i in issues]
-    result = ask_usable(claude, analysis_prompt(issues, checkouts), READ_ONLY_TOOLS,
-                        analysis_schema(issues, project.repos), lambda r: analysis_problem(r, keys_here), "analysis")
+    with timings.step("Claude analysis"):
+        result = ask_usable(claude, analysis_prompt(issues, checkouts), READ_ONLY_TOOLS,
+                            analysis_schema(issues, project.repos), lambda r: analysis_problem(r, keys_here), "analysis")
     analyses = {item["key"]: item["analysis"] for item in result["issues"]}
     target_repos = result["repos"]
     cancel.check()
-    version = None
-    if any(i.kind == "bug" for i in issues):
-        # The highest open release, replacing what the ticket had (e.g. a wrong one from an earlier run).
-        version = rules.latest_fix_version(jira.project_versions(issues[0].fields["project"]["key"]))
-        if not version:
-            log.warning("%s: no unreleased numbered Jira version found; fix version not set", label)
-    for issue in issues:
-        analysis = analyses[issue.key]
-        log.info("%s: %s (repos: %s): %s", issue.key, "root cause" if issue.kind == "bug" else "plan",
-                 ", ".join(target_repos), analysis)
-        if issue.kind == "bug" and project.root_cause_field:
-            jira.set_field(issue.key, project.root_cause_field, analysis)
-            log.info("%s: Jira %s (root cause) set", issue.key, project.root_cause_field)
-        else:
-            heading = "Root cause" if issue.kind == "bug" else "Implementation plan"
-            jira.comment(issue.key, f"*{heading} (ShadowDev):*\n{analysis}")
-            log.info("%s: Jira comment with the %s posted", issue.key, heading.lower())
-        if issue.kind == "bug" and version:
-            jira.set_fix_versions(issue.key, [version])
-            log.info("%s: Jira fix version set to %s", issue.key, version)
+    with timings.step("Jira analysis updates"):
+        version = None
+        if any(i.kind == "bug" for i in issues):
+            # The highest open release, replacing what the ticket had (e.g. a wrong one from an earlier run).
+            version = rules.latest_fix_version(jira.project_versions(issues[0].fields["project"]["key"]))
+            if not version:
+                log.warning("%s: no unreleased numbered Jira version found; fix version not set", label)
+        for issue in issues:
+            analysis = analyses[issue.key]
+            log.info("%s: %s (repos: %s): %s", issue.key, "root cause" if issue.kind == "bug" else "plan",
+                     ", ".join(target_repos), analysis)
+            if issue.kind == "bug" and project.root_cause_field:
+                jira.set_field(issue.key, project.root_cause_field, analysis)
+                log.info("%s: Jira %s (root cause) set", issue.key, project.root_cause_field)
+            else:
+                heading = "Root cause" if issue.kind == "bug" else "Implementation plan"
+                jira.comment(issue.key, f"*{heading} (ShadowDev):*\n{analysis}")
+                log.info("%s: Jira comment with the %s posted", issue.key, heading.lower())
+            if issue.kind == "bug" and version:
+                jira.set_fix_versions(issue.key, [version])
+                log.info("%s: Jira fix version set to %s", issue.key, version)
 
     # 3. Change, test every changed repo, self-heal.
     log.info("%s: Claude making the change in %s", label, ", ".join(target_repos))
-    summary = ask_usable(claude, change_prompt(issues, target_repos), EDIT_TOOLS, CHANGE_SCHEMA,
-                         summary_problem, "summary")["summary"]
+    with timings.step("Claude change"):
+        summary = ask_usable(claude, change_prompt(issues, target_repos), EDIT_TOOLS, CHANGE_SCHEMA,
+                             summary_problem, "summary")["summary"]
     for attempt in range(1, cfg.max_fix_attempts + 1):
         to_ship = changed(checkouts)
         if not to_ship:
@@ -242,7 +265,9 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
             return "failed", "Claude made no changes"
         failures = []
         for c in to_ship:
-            passed, output = check(c, scratch, cfg)
+            # The first check of a repo includes its setup and the base branch baseline (unless cached).
+            with timings.step(f"test {c.repo.name} (attempt {attempt})"):
+                passed, output = check(c, scratch, cfg)
             log.info("%s: %s tests %s (attempt %d/%d)", label, c.repo.name,
                      "passed" if passed else "failed", attempt, cfg.max_fix_attempts)
             if not passed:
@@ -259,7 +284,9 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
             )
             return "failed", f"tests still failing after {attempt} attempts; nothing pushed"
         log.info("%s: Claude fixing the test failures", label)
-        summary = ask_usable(claude, retry_prompt(failures), EDIT_TOOLS, CHANGE_SCHEMA, summary_problem, "summary")["summary"]
+        with timings.step(f"Claude fix (attempt {attempt})"):
+            summary = ask_usable(claude, retry_prompt(failures), EDIT_TOOLS, CHANGE_SCHEMA, summary_problem,
+                                 "summary")["summary"]
     log.info("%s: change: %s", label, summary)
 
     if not publish:
@@ -279,24 +306,27 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     prs = []
     for c in to_ship:
         cancel.check()  # last chance: nothing is pushed for a stopped run
-        name, email = actor.github.git_name, actor.github.git_email
-        gitops.commit_all(c.worktree, f"{title}\n\n{summary}\n\n{commit_details}", name, email)
-        log.info("%s: %s committed as %s <%s>; pushing branch %s to %s", label, c.repo.name, name, email, branch, c.repo.github)
-        gitops.push(c.worktree, c.repo.github, branch, token)
-        pr_url = github.create_pr(
-            c.repo.github,
-            base=c.base,
-            head=branch,
-            title=title,
-            body=f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{tested(c)}\n\n_Opened by ShadowDev._",
-        )
+        with timings.step(f"commit, push and PR {c.repo.name}"):
+            name, email = actor.github.git_name, actor.github.git_email
+            gitops.commit_all(c.worktree, f"{title}\n\n{summary}\n\n{commit_details}", name, email)
+            log.info("%s: %s committed as %s <%s>; pushing branch %s to %s", label, c.repo.name, name, email, branch,
+                     c.repo.github)
+            gitops.push(c.worktree, c.repo.github, branch, token)
+            pr_url = github.create_pr(
+                c.repo.github,
+                base=c.base,
+                head=branch,
+                title=title,
+                body=f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{tested(c)}\n\n_Opened by ShadowDev._",
+            )
         prs.append(f"{c.repo.name} into {c.base}: {pr_url}")
         log.info("%s: %s PR %s", label, c.repo.name, pr_url)
     cancel.check()
-    for issue in issues:
-        others = [k for k in keys_here if k != issue.key]
-        together = f"\nFixed together with {', '.join(others)}." if others else ""
-        jira.comment(issue.key, "ShadowDev opened:\n" + "\n".join(f"* {p}" for p in prs) + together)
-        log.info("%s: Jira comment with the PR links posted", issue.key)
-        move_issue(jira, issue.key, project.review_statuses)
+    with timings.step("Jira PR links and review status"):
+        for issue in issues:
+            others = [k for k in keys_here if k != issue.key]
+            together = f"\nFixed together with {', '.join(others)}." if others else ""
+            jira.comment(issue.key, "ShadowDev opened:\n" + "\n".join(f"* {p}" for p in prs) + together)
+            log.info("%s: Jira comment with the PR links posted", issue.key)
+            move_issue(jira, issue.key, project.review_statuses)
     return "done", "; ".join([*prs, *(f"skipped {s}" for s in skipped)])
