@@ -70,6 +70,10 @@ def serve(cfg: Config) -> None:
     app = build_app(cfg)
     app.queue.start()  # resumes the runs that were queued when the server stopped
     app.privacy.start()  # Atlassian's personal data reporting
+    if cfg.jira_polling:
+        app.poller.start()
+    log.info("new assignments: %s, the webhook, and Run issues now on the page",
+             "polling Jira every 15 minutes" if cfg.jira_polling else "polling off (JIRA_POLLING)")
     log.info("Jira sites: %s", ", ".join(cfg.jira_sites))
     server = Server((cfg.host, cfg.port), make_handler(app))
     log.info("up to %d runs in parallel; listening on http://%s:%d; developers open %s (Jira webhook at /webhook)",

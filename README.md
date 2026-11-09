@@ -49,6 +49,12 @@ Jira webhook → verify signature (the project's secret) → project: by URL, or
           queue → one of MAX_PARALLEL_RUNS workers (5) → pipeline, as the assignee, with that project's accounts
 ```
 
+New assignments are picked up three ways: the Jira **webhook** (instant, needs ShadowDev reachable
+from Jira), **polling** (`JIRA_POLLING=true` in `.env`: every 15 minutes, for machines Jira can't
+reach, like a laptop), and **Run issues now** on the page (always available). Polling asks Jira, as
+each developer's Jira account in each project, for unresolved issues assigned to it and updated
+since the last poll (the first time, the last 15 minutes); repeats are harmless, as with webhooks.
+
 Up to `MAX_PARALLEL_RUNS` (default 5) runs work at the same time, from any developers and
 projects; more wait their turn, **developers taking turns**, so one developer's ten queued issues
 don't hold up everyone else. Runs still waiting when the server restarts are queued again. Each
@@ -83,7 +89,8 @@ ShadowDev/
 │   │   ├── runs.py        run issues by hand, stop a run
 │   │   ├── run_queue.py   the pool of parallel runs, developers taking turns
 │   │   ├── webhook.py     Jira webhook: signature, replay protection, matching the developer
-│   │   └── privacy.py     Atlassian's personal data reporting: erase closed accounts, refresh changed ones
+│   │   ├── privacy.py     Atlassian's personal data reporting: erase closed accounts, refresh changed ones
+│   │   └── poller.py      JIRA_POLLING: ask Jira every 15 minutes for new assignments
 │   ├── routes/            HTTP only: parse the request, call a service, respond
 │   │   ├── request.py     Request helpers, security headers, the signed-in form guard
 │   │   ├── auth.py        /login/jira, /jira/connect, OAuth callback, /logout
@@ -243,7 +250,8 @@ add projects on, comma-separated, e.g. `https://office.atlassian.net,https://hom
 (`JIRA_BASE_URL`, v1's single site, still works). `*` allows any site, which lets anyone with an
 Atlassian account use the server and its machine. `ATLASSIAN_CLIENT_ID`,
 `ATLASSIAN_CLIENT_SECRET`, `PUBLIC_URL`, `SHADOWDEV_SECRET_KEY` (encrypts developers' tokens),
-`WEBHOOK_SECRET` (optional: the shared `/webhook`; each project also has its own), `HOST`, `PORT`,
+`WEBHOOK_SECRET` (optional: the shared `/webhook`; each project also has its own), `JIRA_POLLING`
+(`true`: poll Jira every 15 minutes; off by default), `HOST`, `PORT`,
 `MAX_FIX_ATTEMPTS`, `MAX_PARALLEL_RUNS` (default 5; mind the machine: parallel runs mean parallel
 `npm ci` and test suites).
 
@@ -276,8 +284,8 @@ a background job reports every stored account once per cycle (7 days, or what At
 **closed** account is erased: its Jira account, tokens and the subscriptions using it, or, if it was
 the developer's only Jira account, the whole developer as on *Delete my ShadowDev account*. For an
 **updated** one, its name and email are fetched again. It authenticates with the stored accounts'
-own OAuth tokens, trying the next one if one is refused. The privacy policy URL can be a page
-saying this.
+own OAuth tokens, trying the next one if one is refused. [PRIVACY.md](PRIVACY.md) says what is
+stored and where; its GitHub URL can be the app's privacy policy URL.
 
 ### Test gate: no new failures
 

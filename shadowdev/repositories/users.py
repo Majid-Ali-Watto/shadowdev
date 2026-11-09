@@ -178,12 +178,24 @@ class UserRepository:
             raise ValueError(f"unknown mode {sub.mode!r}")
         with closing(self.db.connect()) as conn, conn:
             conn.execute(
-                "INSERT INTO subscriptions VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(joined), 0) + 1 FROM subscriptions)) "
+                "INSERT INTO subscriptions (user_id, project_id, jira_account_id, github_account_id, claude_account_id, mode, "
+                "base_branches, joined) VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(joined), 0) + 1 FROM subscriptions)) "
                 "ON CONFLICT (user_id, project_id) DO UPDATE SET jira_account_id = excluded.jira_account_id, "
                 "github_account_id = excluded.github_account_id, claude_account_id = excluded.claude_account_id, "
                 "mode = excluded.mode, base_branches = excluded.base_branches",
                 (user_id, sub.project_id, sub.jira_account_id, sub.github_account_id, sub.claude_account_id, sub.mode,
                  json.dumps(sub.base_branches)))
+
+    def polled_at(self, user_id: int, project_id: int) -> float:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT polled_at FROM subscriptions WHERE user_id = ? AND project_id = ?",
+                               (user_id, project_id)).fetchone()
+        return row[0] if row else 0.0
+
+    def mark_polled(self, user_id: int, project_id: int, at: float) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE subscriptions SET polled_at = ? WHERE user_id = ? AND project_id = ?",
+                         (at, user_id, project_id))
 
     def unsubscribe(self, user_id: int, project_id: int) -> None:
         with closing(self.db.connect()) as conn, conn:

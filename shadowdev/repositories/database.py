@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     mode              TEXT NOT NULL DEFAULT 'bugs',
     base_branches     TEXT NOT NULL DEFAULT '{}',  -- JSON {repo name: branch}; missing = default
     joined            INTEGER NOT NULL DEFAULT 0,  -- order of joining; the oldest member inherits a project
+    polled_at         REAL NOT NULL DEFAULT 0,  -- last time Jira was asked for its new assignments (JIRA_POLLING)
     PRIMARY KEY (user_id, project_id)
 );
 CREATE INDEX IF NOT EXISTS subscriptions_project ON subscriptions (project_id);
@@ -159,6 +160,8 @@ class Database:
                     for column in ("profile_at", "reported_at"):  # added in schema 3
                         if column not in columns:
                             db.execute(f"ALTER TABLE jira_accounts ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
+                    if "polled_at" not in {row["name"] for row in db.execute("PRAGMA table_info(subscriptions)")}:
+                        db.execute("ALTER TABLE subscriptions ADD COLUMN polled_at REAL NOT NULL DEFAULT 0")
                     db.execute(f"PRAGMA user_version = {VERSION}")
         path.chmod(0o600)
 

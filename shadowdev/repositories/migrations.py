@@ -124,7 +124,8 @@ def upgrade_from_v1(db, conn: sqlite3.Connection, projects_dir: Path | None, sit
             if pid is None or acc not in user_ids:
                 log.warning("dropping %s's subscription to %s: no such project file any more", acc, s["project"])
                 continue
-            conn.execute("INSERT INTO subscriptions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            conn.execute("INSERT INTO subscriptions (user_id, project_id, jira_account_id, github_account_id, "
+                         "claude_account_id, mode, base_branches, joined) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                          (user_ids[acc], pid, jira_ids[acc], github_ids.get(acc), claude_ids.get(acc), modes[acc],
                           s["base_branches"], n))
         conn.executemany(

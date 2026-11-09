@@ -9,6 +9,7 @@ from .repositories.runs import RunRepository
 from .repositories.sessions import SessionRepository
 from .repositories.users import UserRepository
 from .services.accounts import AccountService
+from .services.poller import Poller
 from .services.privacy import PrivacyReporter
 from .services.projects import ProjectService
 from .services.run_queue import RunQueue
@@ -30,6 +31,7 @@ class App:
     run_service: RunService
     webhooks: WebhookService
     privacy: PrivacyReporter
+    poller: Poller
 
 
 def database(cfg: Config) -> Database:
@@ -52,4 +54,5 @@ def build_app(cfg: Config, oauth: AtlassianOAuth | None = None, queue: RunQueue 
         run_service=RunService(users, projects, oauth, queue),
         webhooks=WebhookService(cfg, users, projects, runs, queue),
         privacy=PrivacyReporter(users, oauth, accounts),
+        poller=Poller(users, projects, oauth, queue),
     )

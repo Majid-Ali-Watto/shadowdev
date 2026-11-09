@@ -69,6 +69,7 @@ class Config:
     host: str
     port: int
     max_parallel_runs: int = 5  # issues (or groups fixed together) worked on at the same time
+    jira_polling: bool = False  # JIRA_POLLING: ask Jira every 15 minutes for newly assigned issues
     sandbox_tools: tuple[str, ...] = SANDBOX_TOOLS
     sandbox_caches: tuple[str, ...] = SANDBOX_CACHES
     data_dir: Path = PROJECT_ROOT / "data"  # database and per-developer Claude config; never in a sandbox
@@ -120,6 +121,7 @@ class Config:
             host=env.get("HOST", "127.0.0.1"),
             port=port,
             max_parallel_runs=max_parallel_runs,
+            jira_polling=(env.get("JIRA_POLLING") or "").strip().lower() in ("1", "true", "yes", "on"),
             sandbox_tools=_home_paths(env.get("SANDBOX_HOME_TOOLS"), SANDBOX_TOOLS, "SANDBOX_HOME_TOOLS"),
             sandbox_caches=_home_paths(env.get("SANDBOX_HOME_CACHES"), SANDBOX_CACHES, "SANDBOX_HOME_CACHES"),
         )
