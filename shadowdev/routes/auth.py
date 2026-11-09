@@ -15,21 +15,26 @@ STATE_COOKIE = "shadowdev_oauth_state"
 STATE_SECONDS = 600
 
 
-def _to_atlassian(req: Request, intent: str) -> None:
+def _atlassian_url(req: Request, intent: str) -> tuple[str, str]:
+    """Atlassian's consent page, and the cookie remembering its one-time state."""
     state = secrets.token_urlsafe(24)
-    req.redirect(req.app.oauth.authorize_url(state),
-                 req.set_cookie(STATE_COOKIE, f"{intent}.{state}", STATE_SECONDS, OAUTH_CALLBACK_PATH))
+    return (req.app.oauth.authorize_url(state),
+            req.set_cookie(STATE_COOKIE, f"{intent}.{state}", STATE_SECONDS, OAUTH_CALLBACK_PATH))
 
 
 def start_sign_in(req: Request) -> None:
-    """Send the browser to Atlassian to grant access, remembering a one-time state."""
-    _to_atlassian(req, "signin")
+    """Send the browser to Atlassian to grant access (a link, so a plain redirect)."""
+    req.redirect(*_atlassian_url(req, "signin"))
 
 
 @form_action
 def connect_jira(req: Request, post: FormPost) -> None:
-    """A POST with the CSRF token, so another site can't start connecting an account to yours."""
-    _to_atlassian(req, "connect")
+    """A POST with the CSRF token, so another site can't start connecting an account to yours.
+    Answered with a page that opens Atlassian, not a redirect: browsers apply the page's
+    form-action 'self' to a form's redirects, so redirecting to Atlassian would be blocked."""
+    url, cookie = _atlassian_url(req, "connect")
+    nonce = secrets.token_urlsafe(16)
+    req.html(pages.continue_page(url, nonce), nonce, cookies=(cookie,))
 
 
 def finish_sign_in(req: Request) -> None:

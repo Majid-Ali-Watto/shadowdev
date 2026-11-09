@@ -177,8 +177,14 @@ select:focus, textarea:focus { outline:none; border-color:var(--accent); box-sha
 .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); column-gap:14px; }
 details.more { margin:10px 0; }
 details.more > summary { cursor:pointer; color:var(--accent); font-size:14px; font-weight:500; }
-.repo { border:1px solid var(--line); border-radius:var(--radius-sm); padding:4px 14px 10px; margin:12px 0; }
-.repo legend { font-family:var(--mono); }
+/* A repo in the project editor: its fields stacked, unlike the grid of base-branch fields. */
+fieldset.repo { display:block; padding:6px 16px 14px; margin:8px 0 12px; }
+fieldset.repo label { font-family:var(--sans); font-size:14px; }
+fieldset.repo label .muted { font-weight:400; }
+fieldset.repo textarea { margin-top:6px; }
+fieldset.repo details.more { margin:6px 0 2px; }
+fieldset.repo [data-remove-repo] { margin-top:12px; }
+.row.intro { margin:0 0 12px; } .row.intro .button { flex:none; }
 .secret { font-family:var(--mono); font-size:13px; background:var(--code); padding:8px 10px; border-radius:6px;
           overflow-wrap:anywhere; margin:4px 0 10px; }
 .actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }

@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import html
 import http.client
 import json
 import re
@@ -165,6 +166,13 @@ class WebTest(Env):
         self.assertEqual(status, 303)
         return self.oauth_round_trip(location)
 
+    def connect(self):
+        """POST /jira/connect; returns the Atlassian URL its page opens."""
+        status, location, page = self.request("POST", "/jira/connect", {"csrf": self.csrf()})
+        self.assertEqual((status, location), (200, None))
+        self.assertIn("location.replace", page)
+        return html.unescape(re.search(r'id="continue" href="([^"]+)"', page).group(1))
+
     def csrf(self):
         return re.search(r'name="csrf" value="([^"]+)"', self.request("GET", "/")[2]).group(1)
 
@@ -208,7 +216,8 @@ class WebTest(Env):
         self.assertIn("Not active yet", self.request("GET", "/")[2])
 
         # Connect the personal Jira account: a CSRF-checked POST, then Atlassian, then back as the same developer.
-        status, location, _ = self.request("POST", "/jira/connect", {"csrf": csrf})
+        # The POST answers with a page opening Atlassian: a redirect would break the page's form-action CSP.
+        location = self.connect()
         self.assertTrue(self.cookies["shadowdev_oauth_state"].startswith("connect."))
         self.me_jira = {"accountId": ME_HOME, "displayName": "Majid", "accountType": "atlassian"}
         self.oauth.sites.return_value = [HOME]
@@ -361,7 +370,7 @@ class WebTest(Env):
     def test_connecting_another_developers_jira_account_is_refused(self):
         add_developer(self.users, "acc-sara")
         self.sign_in()
-        _, location, _ = self.request("POST", "/jira/connect", {"csrf": self.csrf()})
+        location = self.connect()
         self.me_jira = {"accountId": "acc-sara", "displayName": "Sara", "accountType": "atlassian"}
         self.assertIn("already connected to another ShadowDev account", self.oauth_round_trip(location)[2])
         self.assertEqual(len(self.me().jira_accounts), 1)
