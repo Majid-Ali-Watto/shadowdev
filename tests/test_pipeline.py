@@ -4,6 +4,7 @@ import contextlib
 import dataclasses
 import io
 import json
+import re
 import os
 import subprocess
 import tempfile
@@ -316,6 +317,15 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("PROJ-3: app baseline on release/1.10 (", text)
         self.assertIn("already measured; reusing it", text)
 
+    def test_each_step_and_the_whole_run_are_timed(self):
+        with self.assertLogs("shadowdev", "INFO") as logs:
+            self.assertEqual(self.run_pipeline([WRONG_FIX, RIGHT_FIX])[0], "done")
+        text = "\n".join(logs.output)
+        for step in ("Jira and GitHub checks", "clone app", "Claude analysis", "Claude change",
+                     "test app (attempt 1)", "Claude fix (attempt 1)", "test app (attempt 2)", "commit, push and PR app"):
+            self.assertRegex(text, rf"PROJ-1: step {re.escape(step)} took \d")
+        self.assertRegex(text, r"PROJ-1: done in [\d.ms]+ \(Jira and GitHub checks [\d.ms]+ · .*commit, push and PR app")
+
     def test_trailing_markup_is_trimmed_not_rejected(self):
         # MAR-2105 rerun: a correct analysis, with "</analysis>\n</invoke>" left at its end.
         real_ask = FakeClaude.ask
@@ -406,6 +416,7 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("Result: done: dry run: tests pass", out)
         self.assertIn("Jira comment that would be posted on PROJ-0", out)  # a Task: the plan
         self.assertIn("?? test_add.py", out)  # the new file Claude created
+        self.assertRegex(out.rstrip().splitlines()[-1], r"^===== END ===== dry run PROJ-0 finished after [\d.ms]+$")
         worktree = self.cfg.worktree_root / f"{pid}-PROJ-0" / "app"
         self.assertEqual((worktree / "calc.py").read_text(), RIGHT_FIX)
         # Cut from the developer's base branch, and nothing committed or pushed.

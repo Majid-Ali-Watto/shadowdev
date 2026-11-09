@@ -508,6 +508,15 @@ class RunQueueTest(QueueEnv):
         self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))  # finished, so it can run again
         self.wait_for(done)
 
+    def test_a_finished_run_logs_its_end(self):
+        me = self.developer()
+        pool = self.pool(fake_process_factory(), start=False)
+        with self.assertLogs("shadowdev", "INFO") as logs:
+            pool.submit(self.market, ["MAR-1", "MAR-2"], me)
+            pool.start()
+            self.wait_for(lambda: any("===== END =====" in line for line in logs.output))
+        self.assertRegex("\n".join(logs.output), r"===== END ===== run \d+ \(MAR-1, MAR-2\) finished after [\d.ms]+")
+
     def test_the_same_key_on_two_sites_runs_at_once(self):
         me = self.developer()
         add_developer(self.users, ME_HOME, sites=(HOME,), user_id=me)

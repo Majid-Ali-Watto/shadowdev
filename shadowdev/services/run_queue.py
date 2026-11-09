@@ -3,10 +3,12 @@ together) run at once, taken from the developers in turn. Every run acts as the 
 issues are assigned to, with the Jira, GitHub and Claude accounts of their subscription."""
 import logging
 import threading
+import time
 from collections import deque
 
 from ..automation.cancel import CancelToken, Cancelled
 from ..automation.pipeline import process_issues
+from ..automation.timing import END, duration
 from ..clients.atlassian import AtlassianOAuth, jira_client
 from ..clients.github import GitHub
 from ..config import Config
@@ -102,6 +104,7 @@ class RunQueue:
     def run_forever(self) -> None:
         while True:
             project_id, keys, user_id, run_id, pending = self._queue.get()
+            started = time.monotonic()
             try:
                 self._run(project_id, list(keys), user_id, run_id)
             except Exception:
@@ -111,6 +114,8 @@ class RunQueue:
                 with self._lock:
                     self._pending -= pending
                     del self._jobs[run_id]
+                log.info("%s run %d (%s) finished after %s", END, run_id, ", ".join(keys),
+                         duration(time.monotonic() - started))
 
     def stop_run(self, run_id: int, user_id: int) -> bool:
         """Stop one of the developer's queued or running jobs. False if there is no such job of

@@ -8,9 +8,11 @@ worktrees/<project id>-<KEY> for inspection, until the next dry run replaces it.
 """
 import dataclasses
 import logging
+import time
 
 from . import gitops
 from .pipeline import process_issues, workspace_name
+from .timing import END, duration
 from ..config import Config
 from ..models.project import Project
 from ..models.user import Actor, User
@@ -107,14 +109,18 @@ def dry_run(cfg: Config, users: UserRepository, projects: ProjectRepository, pro
         "assignee": {"accountId": actor.jira_account_id}, "project": {"key": jira_key},
     }
     log.info("dry run %s as %s on %s: %s %r", key, user.display_name, project.name, issue_type, summary)
-    status, message = process_issues([key], project, actor, cfg, PrintingJira(fields), NoGitHub(), publish=False)
+    started = time.monotonic()
+    try:
+        status, message = process_issues([key], project, actor, cfg, PrintingJira(fields), NoGitHub(), publish=False)
 
-    print(f"\nResult: {status}: {message}")
-    workspace = cfg.worktree_root / workspace_name(project, key)
-    for repo in project.repos:
-        worktree = workspace / repo.name
-        if worktree.exists() and gitops.git(worktree, "status", "--porcelain"):
-            print(f"\n{repo.name}: changed files (?? = new file)\n{gitops.git(worktree, 'status', '--short')}")
-            print(f"  full diff: git -C {worktree} diff    (new files: open them in {worktree})")
-    if workspace.exists():
-        print(f"\nThe next dry run replaces {workspace}.")
+        print(f"\nResult: {status}: {message}")
+        workspace = cfg.worktree_root / workspace_name(project, key)
+        for repo in project.repos:
+            worktree = workspace / repo.name
+            if worktree.exists() and gitops.git(worktree, "status", "--porcelain"):
+                print(f"\n{repo.name}: changed files (?? = new file)\n{gitops.git(worktree, 'status', '--short')}")
+                print(f"  full diff: git -C {worktree} diff    (new files: open them in {worktree})")
+        if workspace.exists():
+            print(f"\nThe next dry run replaces {workspace}.")
+    finally:
+        print(f"\n{END} dry run {key} finished after {duration(time.monotonic() - started)}", flush=True)
