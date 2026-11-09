@@ -86,7 +86,7 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
 - Mocks patch names **where they are used**, so moving a function means updating the patch target:
   `services.accounts.{GitHub, Jira, check_token}`, `services.projects.{GitHub, jira_client, gitops}`,
   `services.runs.jira_client`, `services.run_queue.{process_issues, jira_client}`,
-  `services.privacy.{report_accounts, access_token}`,
+  `services.privacy.{report_accounts, access_token}`, `services.poller.jira_client`,
   `automation.pipeline.ClaudeSession`.
 - `verify.BASELINES` caches baseline results across runs; tests clear it in `setUp`.
 - Don't name a module under `shadowdev/` `test*.py`: unittest discovery would import it as a test.

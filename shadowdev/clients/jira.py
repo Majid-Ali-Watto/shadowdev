@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from urllib.parse import urlencode
 
 from .rest import request_json
 
@@ -27,6 +28,21 @@ class Jira:
         return self._request(
             "GET", f"/rest/api/2/issue/{key}?fields=summary,description,issuetype,assignee,project,status"
         )
+
+    def search(self, jql: str, fields: list[str], limit: int = 200) -> list[dict]:
+        """Issues matching the JQL (enhanced search; the old /search endpoints are gone), with these
+        fields, at most `limit`. Pages by token, and stops if a token repeats."""
+        issues, token, seen = [], None, set()
+        while len(issues) < limit:
+            query = urlencode({"jql": jql, "fields": ",".join(fields), "maxResults": min(100, limit - len(issues)),
+                               **({"nextPageToken": token} if token else {})})
+            page = self._request("GET", f"/rest/api/3/search/jql?{query}") or {}
+            issues += page.get("issues") or []
+            token = page.get("nextPageToken")
+            if page.get("isLast", True) or not token or token in seen:
+                break
+            seen.add(token)
+        return issues[:limit]
 
     def project_versions(self, project_key: str) -> list[dict]:
         return self._request("GET", f"/rest/api/2/project/{project_key}/versions")
