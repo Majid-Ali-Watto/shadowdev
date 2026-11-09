@@ -109,8 +109,6 @@ ShadowDev/
 │       ├── sandbox.py     bubblewrap sandbox for setup/test commands
 │       ├── cancel.py      stopping a run
 │       └── dryrun.py      python -m shadowdev dry-run: a made-up issue, no Jira or GitHub
-├── .github/workflows/
-│   └── jira-auto-fixer.yml  the other approach: the same job as a scheduled GitHub Action
 ├── tests/
 ├── data/                  database and per-developer Claude config (created; never committed)
 └── worktrees/             workspaces of running issues, deleted when each run ends
@@ -305,61 +303,6 @@ don't verify it either. A suite that writes no report on the base branch is not 
 all. For example, on this machine the documents and notifications services can't load without
 the system `unixodbc` package. If the base branch fails without writing any report, the run
 stops with an error asking you to fix the test command.
-
-## Other approach: GitHub Actions (CI)
-
-The server above is one way to run ShadowDev. The other is
-[`.github/workflows/jira-auto-fixer.yml`](.github/workflows/jira-auto-fixer.yml): no server, no
-web page. GitHub runs it every 5 minutes (and on demand: **Actions → Full-Stack Jira Auto-Fixer →
-Run workflow**) for **one developer**, the owner of the Jira and GitHub tokens in its secrets.
-Each run:
-
-1. takes the newest `MAR` **Bug** assigned to that developer in **To Do** and moves it to
-   **In Progress**, so the next run takes the next bug
-2. checks out `fe` and `services` side by side. If `fix/<KEY>` already exists in either, it stops
-3. per repo, takes the fix version's branch (`Rel 15` → `release/15`) if it exists, or else the
-   highest purely numeric `release/*`, or else `main`
-4. runs Claude Code ([claude-code-action](https://github.com/anthropics/claude-code-action)) on
-   both repos. Claude decides which repo(s) need the fix, makes it, runs those repos' tests,
-   commits as the token's owner, pushes `fix/<KEY>` and opens a PR into the base branch per
-   changed repo, and links the two PRs to each other when both change
-5. comments the PR links on the ticket and moves it to **In Review**. If no PR was opened, it
-   comments a link to the run instead and leaves the ticket in In Progress
-
-Only one run happens at a time (`concurrency`), and none lasts more than 60 minutes.
-
-**Setup**: push this folder to a GitHub repository (or copy the workflow into any repository's
-`.github/workflows/`), and add these repository secrets:
-
-| Secret | Value |
-|---|---|
-| `JIRA_BASE_URL` | `https://acme.atlassian.net` |
-| `JIRA_EMAIL` | the developer's Atlassian email |
-| `JIRA_API_TOKEN` | an [Atlassian API token](https://id.atlassian.com/manage-profile/security/api-tokens) |
-| `TARGET_REPO_PAT` | a GitHub token for `fe` and `services`, scoped as in *For developers* step 2 |
-| `ANTHROPIC_API_KEY` | an Anthropic Console API key |
-
-To use a Claude subscription instead of an API key, replace `anthropic_api_key` in the workflow
-with `claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}` and store the
-`claude setup-token` output in that secret. The Jira project, repos and descriptions are at the
-top of the workflow and in its prompt. Keep them in step with the marketplace project on the ShadowDev page.
-
-**How it compares with the server**
-
-| | Server | GitHub Actions |
-|---|---|---|
-| Developers | the whole team, each signed in on the web page | one per copy of the workflow (its secrets) |
-| Trigger | Jira webhook, at once | polling every 5 minutes |
-| Issues | bugs, optionally tasks, several at once | the newest To Do bug, one per run |
-| Jira access | OAuth sign-in | personal API token in repository secrets |
-| Tests | sandboxed, compared with a base-branch baseline, retried up to `MAX_FIX_ATTEMPTS` | Claude runs them itself; no baseline, nothing enforced |
-| Root cause / fix version | written to the ticket's field, fix version set | root cause in the PR body; fix version only read |
-| Claude's access | file tools only, in a bubblewrap sandbox | `git`, `npm`, `npx`, `uv`, `gh` commands on a throwaway GitHub runner that holds the PAT |
-| Hosting | your machine | GitHub's runners, nothing to host |
-
-The ticket text reaches Claude in both approaches. In the CI approach Claude can run commands
-while the GitHub token is in its environment, so a hostile ticket could misuse that token.
-Give the PAT access to `fe` and `services` only.
 
 ## Safety model
 
