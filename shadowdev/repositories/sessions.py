@@ -6,7 +6,7 @@ from contextlib import closing
 
 from .database import Database
 
-SESSION_SECONDS = 12 * 3600
+SESSION_SECONDS = 7 * 24 * 3600
 
 
 def _hash(token: str) -> str:
