@@ -97,6 +97,18 @@ class StreamingClaudeTest(unittest.TestCase):
                          "MAR-9: claude done in"):
             self.assertIn(expected, text)
 
+    def test_the_model_and_effort_are_passed_to_claude(self):
+        bin_dir = Path(tempfile.mkdtemp())
+        script = bin_dir / "claude"
+        result = json.dumps({"type": "result", "is_error": False, "session_id": "s-1", "structured_output": {}})
+        script.write_text(f"#!/bin/sh\ncat > /dev/null\necho \"$@\" > {bin_dir}/args\necho '{result}'\n")
+        script.chmod(script.stat().st_mode | stat.S_IEXEC)
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        ClaudeSession(Path(tempfile.mkdtemp()), env, model="sonnet", effort="medium").ask("p", "Read", {})
+        self.assertIn("--model sonnet --effort medium", (bin_dir / "args").read_text())
+        ClaudeSession(Path(tempfile.mkdtemp()), env).ask("p", "Read", {})  # the account's default model
+        self.assertNotIn("--model", (bin_dir / "args").read_text())
+
     def test_errors_are_raised(self):
         env = self.fake_claude([{"type": "result", "is_error": True, "result": "Not logged in"}])
         with self.assertRaisesRegex(RuntimeError, "Not logged in"):

@@ -59,7 +59,7 @@ ROUTES = {
         p.user, p.form.get("claude_account_id", ""))),
     ("POST", "/run"): action("queued", lambda req, p: req.app.run_service.request(
         p.user, p.form.get("issue_keys", ""), together=p.form.get("grouping") == "together",
-        project_id=p.form.get("project_id", ""))),
+        project_id=p.form.get("project_id", ""), note=p.form.get("note", ""))),
     ("POST", "/stop"): action("stopping", lambda req, p: req.app.run_service.stop(p.user, p.form.get("run_id", ""))),
     ("POST", "/pause"): action("paused", lambda req, p: req.app.accounts.set_paused(p.user, True)),
     ("POST", "/resume"): action("resumed", lambda req, p: req.app.accounts.set_paused(p.user, False)),

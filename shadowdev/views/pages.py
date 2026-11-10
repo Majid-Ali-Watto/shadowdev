@@ -3,6 +3,7 @@ import html
 import time
 from pathlib import Path
 
+from ..automation.rules import MAX_NOTE_CHARS
 from ..config import Config
 from ..models.project import Project
 from ..models.user import Subscription, User
@@ -278,6 +279,10 @@ def settings_page(cfg: Config, user: User, projects: list[Project], secrets: dic
   <form method="post" action="/run">{hidden}
 <label>Issue keys <input name="issue_keys" placeholder="MAR-123, MAR-124" required spellcheck="false" autocomplete="off"></label>
 {project_pick}
+<label>Note for Claude <span class="muted">(optional: anything the tickets don't say, e.g. where to look or
+  what to leave alone. Start a line with a key, like <code>MAR-123:</code>, for a note that is only for
+  that issue; lines before those are for all of them)</span>
+  <textarea name="note" maxlength="{MAX_NOTE_CHARS}" placeholder="Don't change the API.&#10;MAR-123: the bug is in the checkout total, not the cart."></textarea></label>
 <div class="field"><span class="label">With more than one issue</span>
   <div class="choices">
     <label class="choice"><input type="radio" name="grouping" value="separate" checked>

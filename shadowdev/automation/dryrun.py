@@ -97,7 +97,7 @@ def dry_run_actor(user: User, project: Project) -> Actor:
 
 
 def dry_run(cfg: Config, users: UserRepository, projects: ProjectRepository, project_name: str | None,
-            who: str | None, issue_type: str, summary: str, description: str) -> None:
+            who: str | None, issue_type: str, summary: str, description: str, note: str = "") -> None:
     user = pick_user(users, who)
     project = pick_project(projects, user, project_name)
     actor = dry_run_actor(user, project)
@@ -111,7 +111,8 @@ def dry_run(cfg: Config, users: UserRepository, projects: ProjectRepository, pro
     log.info("dry run %s as %s on %s: %s %r", key, user.display_name, project.name, issue_type, summary)
     started = time.monotonic()
     try:
-        status, message = process_issues([key], project, actor, cfg, PrintingJira(fields), NoGitHub(), publish=False)
+        status, message = process_issues([key], project, actor, cfg, PrintingJira(fields), NoGitHub(), publish=False,
+                                         note=note)
 
         print(f"\nResult: {status}: {message}")
         workspace = cfg.worktree_root / workspace_name(project, key)

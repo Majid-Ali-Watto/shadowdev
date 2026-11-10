@@ -1,6 +1,6 @@
 """Usage:
     python -m shadowdev            # the server: web page at PUBLIC_URL, Jira webhook at /webhook
-    python -m shadowdev dry-run --summary "..." [--description "..."] [--type Bug|Task]
+    python -m shadowdev dry-run --summary "..." [--description "..."] [--type Bug|Task] [--note "..."]
                                 [--project NAME] [--as DEVELOPER]
                                    # try the pipeline on a made-up issue; nothing goes to Jira or GitHub
 """
@@ -20,6 +20,7 @@ def main() -> None:
     text.add_argument("--description", default="", help="the made-up issue's description")
     text.add_argument("--description-file", type=Path, help="read the description from a file")
     dry.add_argument("--type", default="Bug", choices=["Bug", "Task", "Story"], help="issue type (default Bug)")
+    dry.add_argument("--note", default="", help="a developer's note for Claude, as on the Run issues now form")
     dry.add_argument("--project", help="project name, e.g. marketplace (default: your only one)")
     dry.add_argument("--as", dest="who", help="developer: name, GitHub login or Jira account ID (default: the only one)")
     args = parser.parse_args()
@@ -35,7 +36,7 @@ def main() -> None:
         description = args.description_file.read_text() if args.description_file else args.description
         db = database(cfg)
         dry_run(cfg, UserRepository(db), ProjectRepository(db), args.project, args.who,
-                args.type, args.summary, description)
+                args.type, args.summary, description, args.note.strip())
     else:
         from .server import serve
 

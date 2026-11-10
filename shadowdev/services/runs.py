@@ -21,11 +21,13 @@ class RunService:
         self.oauth = oauth
         self.queue = queue
 
-    def request(self, user: User, issue_keys: str, together: bool, project_id: str = "") -> None:
+    def request(self, user: User, issue_keys: str, together: bool, project_id: str = "", note: str = "") -> None:
         """Queue one or more issues (`issue_keys`: separated by spaces, commas or semicolons):
         each on its own branch and PR (run in parallel), or all together on one branch with one
         PR per repo. Each key's project is found among the developer's; `project_id` picks one
-        when the same Jira key is in several of them (e.g. MAR at work and at home)."""
+        when the same Jira key is in several of them (e.g. MAR at work and at home). `note`: the
+        developer's own instructions, given to Claude with the issues. For issues run separately,
+        lines starting "MAR-12:" go only to that issue's run; the lines before them go to every run."""
         keys = list(dict.fromkeys(re.split(r"[\s,;]+", issue_keys.strip().upper())))
         keys = [k for k in keys if k]
         if not keys:
@@ -35,6 +37,13 @@ class RunService:
             raise UserError(f"Not an issue key: {', '.join(bad)}")
         if len(keys) > MAX_GROUP:
             raise UserError(f"At most {MAX_GROUP} issues at a time.")
+        note = "\n".join(note.split("\r\n")).strip()
+        if len(note) > rules.MAX_NOTE_CHARS:
+            raise UserError(f"The note is {len(note)} characters; keep it under {rules.MAX_NOTE_CHARS}.")
+        general, parts = rules.split_note(note)
+        unknown = [k for k in parts if k not in keys]
+        if unknown:
+            raise UserError(f"The note has a part for {', '.join(unknown)}, which is not among the issue keys.")
         if user.paused:
             raise UserError("Your automation is paused. Resume it to run issues.")
         mine = [p for p in self.projects.on_sites(list(user.sites)) if p.id in user.subscriptions]
@@ -72,11 +81,12 @@ class RunService:
         if together and len(keys) > 1:
             if len({p.id for p in projects.values()}) > 1:
                 raise UserError("Issues fixed on one branch must all be in the same project.")
-            refusal = self.queue.submit(projects[keys[0]], keys, user.id)
+            refusal = self.queue.submit(projects[keys[0]], keys, user.id, note=note)
             if refusal:
                 raise UserError(f"Not queued: {refusal}.")
             return
-        refused = [f"{k}: {r}" for k in keys if (r := self.queue.submit(projects[k], [k], user.id))]
+        refused = [f"{k}: {r}" for k in keys if (r := self.queue.submit(
+            projects[k], [k], user.id, note="\n".join(filter(None, [general, parts.get(k)]))))]
         if refused:
             queued = len(keys) - len(refused)
             raise UserError(("Queued the others. " if queued else "") + "Not queued: " + "; ".join(refused) + ".")

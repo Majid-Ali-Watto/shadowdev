@@ -10,11 +10,12 @@ class RunRepository:
     def __init__(self, db: Database):
         self.db = db
 
-    def add(self, issue_key: str, user_id: int, project_id: int, project: str) -> int:
+    def add(self, issue_key: str, user_id: int, project_id: int, project: str, note: str = "") -> int:
         with closing(self.db.connect()) as conn, conn:
             return conn.execute(
-                "INSERT INTO runs (issue_key, user_id, project_id, project, status, updated) VALUES (?, ?, ?, ?, 'queued', ?)",
-                (issue_key, user_id, project_id, project, time.time()),
+                "INSERT INTO runs (issue_key, user_id, project_id, project, note, status, updated) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
+                (issue_key, user_id, project_id, project, note, time.time()),
             ).lastrowid
 
     def update(self, run_id: int, status: str, message: str = "") -> None:

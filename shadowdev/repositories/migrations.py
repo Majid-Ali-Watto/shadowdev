@@ -129,7 +129,8 @@ def upgrade_from_v1(db, conn: sqlite3.Connection, projects_dir: Path | None, sit
                          (user_ids[acc], pid, jira_ids[acc], github_ids.get(acc), claude_ids.get(acc), modes[acc],
                           s["base_branches"], n))
         conn.executemany(
-            "INSERT INTO runs VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO runs (id, issue_key, user_id, project_id, project, status, message, updated) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             [(r["id"], r["issue_key"], user_ids[r["account_id"]], project_ids.get(r["project"]), r["project"],
               r["status"], r["message"], r["updated"]) for r in runs if r["account_id"] in user_ids])
         conn.execute(f"PRAGMA user_version = {VERSION}")
