@@ -25,6 +25,8 @@ log = logging.getLogger("shadowdev")
 COMMAND_TIMEOUT_SECONDS = 30 * 60
 OUTPUT_LIMIT = 8000
 MAX_FILE_BYTES = 2 * 1024**3  # a setup/test command cannot write a file bigger than this
+MAX_REPORT_BYTES = 50 * 1024**2  # a bigger JUnit report is not read
+MAX_REPORTS = 500
 REPORT_DIR_ENV = "SHADOWDEV_REPORT_DIR"
 MAX_BASELINES = 64  # baseline results kept (by repo, base commit and commands); the oldest go first
 NOT_TESTED = "no test command is set for this repo, so the change was not tested"
@@ -87,12 +89,16 @@ def run_command(cwd: Path, command: str, cfg: Config, label: str, cancel: Cancel
 
 
 def junit_results(report_dir: Path) -> tuple[set[str], set[str]]:
-    """(readable report file names, ids of failed or errored test cases)."""
+    """(readable report file names, ids of failed or errored test cases). The reports were written
+    by the code under test, and are read outside the sandbox: only regular files of a sane size
+    are opened (a link could point anywhere, a pipe would block, a huge file would fill memory)."""
     reports, failures = set(), set()
-    for path in sorted(report_dir.glob("*.xml")):
+    for path in sorted(report_dir.glob("*.xml"))[:MAX_REPORTS]:
         try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_REPORT_BYTES:
+                continue
             cases = list(ET.parse(path).iter("testcase"))
-        except ET.ParseError:
+        except (ET.ParseError, OSError):
             continue  # unreadable counts as missing
         reports.add(path.name)
         for case in cases:

@@ -87,10 +87,18 @@ class RunQueue:
             threading.Thread(target=self.run_forever, daemon=True, name=f"run-{n}").start()
 
     def submit(self, project: Project, keys: list[str], user_id: int, run_id: int | None = None,
-               note: str = "") -> str | None:
+               note: str = "", automatic: bool = False) -> str | None:
         """Queue the issues as one job. Returns why not, or None when queued. `run_id`: an
-        existing queued run, resumed after a restart. `note`: the developer's instructions for it."""
+        existing queued run, resumed after a restart. `note`: the developer's instructions for it.
+        `automatic`: queued by a webhook or by polling, not by the developer. An issue whose last
+        run failed or was stopped is then left alone: ShadowDev's own comment about the failure
+        updates the issue, which would start it again, and again, each time it fails."""
         pending = {(project.cloud_id, k) for k in keys}
+        if automatic:
+            for key in keys:
+                last = self.runs.last_status(user_id, project.id, key)
+                if last in ("failed", "stopped"):
+                    return f"the last run of {key} {'failed' if last == 'failed' else 'was stopped'}; run it again from the page"
         with self._lock:
             busy = sorted(k for _, k in self._pending & pending)
             if busy:
@@ -177,7 +185,7 @@ class RunQueue:
             self.runs.update(run_id, "failed", str(e))
             for key in keys:
                 try:
-                    jira.comment(key, "ShadowDev could not finish working on this issue. "
-                                      "The reason is under Recent runs on the ShadowDev page.")
+                    jira.comment(key, "ShadowDev could not finish working on this issue. The reason is under "
+                                      "Recent runs on the ShadowDev page; it runs again when started from there.")
                 except Exception:
                     log.exception("%s: could not report failure to Jira", key)

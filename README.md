@@ -374,7 +374,9 @@ one; 401 otherwise), and a timestamp less than an hour old; each event is accept
 across restarts (it is recorded in the database), so a captured one cannot be replayed. The issue is then
 fetched again from Jira, as the assignee, before anything runs. A branch for the issue on GitHub
 means it was handled, so repeat events do nothing. To run an issue again, close its PR and
-delete its branch.
+delete its branch. An issue whose last run **failed or was stopped** is not started again by a
+webhook or by polling (ShadowDev's own comment about the failure updates the issue, which would
+otherwise start it again each time): start it again with **Run issues now**.
 
 **What stays the reviewers' job.** Anyone who can write a ticket can steer what Claude writes, and
 the PR is opened under the developer's name. The tests ran the change's own code, so their result

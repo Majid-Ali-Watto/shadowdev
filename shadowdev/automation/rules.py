@@ -3,6 +3,7 @@ import re
 
 # Issue keys become branch names and directory names, so they must be strictly validated.
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-[0-9]+\Z")
+ISSUE_KEYS_RE = re.compile(r"[A-Z][A-Z0-9_]+-[0-9]+")  # each key in a run's branch name, MAR-1_MAR-2
 
 MAX_NOTE_CHARS = 2000  # a developer's note for a run they start by hand
 NOTE_KEY_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]+-[0-9]+)\s*:\s*")

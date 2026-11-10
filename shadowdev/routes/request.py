@@ -124,7 +124,7 @@ def form_action(action: Callable[[Request, FormPost], None]) -> Callable[[Reques
             return req.json(413, "form too large")
         form = {k: v[-1] for k, v in lists.items()}
         session = req.session()
-        if not session or not hmac.compare_digest(form.get("csrf", ""), session[2]):
+        if not session or not hmac.compare_digest(form.get("csrf", "").encode(), session[2].encode()):
             return req.redirect("/")  # expired session or forged form
         token, user_id, csrf = session
         user = req.app.users.get(user_id)

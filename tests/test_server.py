@@ -60,6 +60,7 @@ class WebhookTest(Env):
         self.assertTrue(verify_signature("s3cret", body, good))
         self.assertFalse(verify_signature("other", body, good))
         self.assertFalse(verify_signature("s3cret", body, None))
+        self.assertFalse(verify_signature("s3cret", body, "sha256=caf\u00e9"))  # refused, not an error
         self.assertFalse(verify_signature("s3cret", body, good.removeprefix("sha256=")))
 
     def test_routes_to_the_project_on_its_site_and_the_developer_of_that_jira_account(self):
@@ -106,7 +107,7 @@ class WebTest(Env):
     def setUp(self):
         super().setUp()
         self.queued = []
-        self.pool = mock.Mock(submit=lambda project, keys, uid, note="": self.queued.append((project.name, keys, uid, *([note] if note else []))))
+        self.pool = mock.Mock(submit=lambda project, keys, uid, note="", **kw: self.queued.append((project.name, keys, uid, *([note] if note else []))))
         self.oauth = mock.Mock()
         self.oauth.authorize_url.side_effect = lambda state: f"https://auth.atlassian.com/authorize?state={state}"
         self.oauth.exchange.return_value = Tokens("access-1", "refresh-1", time.time() + 3600)
@@ -594,6 +595,24 @@ class StopAndPauseTest(QueueEnv):
         self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "stopped")
         self.assertEqual(pool.stop_runs(me), 0)
 
+    def test_a_failed_or_stopped_issue_is_not_started_again_automatically(self):
+        # Its failure comment updates the issue, which a webhook or the poller would take for new work.
+        me, sara = self.developer(), self.developer("acc-sara")
+
+        def failing(keys, project, actor, cfg, jira, github, cancel=None, note=""):
+            raise RuntimeError("tests still failing")
+
+        pool = self.pool(failing)
+        self.assertIsNone(pool.submit(self.market, ["MAR-1", "MAR-2"], me, automatic=True))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "failed")
+        self.wait_for(lambda: pool.submit(self.market, ["MAR-3"], me) is None)  # the worker is free again
+        self.assertIn("the last run of MAR-2 failed", pool.submit(self.market, ["MAR-2"], me, automatic=True))
+        self.assertIsNone(pool.submit(self.market, ["MAR-22"], me, automatic=True))  # another issue
+        self.assertIsNone(pool.submit(self.market, ["MAR-2"], me))  # by hand
+        # Reassigned: it is new work for the other developer (once this developer's run is over).
+        self.wait_for(lambda: pool.submit(self.market, ["MAR-2"], sara, automatic=True) is None)
+        self.wait_for(lambda: all(r["status"] == "failed" for u in (me, sara) for r in self.runs.recent(u)))
+
     def test_a_developer_stops_one_of_their_runs(self):
         me, sara = self.developer(), self.developer("acc-sara")
         started = []
@@ -644,7 +663,7 @@ class LimitsTest(Env):
     def test_webhooks_are_signed_fresh_and_accepted_once_also_across_restarts(self):
         self.developer()
         queued = []
-        pool = mock.Mock(submit=lambda project, keys, uid: queued.append((project.name, keys[0])))
+        pool = mock.Mock(submit=lambda project, keys, uid, **kw: queued.append((project.name, keys[0])))
 
         def serve():
             server = Server(("127.0.0.1", 0), make_handler(build_app(self.cfg, mock.Mock(), pool)))

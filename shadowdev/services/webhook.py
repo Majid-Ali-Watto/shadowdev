@@ -29,7 +29,7 @@ def verify_signature(secret: str, body: bytes, header: str | None) -> bool:
     if not header or not header.startswith("sha256="):
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header.removeprefix("sha256="))
+    return hmac.compare_digest(expected.encode(), header.removeprefix("sha256=").encode())
 
 
 def site_of(issue: dict) -> str | None:
@@ -103,7 +103,7 @@ class WebhookService:
         if not match:
             return 200, "ignored"
         key, project, user_id = match
-        refusal = self.queue.submit(project, [key], user_id)
+        refusal = self.queue.submit(project, [key], user_id, automatic=True)
         if refusal:
             return 200, refusal
         log.info("%s: queued for %s", key, project.name)
