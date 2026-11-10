@@ -105,5 +105,41 @@ class JiraClientTest(unittest.TestCase):
             jira.myself()
 
 
+class RestTest(unittest.TestCase):
+    def call(self, method, outcomes):
+        """`outcomes`: per attempt, an HTTP status to fail with, an exception, or a JSON body."""
+        import io
+        import urllib.error
+        from shadowdev.clients import rest
+        outcomes = list(outcomes)
+
+        def urlopen(request, timeout):
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, int):
+                raise urllib.error.HTTPError(request.full_url, outcome, "x", {"Retry-After": "1"}, io.BytesIO(b"no"))
+            if isinstance(outcome, Exception):
+                raise outcome
+            response = mock.MagicMock()
+            response.__enter__.return_value.read.return_value = outcome
+            return response
+
+        with mock.patch.object(rest.urllib.request, "urlopen", urlopen), mock.patch.object(rest.time, "sleep") as sleep:
+            try:
+                return rest.request_json(method, "https://x.test/a?b=1", {}), sleep.call_count, outcomes
+            except rest.HTTPError as e:
+                return e, sleep.call_count, outcomes
+
+    def test_rate_limits_and_failed_reads_are_tried_again_but_writes_are_not_repeated(self):
+        self.assertEqual(self.call("POST", [429, b'{"ok": 1}']), ({"ok": 1}, 1, []))  # refused, so safe to repeat
+        self.assertEqual(self.call("GET", [502, OSError("reset"), b'[]']), ([], 2, []))
+        error, sleeps, left = self.call("POST", [502, b'{}'])  # it may have been carried out
+        self.assertEqual((error.status, sleeps, left), (502, 0, [b'{}']))
+        error, sleeps, left = self.call("GET", [404, b'{}'])
+        self.assertEqual((error.status, sleeps), (404, 0))
+        error, sleeps, left = self.call("GET", [TimeoutError("timed out")] * 3)  # unreachable: status 0
+        self.assertEqual((error.status, sleeps, left), (0, 2, []))
+        self.assertIn("could not be reached", str(error))
+
+
 if __name__ == "__main__":
     unittest.main()

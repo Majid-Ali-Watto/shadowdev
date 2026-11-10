@@ -18,6 +18,7 @@ reports and Claude's transcript of the run are deleted. Only a dry run keeps its
 Prompts and answer checks are in prompts.py; running and judging the tests in verify.py.
 """
 import logging
+import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -42,6 +43,7 @@ from ..models.user import Actor
 log = logging.getLogger("shadowdev")
 
 MAX_GROUP = 10  # issues fixed together on one branch
+MAX_TITLE_CHARS = 200  # GitHub refuses PR titles over 256 characters; a Jira summary can be 255
 
 
 def branch_name(keys: list[str]) -> str:
@@ -50,7 +52,10 @@ def branch_name(keys: list[str]) -> str:
 
 
 def handled_by(branch: str, key: str) -> bool:
-    return key in branch.split("_")
+    """The branch is a run's (MAR-1, or MAR-1_MAR-2) and covers the issue. Jira project keys may
+    contain underscores themselves (MY_APP-1), so the branch is read key by key, not split on "_"."""
+    keys = rules.ISSUE_KEYS_RE.findall(branch)
+    return key in keys and branch_name(keys) == branch
 
 
 # Jira and workspace helpers
@@ -74,9 +79,28 @@ def comment_all(jira: Jira, issues: list[Issue], text: str) -> None:
         jira.comment(issue.key, text)
 
 
+def delete_tree(path: Path) -> None:
+    """Delete a run's folder. The setup and test commands ran code Claude wrote in it, which may
+    have left folders without write or read permission; those are opened up first, so that
+    nothing of the run stays behind."""
+    if not path.exists():
+        return
+    for root, dirs, _ in os.walk(path):  # top-down: each folder is opened up before it is entered
+        for name in [".", *dirs]:
+            folder = os.path.join(root, name)
+            if not os.path.islink(folder):
+                try:
+                    os.chmod(folder, 0o700)
+                except OSError:
+                    pass
+    shutil.rmtree(path, ignore_errors=True)
+    if path.exists():
+        log.error("%s could not be deleted completely; remove it by hand", path)
+
+
 def remove_code(workspace: Path, scratch: Path, claude_dir: Path) -> None:
-    shutil.rmtree(workspace, ignore_errors=True)
-    shutil.rmtree(scratch, ignore_errors=True)
+    delete_tree(workspace)
+    delete_tree(scratch)
     forget_claude_sessions(claude_dir, workspace)
 
 
@@ -212,7 +236,7 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
             remove_code(workspace, scratch, claude_dir)
             log.info("%s: code removed from the server", label)
         else:  # a dry run keeps only the change, for inspection
-            shutil.rmtree(scratch, ignore_errors=True)
+            delete_tree(scratch)
             forget_claude_sessions(claude_dir, workspace)
 
 
@@ -320,6 +344,8 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     # 4. Per changed repo: commit and push as the developer, PR into the base branch.
     if len(issues) == 1:
         title = f"{issues[0].key}: {issues[0].summary or ('bug fix' if issues[0].kind == 'bug' else 'task')}"
+        if len(title) > MAX_TITLE_CHARS:
+            title = title[:MAX_TITLE_CHARS - 1].rstrip() + "…"
     else:
         title = f"{', '.join(keys_here)}: {len(issues)} issues fixed together"
     per_issue = "\n\n".join(
@@ -346,11 +372,16 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
         prs.append(f"{c.repo.name} into {c.base}: {pr_url}")
         log.info("%s: %s PR %s", label, c.repo.name, pr_url)
     cancel.check()
+    unreported = []
     with timings.step("Jira PR links and review status"):
         for issue in issues:
             others = [k for k in keys_here if k != issue.key]
             together = f"\nFixed together with {', '.join(others)}." if others else ""
-            jira.comment(issue.key, "ShadowDev opened:\n" + "\n".join(f"* {p}" for p in prs) + together)
-            log.info("%s: Jira comment with the PR links posted", issue.key)
+            try:  # the PRs are open: a Jira error now must not make the run look failed
+                jira.comment(issue.key, "ShadowDev opened:\n" + "\n".join(f"* {p}" for p in prs) + together)
+                log.info("%s: Jira comment with the PR links posted", issue.key)
+            except HTTPError as e:
+                log.warning("%s: could not comment the PR links: %s", issue.key, e)
+                unreported.append(f"{issue.key}: the PR links could not be commented on the ticket")
             move_issue(jira, issue.key, project.review_statuses)
-    return "done", "; ".join([*prs, *(f"skipped {s}" for s in skipped)])
+    return "done", "; ".join([*prs, *unreported, *(f"skipped {s}" for s in skipped)])

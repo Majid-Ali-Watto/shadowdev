@@ -23,7 +23,7 @@ class PollerTest(unittest.TestCase):
     def setUp(self):
         self.queued = []
         self.app = build_app(make_cfg(Path(tempfile.mkdtemp())), mock.Mock(),
-                             mock.Mock(submit=lambda project, keys, uid: self.queued.append((project.name, keys, uid))))
+                             mock.Mock(submit=lambda project, keys, uid, **kw: self.queued.append((project.name, keys, uid))))
         users, projects = self.app.users, self.app.projects
         self.me = add_developer(users, ME)
         self.market = add_project(projects, self.me, "marketplace", ["MAR", "MARS"])

@@ -29,6 +29,14 @@ class RunRepository:
             conn.execute("UPDATE runs SET status = 'stopping', message = 'stop requested', updated = ? "
                          "WHERE id = ? AND status IN ('queued', 'running')", (time.time(), run_id))
 
+    def last_status(self, user_id: int, project_id: int, issue_key: str) -> str | None:
+        """How the developer's latest run of the issue (alone or in a group) in the project ended."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                "SELECT status FROM runs WHERE user_id = ? AND project_id = ? AND instr(', ' || issue_key || ', ', ?) > 0 "
+                "ORDER BY id DESC LIMIT 1", (user_id, project_id, f", {issue_key}, ")).fetchone()
+        return row[0] if row else None
+
     def resume_after_restart(self) -> list[sqlite3.Row]:
         """At startup: runs that were running are lost (failed); queued ones are returned, oldest first,
         to be queued again."""

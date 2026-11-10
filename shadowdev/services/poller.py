@@ -71,7 +71,7 @@ class Poller:
             key, fields = issue.get("key") or "", issue.get("fields") or {}
             if (rules.ISSUE_KEY_RE.match(key) and project.handles(key) and rules.assignee(fields) == actor.jira_account_id
                     and rules.wanted(rules.issue_kind(fields), actor.mode)
-                    and self.queue.submit(project, [key], user.id) is None):
+                    and self.queue.submit(project, [key], user.id, automatic=True) is None):
                 log.info("%s: queued for %s by polling", key, project.name)
                 queued += 1
         self.users.mark_polled(user.id, project.id, now)

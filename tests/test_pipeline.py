@@ -275,6 +275,48 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(self.choose_model(lambda model=None: mock.Mock(ask=lambda *a: {"complexity": rating}),
                                                [], "", "PROJ-1"), expected)
 
+    def test_a_long_summary_and_a_jira_error_after_the_pr_do_not_fail_the_run(self):
+        from shadowdev.clients.rest import HTTPError
+        self.jira.get_issue.return_value["fields"]["summary"] = "Totals are wrong " * 15  # 255 characters
+        self.jira.comment.side_effect = lambda key, text: (_ for _ in ()).throw(HTTPError("Jira 502", 502)) \
+            if "ShadowDev opened" in text else None
+        with self.assertLogs("shadowdev", "WARNING"):
+            status, message = self.run_pipeline([RIGHT_FIX])
+        self.assertEqual(status, "done")  # the PR is open
+        self.assertIn("https://github.com/o/r/pull/1", message)
+        self.assertIn("PROJ-1: the PR links could not be commented", message)
+        title = self.github.create_pr.call_args.kwargs["title"]
+        self.assertTrue(title.startswith("PROJ-1: Totals are wrong") and title.endswith("…") and len(title) <= 200)
+
+    def test_branches_of_keys_with_underscores(self):
+        self.assertTrue(pipeline.handled_by("MY_APP-1", "MY_APP-1"))
+        self.assertTrue(pipeline.handled_by("MAR-1_MY_APP-2_MAR-3", "MY_APP-2"))
+        self.assertTrue(pipeline.handled_by("MAR-1_MAR-2", "MAR-2"))
+        self.assertFalse(pipeline.handled_by("MAR-12", "MAR-1"))
+        self.assertFalse(pipeline.handled_by("feature/MAR-1-totals", "MAR-1"))  # someone's own branch
+
+    def test_code_is_deleted_even_when_test_code_locked_its_folders(self):
+        locked = self.tmp / "ws" / "app" / "locked"
+        (locked / "inner").mkdir(parents=True)
+        (locked / "inner" / "secret.py").write_text("x = 1\n")
+        (locked / "inner").chmod(0)
+        locked.chmod(0o500)
+        pipeline.delete_tree(self.tmp / "ws")
+        self.assertFalse((self.tmp / "ws").exists())
+
+    def test_only_plain_report_files_of_a_sane_size_are_read(self):
+        reports = self.tmp / "reports"
+        reports.mkdir()
+        case = '<testsuite><testcase classname="c" name="n"><failure/></testcase></testsuite>'
+        (reports / "ok.xml").write_text(case)
+        (self.tmp / "elsewhere.xml").write_text(case)
+        (reports / "link.xml").symlink_to(self.tmp / "elsewhere.xml")
+        os.mkfifo(reports / "pipe.xml")  # opening it would block forever
+        (reports / "huge.xml").write_text(case)
+        with mock.patch.object(verify, "MAX_REPORT_BYTES", 10):
+            self.assertEqual(verify.junit_results(reports), (set(), set()))
+        self.assertEqual(verify.junit_results(reports), ({"ok.xml", "huge.xml"}, {"ok: c :: n", "huge: c :: n"}))
+
     def test_tasks_when_the_developer_automates_them(self):
         self.jira.get_issue.return_value["fields"]["issuetype"] = {"name": "Story"}
         self.assertEqual(self.run_pipeline([])[0], "skipped")  # mode "bugs"

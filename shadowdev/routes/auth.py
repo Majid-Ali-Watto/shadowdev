@@ -52,7 +52,7 @@ def finish_sign_in(req: Request) -> None:
 
     if req.arg("error"):
         return fail("Jira access was not granted.")
-    if (not expected or intent not in ("signin", "connect") or not hmac.compare_digest(req.arg("state"), expected)
+    if (not expected or intent not in ("signin", "connect") or not hmac.compare_digest(req.arg("state").encode(), expected.encode())
             or not req.arg("code") or (intent == "connect" and not user)):
         return fail(f"The sign-in expired or was started elsewhere. Open {public_url} and sign in again.")
     try:
