@@ -26,6 +26,14 @@ def show(req: Request) -> None:
     render(req, user, session[2], notice=pages.NOTICES.get(req.arg("ok"), ""))
 
 
+def runs(req: Request) -> None:
+    """The rows of Recent runs, which the page fetches to keep itself up to date."""
+    session = req.session(renew=False)
+    if not session:
+        return req.json(401, "signed out")
+    req.html(pages.run_rows(req.app.runs.recent(session[1]), session[2]))
+
+
 def action(notice: str, do: Callable[[Request, FormPost], None]) -> Callable[[Request], None]:
     """A form on the page: on success back to the page with `notice` (a key of pages.NOTICES);
     a UserError shows the page again with the error."""
@@ -47,6 +55,7 @@ def delete_account(req: Request, post: FormPost) -> None:
 
 ROUTES = {
     ("GET", "/"): show,
+    ("GET", "/runs"): runs,
     ("POST", "/jira/remove"): action("jira-removed", lambda req, p: req.app.accounts.remove_jira(
         p.user, p.form.get("jira_account_id", ""))),
     ("POST", "/github"): action("github", lambda req, p: req.app.accounts.connect_github(

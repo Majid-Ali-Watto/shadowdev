@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..app import App
 from ..models.user import User
+from ..repositories.sessions import SESSION_SECONDS
 
 MAX_FORM_BYTES = 64_000
 COOKIE = "shadowdev_session"
@@ -25,6 +26,7 @@ class Request:
         self._https = app.cfg.public_url.startswith("https://")
         self._secure = "; Secure" if self._https else ""
         self.sent = False  # a response went out
+        self._renewed: list[tuple[str, str]] = []  # the session cookie again, when the session was renewed
 
     def arg(self, name: str) -> str:
         return (self.query.get(name) or [""])[0]
@@ -35,10 +37,13 @@ class Request:
         morsel = SimpleCookie(self.headers.get("Cookie") or "").get(name)
         return morsel.value if morsel else None
 
-    def session(self) -> tuple[str, int, str] | None:
-        """(cookie token, user ID, csrf) of the browser's live session."""
+    def session(self, renew: bool = True) -> tuple[str, int, str] | None:
+        """(cookie token, user ID, csrf) of the browser's live session. Using it renews it,
+        unless `renew` is off (a page refreshing itself is not the developer using it)."""
         token = self.cookie(COOKIE)
         found = self.app.sessions.get(token) if token else None
+        if found and renew and not self._renewed and self.app.sessions.renew(token):
+            self._renewed.append(("Set-Cookie", self.set_cookie(COOKIE, token, SESSION_SECONDS)))
         return (token, *found) if found else None
 
     def content_length(self) -> int:
@@ -81,7 +86,7 @@ class Request:
         h.send_header("X-Content-Type-Options", "nosniff")
         if self._https:
             h.send_header("Strict-Transport-Security", "max-age=31536000")
-        for name, value in headers:
+        for name, value in [*self._renewed, *headers]:  # a route's own cookie (signing out) comes last, and wins
             h.send_header(name, value)
         h.end_headers()
         h.wfile.write(body)
@@ -91,7 +96,7 @@ class Request:
 
     def html(self, html: str, nonce: str = "", status: int = 200, cookies: tuple[str, ...] = ()) -> None:
         headers = [
-            ("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; "
+            ("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; "
                                         "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
             ("Referrer-Policy", "same-origin"),  # no-referrer would make browsers send Origin: null on form posts
             ("Cache-Control", "no-store"),

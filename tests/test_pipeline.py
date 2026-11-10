@@ -214,7 +214,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(claude.env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-x")
         self.assertEqual(claude.env["CLAUDE_CONFIG_DIR"], str(self.cfg.data_dir / "claude" / "k-office"))
         self.assertNotIn("GH_TOKEN", claude.env)
-        self.assertEqual((claude.model, claude.effort), ("sonnet", "medium"))
+        self.assertEqual((claude.model, claude.effort), (None, None))  # stepped up after the wrong fix
         self.assertNotIn("developer_note", claude.prompts[0][0])
         self.assertEqual(len(claude.prompts), 3)  # analyse, change, retry
         self.assertEqual(claude.prompts[0][1], "Read,Glob,Grep")
@@ -316,6 +316,79 @@ class PipelineTest(unittest.TestCase):
         with mock.patch.object(verify, "MAX_REPORT_BYTES", 10):
             self.assertEqual(verify.junit_results(reports), (set(), set()))
         self.assertEqual(verify.junit_results(reports), ({"ok.xml", "huge.xml"}, {"ok: c :: n", "huge: c :: n"}))
+
+    def test_what_a_weaker_model_cannot_do_the_next_stronger_one_tries(self):
+        # Rated simple: Haiku changes nothing, Sonnet's change fails the tests, the default model fixes it.
+        real_ask, idle = FakeClaude.ask, []
+
+        def ask(self, prompt, tools, schema):
+            if "issues" not in schema["properties"] and not idle:
+                idle.append(self.model)
+                return {"summary": "Nothing needed changing, as far as I can see."}
+            return real_ask(self, prompt, tools, schema)
+
+        models = []
+        with mock.patch.object(pipeline, "choose_model", lambda *a: ("haiku", None)), mock.patch.object(FakeClaude, "ask", ask):
+            status, _ = self.run_pipeline([WRONG_FIX, RIGHT_FIX], on_model=models.append)
+        self.assertEqual(status, "done")
+        self.assertEqual(idle, ["haiku"])
+        self.assertEqual(models, ["haiku", "haiku → sonnet (medium)", "haiku → sonnet (medium) → default"])
+        claude = FakeClaude.instances[0]  # one conversation throughout
+        self.assertEqual((claude.model, claude.effort, len(FakeClaude.instances)), (None, None, 1))
+
+    def test_comments_and_attachments_of_the_issue_reach_claude_and_are_not_committed(self):
+        fields = self.jira.get_issue.return_value["fields"]
+        fields["comment"] = {"comments": [
+            {"author": {"displayName": "Sara"}, "body": "It also happens with discounts."},
+            {"author": {"displayName": "Majid"}, "body": "*Root cause (ShadowDev):*\nan earlier run's analysis"},
+        ]}
+        fields["attachment"] = [
+            {"id": "10", "filename": "../screen shot.png", "size": 4},
+            {"id": "11", "filename": "tool.exe", "size": 4},  # not a type Claude reads
+            {"id": "12", "filename": "huge.log", "size": 10**9},
+            {"id": "13", "filename": "gone.txt", "size": 4},
+        ]
+        self.jira.attachment.side_effect = lambda attachment_id, limit: b"\x89PNG" if attachment_id == "10" \
+            else (_ for _ in ()).throw(pipeline.HTTPError("Jira 404", 404))
+        real_ask, seen = FakeClaude.ask, []
+
+        def ask(self, prompt, tools, schema):
+            seen.append((self.cwd / "_attachments" / "PROJ-1" / "10-screen_shot.png").read_bytes())
+            return real_ask(self, prompt, tools, schema)
+
+        with mock.patch.object(FakeClaude, "ask", ask), self.assertLogs("shadowdev", "WARNING"):
+            self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
+        self.assertEqual(seen[0], b"\x89PNG")
+        self.assertEqual([c.args[0] for c in self.jira.attachment.call_args_list], ["10", "13"])
+        prompt = FakeClaude.instances[0].prompts[0][0]
+        self.assertIn("- Sara: It also happens with discounts.", prompt)
+        self.assertNotIn("an earlier run's analysis", prompt)  # ShadowDev's own comments are not fed back
+        self.assertIn("- _attachments/PROJ-1/10-screen_shot.png", prompt)
+        self.assertNotIn("tool.exe", prompt)
+        self.assertNotIn("_attachments", sh(self.app_origin, "git", "ls-tree", "-r", "--name-only", "PROJ-1"))
+
+    def test_a_failed_run_puts_the_issue_back_where_it_was(self):
+        self.jira.get_issue.return_value["fields"]["status"] = {"name": "To Do"}
+        self.assertEqual(self.run_pipeline([WRONG_FIX] * 3)[0], "failed")
+        self.assertEqual([c.args for c in self.jira.move_along.call_args_list],
+                         [("PROJ-1", ["In Progress"]), ("PROJ-1", ["To Do"])])
+
+    def test_a_pushed_branch_whose_pr_cannot_be_opened_stays_in_progress(self):
+        self.jira.get_issue.return_value["fields"]["status"] = {"name": "To Do"}
+        self.github.create_pr.side_effect = pipeline.HTTPError("GitHub 422: validation failed", 422)
+        with self.assertLogs("shadowdev", "WARNING"):
+            status, message = self.run_pipeline([RIGHT_FIX])
+        self.assertEqual(status, "failed")
+        self.assertIn("app: branch PROJ-1 is pushed, but its PR into release/1.10 could not be opened", message)
+        self.assertIn("https://github.com/acme/app/compare/release/1.10...PROJ-1?expand=1", message)
+        self.assertEqual(sh(self.app_origin, "git", "show", "PROJ-1:calc.py") + "\n", RIGHT_FIX)  # the change is on GitHub
+        # Kept in progress: not moved to review, and not back to where it was.
+        self.assertEqual([c.args for c in self.jira.move_along.call_args_list],
+                         [("PROJ-1", ["In Progress"]), ("PROJ-1", ["In Progress"])])
+        comment = self.jira.comment.call_args.args[1]
+        self.assertIn("could not open every pull request", comment)
+        self.assertIn("compare/release/1.10...PROJ-1", comment)
+        self.assertEqual(self.code_left_on_server(), [])
 
     def test_tasks_when_the_developer_automates_them(self):
         self.jira.get_issue.return_value["fields"]["issuetype"] = {"name": "Story"}

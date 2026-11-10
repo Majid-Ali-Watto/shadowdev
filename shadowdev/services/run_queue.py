@@ -173,7 +173,8 @@ class RunQueue:
         jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
         try:
             status, message = process_issues(keys, project, actor, self.cfg, jira, GitHub(actor.github.token),
-                                             cancel=token, note=note)
+                                             cancel=token, note=note,
+                                             on_model=lambda models: self.runs.set_model(run_id, models))
             log.info("%s: %s: %s", label, status, message)
             self.runs.update(run_id, status, message)
         except Cancelled:

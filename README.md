@@ -31,7 +31,11 @@ project's repos:
    `worktrees/<project id>-MAR-123/{fe,services}`, which is **deleted when the run ends**
 4. has a small Claude model (Haiku) rate the issue from its text as simple, standard or complex,
    which picks the model for the rest of the run: Haiku, Sonnet at medium effort, or the Claude
-   account's default model. An issue that can't be rated runs with the default
+   account's default model. An issue that can't be rated runs with the default. When the model
+   changes nothing, or its change fails the tests, the next stronger one continues the same
+   conversation. Claude is given the issue's summary and description, people's latest comments,
+   and its attached screenshots, logs and documents (up to 10 files of 10 MB per issue, kept
+   beside the clones in the workspace, so they are never committed)
 5. has Claude analyse the workspace (read-only) and decide which repo(s) to change. For a bug it
    writes a concise **root cause** (2–5 sentences: what is wrong, where, and why it causes the
    reported behaviour) to the ticket, and sets the **fix version** to the highest unreleased
@@ -43,6 +47,10 @@ project's repos:
    A repo without a test command is not tested, and its PR says so
 8. per changed repo: commits as the developer, pushes with their GitHub token, and opens a PR
    **into the base branch**. The PR links are commented on the ticket, which moves to **In Review**
+
+A run that **fails before anything is pushed** moves the ticket back to the status it had. If a
+branch was pushed but its **PR could not be opened**, the ticket stays **In Progress**, and the
+run and a ticket comment give the link to open the PR by hand.
 
 ```
 Jira webhook → verify signature (the project's secret) → project: by URL, or by site + key (MAR-123 → MAR)
@@ -214,8 +222,8 @@ same key is in two of yours), and choose whether several are fixed separately or
 branch. An optional **note for Claude** says what the tickets don't (where to look, what to
 leave alone); it is given to Claude with the issues, and is not posted to Jira or GitHub. A line starting
 with a key (`MAR-123: ...`) begins a note for that issue only; the lines before those are for all.
-**Recent runs** shows what happened, and the ticket gets comments with the analysis and
-the PRs.
+**Recent runs** (it keeps itself up to date) shows what happened, with the model and your note,
+and the ticket gets comments with the analysis and the PRs. Your latest 200 finished runs are kept.
 
 - **Stop** (next to a queued or running run in **Recent runs**) stops that run: a queued one never
   starts; a running one stops at once (Claude and the test commands are killed, nothing more is
@@ -356,7 +364,8 @@ remain: Jira comments, PRs, the run list. A dry run keeps its change for inspect
 next one.
 
 **The web page** uses Jira sign-in (OAuth with a one-time `state`), HttpOnly SameSite=Lax session
-cookies, Secure (and HSTS) because `PUBLIC_URL` must be https (plain http only for localhost), CSRF
+cookies (a session lasts 7 days from when it was last used; the page refreshing its run list does
+not count as use), Secure (and HSTS) because `PUBLIC_URL` must be https (plain http only for localhost), CSRF
 tokens, an Origin check, a strict Content-Security-Policy, a 20 s request timeout, and at most 64
 connections handled at once. Connecting another Jira account is a CSRF-checked POST, and the OAuth
 state says what it is for, so another site can't attach an account to yours; an Atlassian account

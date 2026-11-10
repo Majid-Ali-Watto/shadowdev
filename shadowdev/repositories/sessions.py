@@ -6,7 +6,8 @@ from contextlib import closing
 
 from .database import Database
 
-SESSION_SECONDS = 7 * 24 * 3600
+SESSION_SECONDS = 7 * 24 * 3600  # since the session was last renewed
+RENEW_AFTER_SECONDS = 24 * 3600  # a session used after this long gets a full lifetime again
 
 
 def _hash(token: str) -> str:
@@ -35,6 +36,16 @@ class SessionRepository:
                 "SELECT user_id, csrf FROM sessions WHERE token_hash = ? AND expires > ?", (_hash(token), time.time())
             ).fetchone()
         return (row["user_id"], row["csrf"]) if row else None
+
+    def renew(self, token: str) -> bool:
+        """Give a live session, used a day or more after it was created or last renewed, a full
+        lifetime again; so a developer who keeps using ShadowDev stays signed in. True when
+        renewed: its cookie must then be sent again too."""
+        now = time.time()
+        with closing(self.db.connect()) as conn, conn:
+            return conn.execute("UPDATE sessions SET expires = ? WHERE token_hash = ? AND expires > ? AND expires < ?",
+                                (now + SESSION_SECONDS, _hash(token), now,
+                                 now + SESSION_SECONDS - RENEW_AFTER_SECONDS)).rowcount == 1
 
     def end(self, token: str) -> None:
         with closing(self.db.connect()) as conn, conn:
