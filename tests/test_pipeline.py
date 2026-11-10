@@ -70,8 +70,9 @@ class FakeClaude:
 
     instances = []
 
-    def __init__(self, cwd, env, fixes):
+    def __init__(self, cwd, env, fixes, model=None, effort=None, **kw):
         self.cwd = cwd
+        self.model, self.effort = model, effort
         self.env = env
         # Like the real CLI: a transcript of the session, which holds the code it read.
         transcript = Path(env["CLAUDE_CONFIG_DIR"]) / "projects" / str(cwd).replace("/", "-") / "session.jsonl"
@@ -132,6 +133,11 @@ class PipelineTest(unittest.TestCase):
         self.github.can_push.return_value = True
         self.github.create_pr.return_value = "https://github.com/o/r/pull/1"
         FakeClaude.instances = []
+        # The model is chosen by a rating of the issue; here it is rated "standard" unless a test says otherwise.
+        self.choose_model = pipeline.choose_model
+        patcher = mock.patch.object(pipeline, "choose_model", lambda session, issues, note, label: ("sonnet", "medium"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         verify.BASELINES.clear()  # keyed by repo name and commit, which repeat across tests
 
     def make_repo(self, name, files, old_releases, latest):
@@ -156,10 +162,10 @@ class PipelineTest(unittest.TestCase):
         """"GitHub" is the local bare repos: acme/app -> <tmp>/app.git."""
         return mock.patch.object(pipeline.gitops, "repo_url", lambda owner_repo: str(self.tmp / f"{owner_repo.split('/')[1]}.git"))
 
-    def run_pipeline(self, fixes, keys=("PROJ-1",)):
-        with mock.patch.object(pipeline, "ClaudeSession", lambda cwd, env, **kw: FakeClaude(cwd, env, fixes)), \
+    def run_pipeline(self, fixes, keys=("PROJ-1",), **kw):
+        with mock.patch.object(pipeline, "ClaudeSession", lambda cwd, env, **kw: FakeClaude(cwd, env, fixes, **kw)), \
              self.local_github():
-            return pipeline.process_issues(list(keys), self.project, self.actor, self.cfg, self.jira, self.github)
+            return pipeline.process_issues(list(keys), self.project, self.actor, self.cfg, self.jira, self.github, **kw)
 
     def code_left_on_server(self):
         transcripts = list((self.cfg.data_dir / "claude").glob("*/projects/*/*.jsonl"))
@@ -208,6 +214,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(claude.env["CLAUDE_CODE_OAUTH_TOKEN"], "sk-ant-oat01-x")
         self.assertEqual(claude.env["CLAUDE_CONFIG_DIR"], str(self.cfg.data_dir / "claude" / "k-office"))
         self.assertNotIn("GH_TOKEN", claude.env)
+        self.assertEqual((claude.model, claude.effort), ("sonnet", "medium"))
+        self.assertNotIn("developer_note", claude.prompts[0][0])
         self.assertEqual(len(claude.prompts), 3)  # analyse, change, retry
         self.assertEqual(claude.prompts[0][1], "Read,Glob,Grep")
         self.assertIn("- app/ (branch release/1.10)", claude.prompts[0][0])
@@ -226,6 +234,46 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(self.github.create_pr.call_args.kwargs["base"], "main")
         self.assertEqual(sh(self.app_origin, "git", "rev-parse", "PROJ-1~1"), sh(self.app_origin, "git", "rev-parse", "main"))
         self.jira.set_fix_versions.assert_called_once_with("PROJ-1", ["Rel 1.11"])
+
+    def test_the_model_follows_the_rating_and_the_note_reaches_claude(self):
+        rated = []
+
+        class Triage:
+            def __init__(self, cwd, env, model=None, **kw):
+                self.model = model
+
+            def ask(self, prompt, tools, schema):
+                rated.append((self.model, prompt, tools))
+                return {"complexity": "simple"}
+
+        note = "The sign is wrong in add(); leave sub() alone."
+        with mock.patch.object(pipeline, "choose_model", self.choose_model), \
+             mock.patch.object(pipeline, "ClaudeSession",
+                               lambda cwd, env, model=None, **kw: Triage(cwd, env, model) if not rated
+                               else FakeClaude(cwd, env, [RIGHT_FIX], model=model, **kw)), self.local_github():
+            status, _ = pipeline.process_issues(["PROJ-1"], self.project, self.actor, self.cfg, self.jira, self.github,
+                                                note=note)
+        self.assertEqual(status, "done")
+        (model, prompt, tools), = rated
+        self.assertEqual((model, tools), ("haiku", ""))  # the small model, from the text alone
+        self.assertIn("Totals are wrong", prompt)
+        self.assertIn(note, prompt)
+        claude = FakeClaude.instances[0]
+        self.assertEqual((claude.model, claude.effort), ("haiku", None))  # a simple issue: the small model
+        self.assertIn(f"<developer_note>\n{note}\n</developer_note>", claude.prompts[0][0])
+        for text in (self.jira.comment.call_args_list[0].args[1], self.github.create_pr.call_args.kwargs["body"]):
+            self.assertNotIn("leave sub() alone", text)  # the note is for Claude only
+
+    def test_an_issue_that_cannot_be_rated_runs_with_the_default_model(self):
+        def session(model=None):
+            return mock.Mock(ask=mock.Mock(side_effect=RuntimeError("claude failed: model not available")))
+
+        with self.assertLogs("shadowdev", "WARNING"):
+            self.assertEqual(self.choose_model(session, [], "", "PROJ-1"), (None, None))
+        answers = {"complex": (None, None), "standard": ("sonnet", "medium"), "nonsense": (None, None)}
+        for rating, expected in answers.items():
+            self.assertEqual(self.choose_model(lambda model=None: mock.Mock(ask=lambda *a: {"complexity": rating}),
+                                               [], "", "PROJ-1"), expected)
 
     def test_tasks_when_the_developer_automates_them(self):
         self.jira.get_issue.return_value["fields"]["issuetype"] = {"name": "Story"}
@@ -407,7 +455,7 @@ class PipelineTest(unittest.TestCase):
 
         def run(fixes):
             out = io.StringIO()
-            with mock.patch.object(pipeline, "ClaudeSession", lambda cwd, env, **kw: FakeClaude(cwd, env, fixes)), \
+            with mock.patch.object(pipeline, "ClaudeSession", lambda cwd, env, **kw: FakeClaude(cwd, env, fixes, **kw)), \
                  self.local_github(), contextlib.redirect_stdout(out):
                 dryrun.dry_run(self.cfg, users, projects, None, ME, "Task", "Totals are wrong", "2 + 3 shows -1")
             return out.getvalue()

@@ -18,6 +18,10 @@ EDIT_TOOLS = "Read,Glob,Grep,Edit,Write"
 TIMEOUT_SECONDS = 30 * 60
 LOG_TEXT_CHARS = 400
 
+TRIAGE_MODEL = "haiku"  # rates how hard an issue is, from its text alone
+# What works on an issue of each difficulty: (--model, --effort). None: the Claude account's default.
+MODELS = {"simple": ("haiku", None), "standard": ("sonnet", "medium"), "complex": (None, None)}
+
 log = logging.getLogger("shadowdev")
 
 
@@ -118,12 +122,14 @@ class ClaudeSession:
     """
 
     def __init__(self, cwd: Path, env: dict, label: str = "claude", cfg: Config | None = None,
-                 cancel: CancelToken = NEVER):
+                 cancel: CancelToken = NEVER, model: str | None = None, effort: str | None = None):
         self.cwd = cwd
         self.env = env
         self.label = label
         self.cfg = cfg  # set: run in the sandbox
         self.cancel = cancel
+        self.model = model  # None: the Claude account's default
+        self.effort = effort
         self.session_id: str | None = None
 
     def _log_event(self, event: dict) -> None:
@@ -162,6 +168,10 @@ class ClaudeSession:
             "--permission-mode", "acceptEdits",
             "--json-schema", json.dumps(schema),
         ]
+        if self.model:
+            cmd += ["--model", self.model]
+        if self.effort:
+            cmd += ["--effort", self.effort]
         if self.session_id:
             cmd += ["--resume", self.session_id]
         cmd = in_sandbox(cmd, self.cfg, self.cwd, Path(self.env["CLAUDE_CONFIG_DIR"])) if self.cfg else cmd

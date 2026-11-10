@@ -4,6 +4,21 @@ import re
 # Issue keys become branch names and directory names, so they must be strictly validated.
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-[0-9]+\Z")
 
+MAX_NOTE_CHARS = 2000  # a developer's note for a run they start by hand
+NOTE_KEY_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]+-[0-9]+)\s*:\s*")
+
+
+def split_note(note: str) -> tuple[str, dict[str, str]]:
+    """A note's general part, and its part for each issue: a line starting "MAR-12:" begins that
+    issue's part, which runs until the next such line. Lines before the first are general."""
+    general, parts, current = [], {}, None
+    for line in note.split("\n"):
+        match = NOTE_KEY_RE.match(line)
+        if match:
+            current = parts.setdefault(match.group(1).upper(), [])
+            line = line[match.end():]
+        (general if current is None else current).append(line)
+    return "\n".join(general).strip(), {k: "\n".join(v).strip() for k, v in parts.items()}
 
 TASK_TYPES = {"task", "story", "sub-task", "subtask"}
 

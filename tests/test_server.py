@@ -106,7 +106,7 @@ class WebTest(Env):
     def setUp(self):
         super().setUp()
         self.queued = []
-        self.pool = mock.Mock(submit=lambda project, keys, uid: self.queued.append((project.name, keys, uid)))
+        self.pool = mock.Mock(submit=lambda project, keys, uid, note="": self.queued.append((project.name, keys, uid, *([note] if note else []))))
         self.oauth = mock.Mock()
         self.oauth.authorize_url.side_effect = lambda state: f"https://auth.atlassian.com/authorize?state={state}"
         self.oauth.exchange.return_value = Tokens("access-1", "refresh-1", time.time() + 3600)
@@ -306,6 +306,25 @@ class WebTest(Env):
         self.queued.clear()
         self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1, MARS-2", "grouping": "together"})
         self.assertEqual(self.queued, [("marketplace", ["MARS-1", "MARS-2"], me.id)])
+        # A note goes with every run it queues; one that is too long is refused.
+        self.queued.clear()
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "note": "  Only the API.\r\nNot the UI. "})
+        self.assertEqual(self.queued, [("marketplace", [k], me.id, "Only the API.\nNot the UI.") for k in ("MARS-1", "MARS-2")])
+        # Lines starting with a key are only for that issue's run; the lines before them are for all.
+        self.queued.clear()
+        note = "Only the API.\nmars-1: the total is wrong,\nnot the tax.\nMARS-2:"
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "note": note})
+        self.assertEqual(self.queued, [("marketplace", ["MARS-1"], me.id, "Only the API.\nthe total is wrong,\nnot the tax."),
+                                       ("marketplace", ["MARS-2"], me.id, "Only the API.")])
+        self.queued.clear()
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "grouping": "together", "note": note})
+        self.assertEqual(self.queued, [("marketplace", ["MARS-1", "MARS-2"], me.id, note)])  # one run: all of it
+        self.queued.clear()
+        self.assertIn("a part for MARS-7, which is not among the issue keys",
+                      self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1", "note": "MARS-7: x"})[2])
+        self.queued.clear()
+        self.assertIn("keep it under 2000", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1", "note": "x" * 2001})[2])
+        self.assertEqual(self.queued, [])
         self.assertIn("HR-1 is not in one of your projects", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "HR-1"})[2])
         self.assertIn("Not an issue key: ../X", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 ../x"})[2])
         # Only issues assigned to you (to the Jira account you joined with) can be queued.
@@ -450,9 +469,9 @@ class WebTest(Env):
 
 
 def fake_process_factory(record=None, block: threading.Event | None = None):
-    def fake_process(keys, project, actor, cfg, jira, github, cancel=None):
+    def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note=""):
         if record is not None:
-            record.append((actor.display_name, tuple(keys)))
+            record.append((actor.display_name, tuple(keys), *([note] if note else [])))
         if block:
             while not cancel.cancelled and not block.is_set():
                 time.sleep(0.01)
@@ -485,7 +504,7 @@ class RunQueueTest(QueueEnv):
         me = self.developer()
         running, peak, lock, release = set(), [0], threading.Lock(), threading.Event()
 
-        def fake_process(keys, project, actor, cfg, jira, github, cancel=None):
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note=""):
             with lock:
                 running.add(tuple(keys))
                 peak[0] = max(peak[0], len(running))
@@ -539,12 +558,12 @@ class RunQueueTest(QueueEnv):
 
     def test_queued_runs_survive_a_restart(self):
         me = self.developer()
-        waiting = self.runs.add("MAR-1, MAR-2", me, self.market.id, "marketplace")  # left by the previous server
+        waiting = self.runs.add("MAR-1, MAR-2", me, self.market.id, "marketplace", "Only the API.")  # left by the previous server
         gone = self.runs.add("MAR-3", me, None, "deleted project")
         ran = []
         self.pool(fake_process_factory(ran))
         self.wait_for(lambda: ran)
-        self.assertEqual(ran, [(ME, ("MAR-1", "MAR-2"))])
+        self.assertEqual(ran, [(ME, ("MAR-1", "MAR-2"), "Only the API.")])  # with its note
         status = {r["id"]: (r["status"], r["message"]) for r in self.runs.recent(me)}
         self.wait_for(lambda: self.runs.recent(me)[-1]["status"] == "done")
         self.assertEqual(status[gone][0], "failed")

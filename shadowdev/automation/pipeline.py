@@ -4,7 +4,8 @@ on one branch, acting as the developer they are assigned to. A single issue is a
 1. per repo: a shallow clone of the developer's base branch (or the latest release branch, or
    the default branch), with their token, on a new branch named after the issue key(s), all
    inside one workspace (worktrees/<project id>-<BRANCH>/<repo>); each issue moves to "In Progress"
-2. Claude analyses the workspace (read-only) -> per issue, a root cause (bug) or plan (task)
+2. a small model rates how hard the issues are, which picks the model for the rest of the run;
+   Claude analyses the workspace (read-only) -> per issue, a root cause (bug) or plan (task)
    to Jira, and for bugs the fix version; the repos to change
 3. Claude edits and creates files -> each changed repo is set up and tested in a sandbox ->
    new failures fed back (self-heal)
@@ -19,14 +20,16 @@ Prompts and answer checks are in prompts.py; running and judging the tests in ve
 import logging
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 
 from . import gitops, rules
-from .agent import EDIT_TOOLS, READ_ONLY_TOOLS, ClaudeSession, claude_config_dir, claude_env, forget_claude_sessions
+from .agent import (EDIT_TOOLS, MODELS, READ_ONLY_TOOLS, TRIAGE_MODEL, ClaudeSession, claude_config_dir, claude_env,
+                    forget_claude_sessions)
 from .cancel import NEVER, CancelToken, Cancelled
 from .timing import Timings
-from .prompts import (CHANGE_SCHEMA, analysis_problem, analysis_prompt, analysis_schema, ask_usable, change_prompt,
-                      retry_prompt, summary_problem)
+from .prompts import (CHANGE_SCHEMA, TRIAGE_SCHEMA, analysis_problem, analysis_prompt, analysis_schema, ask_usable,
+                      change_prompt, retry_prompt, summary_problem, triage_prompt)
 from .verify import NOT_TESTED, Checkout, changed, check
 from ..clients.github import GitHub
 from ..clients.jira import Jira
@@ -107,9 +110,26 @@ def resolve_base(repo: Repo, chosen: str | None, branches: list[str], token: str
             or gitops.default_branch(repo.github, token))
 
 
+def choose_model(session, issues: list[Issue], note: str, label: str) -> tuple[str | None, str | None]:
+    """The (model, effort) to work on the issues with, from a small model's rating of their text:
+    a typo does not need the model a race condition does. `session(model=...)` starts a Claude
+    session of the run. A rating that fails is not fatal: the run then uses the Claude account's
+    default model, as for a complex issue."""
+    try:
+        complexity = session(model=TRIAGE_MODEL).ask(triage_prompt(issues, note), "", TRIAGE_SCHEMA).get("complexity")
+    except RuntimeError as e:
+        log.warning("%s: could not rate the issue, so the default model works on it: %s", label, e)
+        complexity = None
+    model, effort = MODELS.get(complexity, MODELS["complex"])
+    log.info("%s: rated %s: worked on by %s%s", label, complexity or "unrated",
+             model or "the Claude account's default model", f" (effort {effort})" if effort else "")
+    return model, effort
+
+
 def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-                   publish: bool = True, cancel: CancelToken = NEVER) -> tuple[str, str]:
-    """Work on the issues together, on one branch. Returns (status, message): status "done",
+                   publish: bool = True, cancel: CancelToken = NEVER, note: str = "") -> tuple[str, str]:
+    """Work on the issues together, on one branch. `note`: the developer's own instructions for
+    this run, given to Claude with the issues. Returns (status, message): status "done",
     "skipped" or "failed". Raises on errors, and Cancelled when `cancel` stops the run. With
     publish=False (dry run) it stops once the tests pass: nothing is committed, pushed or
     opened, and the change stays in the workspace. Each step's time is logged, and at the end
@@ -119,7 +139,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     timings = Timings(branch_name(keys))
     outcome = "failed"
     try:
-        outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings)
+        outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings, note)
         return outcome, message
     except Cancelled:
         outcome = "stopped"
@@ -129,7 +149,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
 
 
 def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-             publish: bool, cancel: CancelToken, timings: Timings) -> tuple[str, str]:
+             publish: bool, cancel: CancelToken, timings: Timings, note: str) -> tuple[str, str]:
     with timings.step("Jira and GitHub checks"):
         issues, skipped = select_issues(keys, project, actor, jira)
 
@@ -186,7 +206,7 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
     workspace.mkdir(mode=0o700)
     try:
         return _work(issues, skipped, branch, targets, workspace, scratch, claude_dir, project, actor, cfg, jira, github,
-                     publish, cancel, timings)
+                     publish, cancel, timings, note)
     finally:
         if publish:
             remove_code(workspace, scratch, claude_dir)
@@ -206,7 +226,7 @@ def tested(c: Checkout) -> str:
 
 def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tuple[Repo, str]], workspace: Path,
           scratch: Path, claude_dir: Path, project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-          publish: bool, cancel: CancelToken, timings: Timings) -> tuple[str, str]:
+          publish: bool, cancel: CancelToken, timings: Timings, note: str) -> tuple[str, str]:
     label = branch
     token = actor.github.token
 
@@ -222,11 +242,15 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
         log.info("%s: %s cloned at %s (%s), on branch %s", label, repo.name, base, commit[:10], branch)
 
     # 2. Per issue: root cause (bug) or plan (task) on the ticket; fix version for bugs.
-    claude = ClaudeSession(workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg, cancel=cancel)
+    session = partial(ClaudeSession, workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg,
+                      cancel=cancel)
+    with timings.step("Claude model choice"):
+        model, effort = choose_model(session, issues, note, label)
+    claude = session(model=model, effort=effort)
     log.info("%s: Claude analysing", label)
     keys_here = [i.key for i in issues]
     with timings.step("Claude analysis"):
-        result = ask_usable(claude, analysis_prompt(issues, checkouts), READ_ONLY_TOOLS,
+        result = ask_usable(claude, analysis_prompt(issues, checkouts, note), READ_ONLY_TOOLS,
                             analysis_schema(issues, project.repos), lambda r: analysis_problem(r, keys_here), "analysis")
     analyses = {item["key"]: item["analysis"] for item in result["issues"]}
     target_repos = result["repos"]

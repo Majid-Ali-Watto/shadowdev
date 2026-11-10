@@ -78,16 +78,18 @@ class RunQueue:
             if row["id"] in self._jobs:  # queued by this process, before the workers started
                 continue
             project = self.projects.get(row["project_id"]) if row["project_id"] else None
-            refusal = (self.submit(project, row["issue_key"].split(", "), row["user_id"], run_id=row["id"])
+            refusal = (self.submit(project, row["issue_key"].split(", "), row["user_id"], run_id=row["id"],
+                                   note=row["note"])
                        if project else "its project was deleted")
             if refusal:
                 self.runs.update(row["id"], "failed", f"not resumed after a ShadowDev restart: {refusal}")
         for n in range(1, self.cfg.max_parallel_runs + 1):
             threading.Thread(target=self.run_forever, daemon=True, name=f"run-{n}").start()
 
-    def submit(self, project: Project, keys: list[str], user_id: int, run_id: int | None = None) -> str | None:
+    def submit(self, project: Project, keys: list[str], user_id: int, run_id: int | None = None,
+               note: str = "") -> str | None:
         """Queue the issues as one job. Returns why not, or None when queued. `run_id`: an
-        existing queued run, resumed after a restart."""
+        existing queued run, resumed after a restart. `note`: the developer's instructions for it."""
         pending = {(project.cloud_id, k) for k in keys}
         with self._lock:
             busy = sorted(k for _, k in self._pending & pending)
@@ -96,17 +98,17 @@ class RunQueue:
             if sum(1 for owner, _, _ in self._jobs.values() if owner == user_id) >= MAX_JOBS_PER_DEVELOPER:
                 return f"you already have {MAX_JOBS_PER_DEVELOPER} runs queued or running"
             self._pending |= pending
-            run_id = run_id or self.runs.add(", ".join(keys), user_id, project.id, project.name)
+            run_id = run_id or self.runs.add(", ".join(keys), user_id, project.id, project.name, note)
             self._jobs[run_id] = (user_id, project.id, CancelToken())
-        self._queue.put(user_id, (project.id, tuple(keys), user_id, run_id, frozenset(pending)))
+        self._queue.put(user_id, (project.id, tuple(keys), user_id, run_id, frozenset(pending), note))
         return None
 
     def run_forever(self) -> None:
         while True:
-            project_id, keys, user_id, run_id, pending = self._queue.get()
+            project_id, keys, user_id, run_id, pending, note = self._queue.get()
             started = time.monotonic()
             try:
-                self._run(project_id, list(keys), user_id, run_id)
+                self._run(project_id, list(keys), user_id, run_id, note)
             except Exception:
                 log.exception("run %d: could not be run", run_id)
                 self.runs.update(run_id, "failed", "ShadowDev could not run it; see the server log")
@@ -141,7 +143,7 @@ class RunQueue:
             log.info("stopped %d run(s) (developer %s, projects %s)", len(tokens), user_id, project_ids)
         return len(tokens)
 
-    def _run(self, project_id: int, keys: list[str], user_id: int, run_id: int) -> None:
+    def _run(self, project_id: int, keys: list[str], user_id: int, run_id: int, note: str = "") -> None:
         label = ", ".join(keys)
         with self._lock:
             token = self._jobs[run_id][2]
@@ -163,7 +165,7 @@ class RunQueue:
         jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
         try:
             status, message = process_issues(keys, project, actor, self.cfg, jira, GitHub(actor.github.token),
-                                             cancel=token)
+                                             cancel=token, note=note)
             log.info("%s: %s: %s", label, status, message)
             self.runs.update(run_id, status, message)
         except Cancelled:

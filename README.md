@@ -29,16 +29,19 @@ project's repos:
 3. per repo, makes a shallow clone of it with the developer's GitHub token, on a branch named
    after the issue key (e.g. `MAR-123`). All of them sit in one workspace,
    `worktrees/<project id>-MAR-123/{fe,services}`, which is **deleted when the run ends**
-4. has Claude analyse the workspace (read-only) and decide which repo(s) to change. For a bug it
+4. has a small Claude model (Haiku) rate the issue from its text as simple, standard or complex,
+   which picks the model for the rest of the run: Haiku, Sonnet at medium effort, or the Claude
+   account's default model. An issue that can't be rated runs with the default
+5. has Claude analyse the workspace (read-only) and decide which repo(s) to change. For a bug it
    writes a concise **root cause** (2–5 sentences: what is wrong, where, and why it causes the
    reported behaviour) to the ticket, and sets the **fix version** to the highest unreleased
    `Rel N`, replacing any other. For a task it comments a concise **implementation plan**. A
    placeholder, over-long or garbled answer is sent back to Claude
-5. has Claude make the change: it edits files and creates new ones, like Claude Code does
-6. for each repo that changed, runs its `setup` (once) and `test` commands in a sandbox. New test
+6. has Claude make the change: it edits files and creates new ones, like Claude Code does
+7. for each repo that changed, runs its `setup` (once) and `test` commands in a sandbox. New test
    failures go back to Claude, which tries again (up to `MAX_FIX_ATTEMPTS` attempts in total).
    A repo without a test command is not tested, and its PR says so
-7. per changed repo: commits as the developer, pushes with their GitHub token, and opens a PR
+8. per changed repo: commits as the developer, pushes with their GitHub token, and opens a PR
    **into the base branch**. The PR links are commented on the ticket, which moves to **In Review**
 
 ```
@@ -208,7 +211,10 @@ to push to every repo of the project, your Jira account must be able to see its 
 and base branches must exist. New assignments then run automatically. **Run issues now** starts
 issues that were assigned before you joined: enter one or more keys (and the project, when the
 same key is in two of yours), and choose whether several are fixed separately or together on one
-branch. **Recent runs** shows what happened, and the ticket gets comments with the analysis and
+branch. An optional **note for Claude** says what the tickets don't (where to look, what to
+leave alone); it is given to Claude with the issues, and is not posted to Jira or GitHub. A line starting
+with a key (`MAR-123: ...`) begins a note for that issue only; the lines before those are for all.
+**Recent runs** shows what happened, and the ticket gets comments with the analysis and
 the PRs.
 
 - **Stop** (next to a queued or running run in **Recent runs**) stops that run: a queued one never
@@ -442,6 +448,7 @@ python3 -m shadowdev dry-run --summary "Invoice total ignores the discount" \
     --description "Steps: add a 10% discount... Expected: ... Actual: ..."
 ```
 
+- `--note "Only the API"` adds a developer's note for Claude, as on the page
 - `--type Task` (or `Story`) tries the task flow; the default is `Bug`
 - `--description-file bug.txt` reads a longer description from a file
 - `--project` and `--as` choose the project (by name) and developer when there are several
