@@ -237,14 +237,6 @@ def settings_page(cfg: Config, user: User, projects: list[Project], secrets: dic
         project_pick = (f'<label>Project <select name="project_id">'
                         f'{options([(p.id, p.name) for p in joined], None, "Find it from the issue key")}</select></label>')
 
-    rows = "".join(
-        f'<tr><td>{issue_links(r)}</td><td>{esc(r["project"])}</td>'
-        f'<td class="state"><span class="badge {esc(r["status"])}">{esc(r["status"])}</span>{stop_button(r, hidden)}</td>'
-        f'<td class="msg">{esc(r["message"])}</td>'
-        f'<td class="when">{esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated"])))}</td></tr>'
-        for r in runs
-    ) or '<tr><td colspan="5" class="empty">No runs yet. Runs show up here once an issue is queued.</td></tr>'
-
     if user.paused:
         pause_title, pause_text = "Automation paused", "Issues assigned to you are not worked on, and runs can't be started."
         pause_form = f'<form method="post" action="/resume">{hidden}<button>Resume automation</button></form>'
@@ -299,7 +291,7 @@ def settings_page(cfg: Config, user: User, projects: list[Project], secrets: dic
 <section class="card">
   <div class="card-head"><h3>Recent runs</h3></div>
   <div class="table"><table><thead><tr><th>Issue</th><th>Project</th><th>Status</th><th>Details</th><th>Updated</th></tr></thead>
-  <tbody>{rows}</tbody></table></div>
+  <tbody id="runs">{run_rows(runs, csrf)}</tbody></table></div>
 </section>
 
 <h2 class="section">Account</h2>
@@ -318,7 +310,33 @@ def settings_page(cfg: Config, user: User, projects: list[Project], secrets: dic
       <button class="danger">Delete my ShadowDev account</button></form>
   </div>
 </section>
-{CONFIRM_SCRIPT.format(nonce=esc(nonce))}""")
+{CONFIRM_SCRIPT.format(nonce=esc(nonce))}{RUNS_SCRIPT.format(nonce=esc(nonce))}""")
+
+
+def run_rows(runs: list, csrf: str) -> str:
+    """The rows of Recent runs: also what GET /runs answers, for the page to refresh itself."""
+    hidden = f'<input type="hidden" name="csrf" value="{esc(csrf)}">'
+    extra = lambda r, column, what: f'<small>{what}: {esc(r[column])}</small>' if r[column] else ""
+    return "".join(
+        f'<tr><td>{issue_links(r)}</td><td>{esc(r["project"])}</td>'
+        f'<td class="state"><span class="badge {esc(r["status"])}">{esc(r["status"])}</span>{stop_button(r, hidden)}</td>'
+        f'<td class="msg">{esc(r["message"])}{extra(r, "model", "Model")}{extra(r, "note", "Your note")}</td>'
+        f'<td class="when">{esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated"])))}</td></tr>'
+        for r in runs
+    ) or '<tr><td colspan="5" class="empty">No runs yet. Runs show up here once an issue is queued.</td></tr>'
+
+
+# Keeps Recent runs up to date: every 5 seconds while a run is queued or running, else every 30.
+RUNS_SCRIPT = """<script nonce="{nonce}">
+  const runs = document.getElementById("runs");
+  let tick = 0;
+  setInterval(async () => {{
+    const busy = runs.querySelector(".badge.queued, .badge.running, .badge.stopping");
+    if (document.hidden || (++tick % 6 && !busy)) return;
+    const response = await fetch("/runs").catch(() => null);
+    if (response && response.ok) runs.innerHTML = await response.text();
+  }}, 5000);
+</script>"""
 
 
 # Asks before forms marked data-confirm (or their submit button) are sent.

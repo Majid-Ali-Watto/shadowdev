@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from urllib.parse import urlencode
 
-from .rest import request_json
+from .rest import download, request_json
 
 
 class Jira:
@@ -26,8 +26,13 @@ class Jira:
 
     def get_issue(self, key: str) -> dict:
         return self._request(
-            "GET", f"/rest/api/2/issue/{key}?fields=summary,description,issuetype,assignee,project,status"
+            "GET", f"/rest/api/2/issue/{key}?fields=summary,description,issuetype,assignee,project,status,comment,attachment"
         )
+
+    def attachment(self, attachment_id: str, max_bytes: int) -> bytes:
+        """A file attached to an issue. redirect=false: Jira sends the file itself, not a link to it."""
+        return download(f"{self.api_base}/rest/api/2/attachment/content/{attachment_id}?redirect=false",
+                        {"Authorization": f"Bearer {self._access_token()}"}, max_bytes, "Jira")
 
     def search(self, jql: str, fields: list[str], limit: int = 200) -> list[dict]:
         """Issues matching the JQL (enhanced search; the old /search endpoints are gone), with these

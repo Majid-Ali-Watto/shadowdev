@@ -2,7 +2,9 @@ import hashlib
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -11,6 +13,7 @@ from shadowdev.models.tokens import Tokens
 from shadowdev.models.user import Subscription
 from shadowdev.repositories.database import Database
 from shadowdev.repositories.projects import ProjectRepository, Taken
+from shadowdev.repositories import runs as runs_repository
 from shadowdev.repositories.runs import RunRepository
 from shadowdev.repositories.sessions import SessionRepository
 from shadowdev.repositories.users import AccountInUse, UserRepository
@@ -123,6 +126,17 @@ class RepositoriesTest(unittest.TestCase):
         self.assertEqual(user_id, self.me)
         self.assertTrue(csrf)
         self.assertIsNone(self.sessions.get("forged"))
+        # A session used a day or more after it was made gets a full week again; an expired one does not.
+        expire_in = lambda days: sqlite3.connect(self.path).execute(
+            "UPDATE sessions SET expires = ?", (time.time() + days * 86400,)).connection.commit()
+        self.assertFalse(self.sessions.renew(token))
+        expire_in(5)
+        self.assertTrue(self.sessions.renew(token))
+        self.assertFalse(self.sessions.renew(token))
+        expire_in(-1)
+        self.assertFalse(self.sessions.renew(token))
+        self.assertIsNone(self.sessions.get(token))
+        token = self.sessions.create(self.me)
         project = add_project(self.projects, self.me, "market", ["MAR"])
         running = self.runs.add("MAR-1", self.me, project.id, "market")
         self.runs.update(running, "running")
@@ -131,6 +145,11 @@ class RepositoriesTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in self.runs.resume_after_restart()], [queued])
         self.assertEqual({r["id"]: r["status"] for r in self.runs.recent(self.me)}, {running: "failed", queued: "queued"})
         self.assertEqual(self.runs.recent(self.me)[0]["site_url"], OFFICE.url)
+        # Old finished runs are dropped as new ones are added; unfinished ones never are.
+        with mock.patch.object(runs_repository, "KEPT_RUNS", 3):
+            for n in range(4, 8):
+                self.runs.update(self.runs.add(f"MAR-{n}", self.me, project.id, "market"), "done")
+        self.assertEqual([r["issue_key"] for r in self.runs.recent(self.me)], ["MAR-7", "MAR-6", "MAR-5", "MAR-2, MAR-3"])
         self.assertEqual(self.users.delete(self.me), [])
         self.assertIsNone(self.users.get(self.me))
         self.assertIsNone(self.sessions.get(token))

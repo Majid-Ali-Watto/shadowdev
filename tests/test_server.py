@@ -4,6 +4,7 @@ import html
 import http.client
 import json
 import re
+import sqlite3
 import tempfile
 import threading
 import time
@@ -433,9 +434,16 @@ class WebTest(Env):
         csrf = self.csrf()
         uid = self.me().id
         market = add_project(self.projects, uid, "marketplace", ["MAR"])
-        run_id = self.runs.add("MAR-1", uid, market.id, "marketplace")
+        run_id = self.runs.add("MAR-1", uid, market.id, "marketplace", "Only the <API>.")
+        self.runs.set_model(run_id, "haiku → sonnet (medium)")
         page = self.request("GET", "/")[2]
         self.assertIn(f'name="run_id" value="{run_id}"', page)  # queued: has a Stop button
+        self.assertIn("<small>Model: haiku → sonnet (medium)</small><small>Your note: Only the &lt;API&gt;.</small>", page)
+        # The page keeps Recent runs up to date by fetching its rows.
+        self.assertIn("connect-src 'self'", self.headers["Content-Security-Policy"])
+        status, _, rows = self.request("GET", "/runs")
+        self.assertEqual(status, 200)
+        self.assertTrue(rows.startswith("<tr>") and f'name="run_id" value="{run_id}"' in rows and csrf in rows)
         self.assertIn(f'href="{OFFICE.url}/browse/MAR-1"', page)
         self.assertEqual(self.request("POST", "/stop", {"csrf": csrf, "run_id": str(run_id)})[1], "/?ok=stopping")
         self.pool.stop_run.assert_called_once_with(run_id, uid)
@@ -444,6 +452,30 @@ class WebTest(Env):
         self.assertIn("already finished, or is not yours", self.request("POST", "/stop", {"csrf": csrf, "run_id": "x"})[2])
         self.runs.update(run_id, "done", "ok")
         self.assertNotIn(f'name="run_id" value="{run_id}"', self.request("GET", "/")[2])  # finished: no button
+
+    def test_using_shadowdev_renews_the_session_but_the_pages_own_refresh_does_not(self):
+        self.sign_in()
+        token = self.cookies["shadowdev_session"]
+
+        def age(days_left):
+            with sqlite3.connect(self.cfg.data_dir / "shadowdev.db") as db:
+                db.execute("UPDATE sessions SET expires = ?", (time.time() + days_left * 86400,))
+
+        self.request("GET", "/")
+        self.assertEqual(self.set_cookies, [])  # signed in just now: nothing to renew
+        age(2)
+        self.assertEqual(self.request("GET", "/runs")[0], 200)
+        self.assertEqual(self.set_cookies, [])  # an open tab alone does not keep the session alive
+        self.request("GET", "/")
+        self.assertIn(f"shadowdev_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800", self.set_cookies[0])
+        self.request("GET", "/")
+        self.assertEqual(self.set_cookies, [])  # renewed: a full week again
+        age(2)
+        self.request("POST", "/logout", {"csrf": self.csrf()})  # (csrf() renewed it) signing out still wins
+        self.assertNotIn("shadowdev_session", self.cookies)
+        age(-1)
+        self.cookies["shadowdev_session"] = token
+        self.assertEqual(self.request("GET", "/runs")[0], 401)
 
     def test_pause_and_resume(self):
         self.sign_in()
@@ -470,9 +502,11 @@ class WebTest(Env):
 
 
 def fake_process_factory(record=None, block: threading.Event | None = None):
-    def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note=""):
+    def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None):
         if record is not None:
             record.append((actor.display_name, tuple(keys), *([note] if note else [])))
+        if on_model:
+            on_model("haiku")
         if block:
             while not cancel.cancelled and not block.is_set():
                 time.sleep(0.01)
@@ -505,7 +539,7 @@ class RunQueueTest(QueueEnv):
         me = self.developer()
         running, peak, lock, release = set(), [0], threading.Lock(), threading.Event()
 
-        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note=""):
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None):
             with lock:
                 running.add(tuple(keys))
                 peak[0] = max(peak[0], len(running))
@@ -567,6 +601,7 @@ class RunQueueTest(QueueEnv):
         self.assertEqual(ran, [(ME, ("MAR-1", "MAR-2"), "Only the API.")])  # with its note
         status = {r["id"]: (r["status"], r["message"]) for r in self.runs.recent(me)}
         self.wait_for(lambda: self.runs.recent(me)[-1]["status"] == "done")
+        self.assertEqual(self.runs.recent(me)[-1]["model"], "haiku")  # the run reports its model
         self.assertEqual(status[gone][0], "failed")
         self.assertIn("project was deleted", status[gone][1])
         self.assertIn(waiting, status)
@@ -599,7 +634,7 @@ class StopAndPauseTest(QueueEnv):
         # Its failure comment updates the issue, which a webhook or the poller would take for new work.
         me, sara = self.developer(), self.developer("acc-sara")
 
-        def failing(keys, project, actor, cfg, jira, github, cancel=None, note=""):
+        def failing(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None):
             raise RuntimeError("tests still failing")
 
         pool = self.pool(failing)

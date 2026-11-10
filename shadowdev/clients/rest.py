@@ -54,3 +54,27 @@ def _request(method: str, url: str, headers: dict, body: dict | None, label: str
     except OSError as e:  # URLError, a timeout, a dropped connection
         raise HTTPError(f"{label} {method} {url.split('?')[0]} could not be reached: {e}", 0) from e
     return (json.loads(data) if data else None), response_headers
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+_direct = urllib.request.build_opener(_NoRedirect)
+
+
+def download(url: str, headers: dict, max_bytes: int, label: str = "") -> bytes:
+    """The body of a GET, for files. Redirects are refused, so the Authorization header never
+    goes to another host. Raises HTTPError, with status 413 for a body over `max_bytes`."""
+    where = url.split("?")[0]
+    try:
+        with _direct.open(urllib.request.Request(url, headers=headers), timeout=60) as response:
+            data = response.read(max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        raise HTTPError(f"{label} GET {where} -> {e.code}", e.code) from e
+    except OSError as e:
+        raise HTTPError(f"{label} GET {where} could not be reached: {e}", 0) from e
+    if len(data) > max_bytes:
+        raise HTTPError(f"{label} GET {where}: larger than {max_bytes} bytes", 413)
+    return data

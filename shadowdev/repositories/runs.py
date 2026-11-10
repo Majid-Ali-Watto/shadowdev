@@ -5,6 +5,8 @@ from contextlib import closing
 
 from .database import Database
 
+KEPT_RUNS = 200  # finished runs kept per developer; older ones are dropped
+
 
 class RunRepository:
     def __init__(self, db: Database):
@@ -12,6 +14,8 @@ class RunRepository:
 
     def add(self, issue_key: str, user_id: int, project_id: int, project: str, note: str = "") -> int:
         with closing(self.db.connect()) as conn, conn:
+            conn.execute("DELETE FROM runs WHERE user_id = ? AND status NOT IN ('queued', 'running', 'stopping') AND id NOT IN "
+                         "(SELECT id FROM runs WHERE user_id = ? ORDER BY id DESC LIMIT ?)", (user_id, user_id, KEPT_RUNS - 1))
             return conn.execute(
                 "INSERT INTO runs (issue_key, user_id, project_id, project, note, status, updated) "
                 "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
@@ -22,6 +26,10 @@ class RunRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE runs SET status = ?, message = ?, updated = ? WHERE id = ?",
                          (status, message[:2000], time.time(), run_id))
+
+    def set_model(self, run_id: int, model: str) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE runs SET model = ? WHERE id = ?", (model[:200], run_id))
 
     def mark_stopping(self, run_id: int) -> None:
         """Only while it is queued or running: a run that already ended keeps its status."""

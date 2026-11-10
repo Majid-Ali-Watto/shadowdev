@@ -134,7 +134,7 @@ class PrivacyReporterTest(unittest.TestCase):
             columns = {r[1] for r in db.execute("PRAGMA table_info(jira_accounts)")}
             self.assertTrue({"profile_at", "reported_at"} <= columns)
             self.assertIn("note", {r[1] for r in db.execute("PRAGMA table_info(runs)")})  # added in schema 4
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
 
 
 if __name__ == "__main__":

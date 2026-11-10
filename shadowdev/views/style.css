@@ -149,6 +149,7 @@ tbody tr:hover td { background:color-mix(in srgb, var(--bg) 60%, transparent); }
 td:first-child { white-space:nowrap; font-family:var(--mono); font-size:13px; font-weight:600; }
 td:first-child a { text-decoration:none; } td:first-child a:hover { text-decoration:underline; }
 td.msg { overflow-wrap:anywhere; min-width:200px; color:var(--muted); }
+td.msg small { display:block; margin-top:3px; font-size:12.5px; }
 td.when { white-space:nowrap; color:var(--muted); }
 td.state { white-space:nowrap; }
 td.empty { text-align:center; padding:28px; color:var(--muted); font-family:var(--sans); font-weight:400; }

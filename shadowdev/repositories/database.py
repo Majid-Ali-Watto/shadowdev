@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION = 4  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
+VERSION = 5  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS runs (
     status     TEXT NOT NULL,  -- queued, running, stopping, stopped, done, skipped, failed
     message    TEXT NOT NULL DEFAULT '',
     note       TEXT NOT NULL DEFAULT '',  -- the developer's instructions for a run started by hand
+    model      TEXT NOT NULL DEFAULT '',  -- the Claude model(s) that worked on it, e.g. "haiku → sonnet (medium)"
     updated    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_user ON runs (user_id, id);
@@ -163,8 +164,10 @@ class Database:
                             db.execute(f"ALTER TABLE jira_accounts ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
                     if "polled_at" not in {row["name"] for row in db.execute("PRAGMA table_info(subscriptions)")}:
                         db.execute("ALTER TABLE subscriptions ADD COLUMN polled_at REAL NOT NULL DEFAULT 0")
-                    if "note" not in {row["name"] for row in db.execute("PRAGMA table_info(runs)")}:  # schema 4
-                        db.execute("ALTER TABLE runs ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+                    columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
+                    for column in ("note", "model"):  # added in schemas 4 and 5
+                        if column not in columns:
+                            db.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
                     db.execute(f"PRAGMA user_version = {VERSION}")
         path.chmod(0o600)
 

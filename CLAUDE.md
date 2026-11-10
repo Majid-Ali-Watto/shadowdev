@@ -52,7 +52,9 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
 - **No new dependencies** without asking. It is deliberately stdlib-only (`http.server`, `sqlite3`,
   `urllib`) plus `cryptography`. No web framework, no ORM, no requests.
 - **Security invariants. Never weaken these:**
-  - Jira issue text, Claude's output, and repo code are hostile. Every command that runs repo code
+  - Jira issue text, comments and attachments, Claude's output, and repo code are hostile. Attachments
+    are only written to `_attachments/` in the workspace (allowlisted types, size-limited, safe
+    names) for Claude to read, and are fetched without following redirects. Every command that runs repo code
     goes through `verify.run_command` (bwrap sandbox + `prlimit`); Claude runs sandboxed too.
   - Secrets from `.env` live only in `Config`, never in `os.environ`, so child processes can't
     inherit them. Child environments are allowlists (`sandbox.env`, `gitops._env`).

@@ -19,7 +19,9 @@ Prompts and answer checks are in prompts.py; running and judging the tests in ve
 """
 import logging
 import os
+import re
 import shutil
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from pathlib import Path
@@ -43,6 +45,13 @@ from ..models.user import Actor
 log = logging.getLogger("shadowdev")
 
 MAX_GROUP = 10  # issues fixed together on one branch
+# Files attached to the issues are put here in the workspace for Claude to read: beside the
+# clones (a repo's folder never starts with "_"), so they are never committed.
+ATTACHMENTS_DIR = "_attachments"
+ATTACHMENT_TYPES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".txt", ".log", ".md", ".json", ".csv", ".xml",
+                    ".yaml", ".yml", ".har"}
+MAX_ATTACHMENTS = 10  # per issue: the latest ones
+MAX_ATTACHMENT_BYTES = 10 * 1024**2
 MAX_TITLE_CHARS = 200  # GitHub refuses PR titles over 256 characters; a Jira summary can be 255
 
 
@@ -72,6 +81,42 @@ def move_issue(jira: Jira, key: str, path: tuple[str, ...]) -> None:
         log.info("%s: Jira status → %s", key, " → ".join(moved))
     if status.lower() != path[-1].lower():
         log.warning("%s: issue is in %r; no transition from there towards %r", key, status, path[-1])
+
+
+def move_back(jira: Jira, issue: Issue, project: Project) -> None:
+    """A run that failed without pushing anything: the issue goes back to the status it had
+    before the run, back along the start statuses, as far as the workflow allows."""
+    if issue.status and issue.status.lower() != project.start_statuses[-1].lower():
+        move_issue(jira, issue.key, (*reversed(project.start_statuses[:-1]), issue.status))
+
+
+def fetch_attachments(jira: Jira, issues: list[Issue], workspace: Path, label: str) -> None:
+    """Put the issues' attached screenshots, logs and documents in the workspace, for Claude to
+    read. They are untrusted, like the issue text: only known file types of a sane size are
+    fetched, under names made safe, and they are data, never run. One that can't be fetched
+    is skipped."""
+    for issue in issues:
+        wanted = []
+        for item in issue.fields.get("attachment") or []:
+            name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(str(item.get("filename") or "")).name).lstrip(".")
+            size = item.get("size")
+            if (str(item.get("id") or "").isdigit() and Path(name).suffix.lower() in ATTACHMENT_TYPES
+                    and isinstance(size, int) and 0 < size <= MAX_ATTACHMENT_BYTES):
+                wanted.append((str(item["id"]), name[-100:]))
+        folder = workspace / ATTACHMENTS_DIR / issue.key
+        for attachment_id, name in wanted[-MAX_ATTACHMENTS:]:
+            try:
+                data = jira.attachment(attachment_id, MAX_ATTACHMENT_BYTES)
+            except HTTPError as e:
+                log.warning("%s: attachment %s of %s not fetched: %s", label, name, issue.key, e)
+                continue
+            folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+            path = folder / f"{attachment_id}-{name}"
+            path.write_bytes(data)
+            path.chmod(0o600)
+            issue.attachments.append(str(path.relative_to(workspace)))
+        if issue.attachments:
+            log.info("%s: %d attachment(s) of %s for Claude to read", label, len(issue.attachments), issue.key)
 
 
 def comment_all(jira: Jira, issues: list[Issue], text: str) -> None:
@@ -150,10 +195,27 @@ def choose_model(session, issues: list[Issue], note: str, label: str) -> tuple[s
     return model, effort
 
 
+def model_name(model: str | None, effort: str | None) -> str:
+    return (model or "default") + (f" ({effort})" if effort else "")
+
+
+def step_up(claude) -> bool:
+    """Give the session the next stronger model (it keeps its conversation). False when it
+    already has the strongest: the Claude account's default."""
+    tiers = list(MODELS.values())  # weakest first
+    at = tiers.index((claude.model, claude.effort)) if (claude.model, claude.effort) in tiers else len(tiers) - 1
+    if at == len(tiers) - 1:
+        return False
+    claude.model, claude.effort = tiers[at + 1]
+    return True
+
+
 def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-                   publish: bool = True, cancel: CancelToken = NEVER, note: str = "") -> tuple[str, str]:
+                   publish: bool = True, cancel: CancelToken = NEVER, note: str = "",
+                   on_model: Callable[[str], None] = lambda models: None) -> tuple[str, str]:
     """Work on the issues together, on one branch. `note`: the developer's own instructions for
-    this run, given to Claude with the issues. Returns (status, message): status "done",
+    this run, given to Claude with the issues. `on_model` is told which model(s) work on it,
+    e.g. "haiku → sonnet (medium)". Returns (status, message): status "done",
     "skipped" or "failed". Raises on errors, and Cancelled when `cancel` stops the run. With
     publish=False (dry run) it stops once the tests pass: nothing is committed, pushed or
     opened, and the change stays in the workspace. Each step's time is logged, and at the end
@@ -163,7 +225,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     timings = Timings(branch_name(keys))
     outcome = "failed"
     try:
-        outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings, note)
+        outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings, note, on_model)
         return outcome, message
     except Cancelled:
         outcome = "stopped"
@@ -173,7 +235,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
 
 
 def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-             publish: bool, cancel: CancelToken, timings: Timings, note: str) -> tuple[str, str]:
+             publish: bool, cancel: CancelToken, timings: Timings, note: str, on_model) -> tuple[str, str]:
     with timings.step("Jira and GitHub checks"):
         issues, skipped = select_issues(keys, project, actor, jira)
 
@@ -228,10 +290,23 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
     cfg.worktree_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     cfg.worktree_root.chmod(0o700)  # other local users must not read or write live code
     workspace.mkdir(mode=0o700)
+    pushed: list[str] = []  # repos whose branch reached GitHub
+    failed = True
     try:
-        return _work(issues, skipped, branch, targets, workspace, scratch, claude_dir, project, actor, cfg, jira, github,
-                     publish, cancel, timings, note)
+        outcome = _work(issues, skipped, branch, targets, workspace, scratch, claude_dir, project, actor, cfg, jira, github,
+                        publish, cancel, timings, note, on_model, pushed)
+        failed = outcome[0] == "failed"
+        return outcome
+    except Cancelled:
+        failed = False  # a stopped run writes nothing more to Jira
+        raise
     finally:
+        if failed and not pushed:  # with a branch on GitHub, the issue stays in progress
+            for issue in issues:
+                try:
+                    move_back(jira, issue, project)
+                except Exception:
+                    log.exception("%s: could not move the issue back", issue.key)
         if publish:
             remove_code(workspace, scratch, claude_dir)
             log.info("%s: code removed from the server", label)
@@ -250,7 +325,7 @@ def tested(c: Checkout) -> str:
 
 def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tuple[Repo, str]], workspace: Path,
           scratch: Path, claude_dir: Path, project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
-          publish: bool, cancel: CancelToken, timings: Timings, note: str) -> tuple[str, str]:
+          publish: bool, cancel: CancelToken, timings: Timings, note: str, on_model, pushed: list[str]) -> tuple[str, str]:
     label = branch
     token = actor.github.token
 
@@ -265,12 +340,27 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
         checkouts.append(Checkout(label, repo, base, commit, worktree, cancel=cancel))
         log.info("%s: %s cloned at %s (%s), on branch %s", label, repo.name, base, commit[:10], branch)
 
+    with timings.step("Jira attachments"):
+        fetch_attachments(jira, issues, workspace, label)
+
     # 2. Per issue: root cause (bug) or plan (task) on the ticket; fix version for bugs.
     session = partial(ClaudeSession, workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg,
                       cancel=cancel)
     with timings.step("Claude model choice"):
         model, effort = choose_model(session, issues, note, label)
     claude = session(model=model, effort=effort)
+    models = [model_name(model, effort)]
+    on_model(models[0])
+
+    def stronger() -> bool:
+        """What the model could not do, the next stronger one tries."""
+        if not step_up(claude):
+            return False
+        models.append(model_name(claude.model, claude.effort))
+        on_model(" → ".join(models))
+        log.info("%s: %s could not do it; continuing with %s", label, models[-2], models[-1])
+        return True
+
     log.info("%s: Claude analysing", label)
     keys_here = [i.key for i in issues]
     with timings.step("Claude analysis"):
@@ -308,6 +398,11 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
                              summary_problem, "summary")["summary"]
     for attempt in range(1, cfg.max_fix_attempts + 1):
         to_ship = changed(checkouts)
+        while not to_ship and stronger():
+            with timings.step(f"Claude change ({models[-1]})"):
+                summary = ask_usable(claude, change_prompt(issues, target_repos), EDIT_TOOLS, CHANGE_SCHEMA,
+                                     summary_problem, "summary")["summary"]
+            to_ship = changed(checkouts)
         if not to_ship:
             comment_all(jira, issues, "ShadowDev analysed this issue but made no code changes; needs a human look.")
             return "failed", "Claude made no changes"
@@ -331,6 +426,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
                 f"{{noformat}}{chr(10).join(failures)[-2000:]}{{noformat}}",
             )
             return "failed", f"tests still failing after {attempt} attempts; nothing pushed"
+        stronger()
         log.info("%s: Claude fixing the test failures", label)
         with timings.step(f"Claude fix (attempt {attempt})"):
             summary = ask_usable(claude, retry_prompt(failures), EDIT_TOOLS, CHANGE_SCHEMA, summary_problem,
@@ -353,7 +449,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     commit_details = "\n\n".join(
         f"{i.key}: {i.summary}\n{'Root cause' if i.kind == 'bug' else 'Plan'}: {analyses[i.key]}" for i in issues)
     links = ", ".join(f"[{i.key}]({project.site_url}/browse/{i.key})" for i in issues)
-    prs = []
+    prs, unopened = [], []
     for c in to_ship:
         cancel.check()  # last chance: nothing is pushed for a stopped run
         with timings.step(f"commit, push and PR {c.repo.name}"):
@@ -362,16 +458,35 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
             log.info("%s: %s committed as %s <%s>; pushing branch %s to %s", label, c.repo.name, name, email, branch,
                      c.repo.github)
             gitops.push(c.worktree, c.repo.github, branch, token)
-            pr_url = github.create_pr(
-                c.repo.github,
-                base=c.base,
-                head=branch,
-                title=title,
-                body=f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{tested(c)}\n\n_Opened by ShadowDev._",
-            )
+            pushed.append(c.repo.name)
+            try:
+                pr_url = github.create_pr(
+                    c.repo.github,
+                    base=c.base,
+                    head=branch,
+                    title=title,
+                    body=f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{tested(c)}\n\n_Opened by ShadowDev._",
+                )
+            except HTTPError as e:  # the change is on GitHub: say where, so the PR can be opened by hand
+                log.warning("%s: %s branch pushed, but the PR could not be opened: %s", label, c.repo.name, e)
+                unopened.append(f"{c.repo.name}: branch {branch} is pushed, but its PR into {c.base} could not be opened "
+                                f"(GitHub answered {e.status}); open it at "
+                                f"https://github.com/{c.repo.github}/compare/{c.base}...{branch}?expand=1")
+                continue
         prs.append(f"{c.repo.name} into {c.base}: {pr_url}")
         log.info("%s: %s PR %s", label, c.repo.name, pr_url)
     cancel.check()
+    if unopened:
+        # Not in review until every PR is open: the issue stays in progress, for its developer.
+        with timings.step("Jira: PRs to open by hand"):
+            lines = "\n".join(f"* {line}" for line in [*unopened, *(f"opened {p}" for p in prs)])
+            for issue in issues:
+                try:
+                    jira.comment(issue.key, "ShadowDev pushed its change, but could not open every pull request:\n" + lines)
+                except HTTPError as e:
+                    log.warning("%s: could not comment the branches to open PRs for: %s", issue.key, e)
+                move_issue(jira, issue.key, project.start_statuses)
+        return "failed", "; ".join([*unopened, *(f"opened {p}" for p in prs)])
     unreported = []
     with timings.step("Jira PR links and review status"):
         for issue in issues:
