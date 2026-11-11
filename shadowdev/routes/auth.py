@@ -5,7 +5,7 @@ import secrets
 from ..config import OAUTH_CALLBACK_PATH
 from ..repositories.sessions import SESSION_SECONDS
 from ..services.errors import UserError
-from ..views import pages
+from ..views.auth import continue_page, login_page
 from .request import COOKIE, FormPost, Request, form_action
 from .settings import render
 
@@ -34,7 +34,7 @@ def connect_jira(req: Request, post: FormPost) -> None:
     form-action 'self' to a form's redirects, so redirecting to Atlassian would be blocked."""
     url, cookie = _atlassian_url(req, "connect")
     nonce = secrets.token_urlsafe(16)
-    req.html(pages.continue_page(url, nonce), nonce, cookies=(cookie,))
+    req.html(continue_page(url, nonce, req.theme()), nonce, cookies=(cookie,))
 
 
 def finish_sign_in(req: Request) -> None:
@@ -47,8 +47,9 @@ def finish_sign_in(req: Request) -> None:
 
     def fail(message: str) -> None:
         if user:
-            return render(req, user, session[2], error=message, status=400, cookies=(clear_state,))
-        req.html(pages.login_page(public_url, message), status=400, cookies=(clear_state,))
+            return render(req, user, session[2], tab="accounts", error=message, status=400, cookies=(clear_state,))
+        nonce = secrets.token_urlsafe(16)
+        req.html(login_page(public_url, nonce, req.theme(), message), nonce, status=400, cookies=(clear_state,))
 
     if req.arg("error"):
         return fail("Jira access was not granted.")

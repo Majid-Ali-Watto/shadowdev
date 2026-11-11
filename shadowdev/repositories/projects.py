@@ -34,10 +34,11 @@ class ProjectRepository:
             repos: dict[int, list[Repo]] = {}
             for r in conn.execute(f"SELECT * FROM repos WHERE project_id IN ({marks}) ORDER BY position", ids):
                 repos.setdefault(r["project_id"], []).append(
-                    Repo(r["name"], r["github"], r["description"], r["release_prefix"], r["setup"], r["test"]))
+                    Repo(r["name"], r["github"], r["description"], r["release_prefix"], r["setup"], r["test"],
+                         tuple(r["reviewers"].split())))
         return [Project(r["id"], r["name"], r["owner_id"], r["cloud_id"], r["url"], frozenset(keys.get(r["id"], ())),
                         r["root_cause_field"], tuple(repos.get(r["id"], ())), tuple(json.loads(r["start_statuses"])),
-                        tuple(json.loads(r["review_statuses"]))) for r in rows]
+                        tuple(json.loads(r["review_statuses"])), r["slack_channel"]) for r in rows]
 
     def get(self, project_id: int) -> Project | None:
         found = self._query("p.id = ?", (project_id,))
@@ -64,18 +65,18 @@ class ProjectRepository:
         """Create (id 0) or update a project; returns its ID. Raises Taken."""
         with closing(self.db.connect()) as conn, conn:
             values = (project.name, project.root_cause_field, json.dumps(project.start_statuses),
-                      json.dumps(project.review_statuses))
+                      json.dumps(project.review_statuses), project.slack_channel)
             try:
                 if project.id:
                     pid = project.id
-                    conn.execute("UPDATE projects SET name = ?, root_cause_field = ?, start_statuses = ?, review_statuses = ? "
-                                 "WHERE id = ?", (*values, pid))
+                    conn.execute("UPDATE projects SET name = ?, root_cause_field = ?, start_statuses = ?, review_statuses = ?, "
+                                 "slack_channel = ? WHERE id = ?", (*values, pid))
                     conn.execute("DELETE FROM project_keys WHERE project_id = ?", (pid,))
                     conn.execute("DELETE FROM repos WHERE project_id = ?", (pid,))
                 else:
                     pid = conn.execute(
-                        "INSERT INTO projects (name, root_cause_field, start_statuses, review_statuses, cloud_id, owner_id, "
-                        "webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO projects (name, root_cause_field, start_statuses, review_statuses, slack_channel, cloud_id, "
+                        "owner_id, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (*values, project.cloud_id, project.owner_id, self.db.encrypt(secrets.token_urlsafe(32)))).lastrowid
                 conn.executemany("INSERT INTO project_keys VALUES (?, ?, ?)",
                                  [(pid, project.cloud_id, k) for k in sorted(project.jira_projects)])
@@ -83,8 +84,9 @@ class ProjectRepository:
                 if "UNIQUE" not in str(e):
                     raise
                 raise Taken("name" if "projects.name" in str(e) else "key") from None
-            conn.executemany("INSERT INTO repos VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                             [(pid, i, r.name, r.github, r.description, r.release_prefix, r.setup, r.test)
+            conn.executemany("INSERT INTO repos (project_id, position, name, github, description, release_prefix, setup, "
+                             "test, reviewers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                             [(pid, i, r.name, r.github, r.description, r.release_prefix, r.setup, r.test, " ".join(r.reviewers))
                               for i, r in enumerate(project.repos)])
         return pid
 

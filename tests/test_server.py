@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import hmac
 import html
@@ -15,6 +16,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from shadowdev.app import build_app, database
 from shadowdev.config import Config
+from shadowdev.models.limits import Limits
 from shadowdev.models.tokens import Tokens
 from shadowdev.models.user import Site
 from shadowdev.repositories.projects import ProjectRepository
@@ -24,6 +26,9 @@ from shadowdev.repositories.users import UserRepository
 from shadowdev.server import Server, make_handler
 from shadowdev.services import accounts, projects as project_service, run_queue, runs
 from shadowdev.services.run_queue import RunQueue
+from shadowdev.clients.rest import HTTPError
+from shadowdev.models.settings import Settings
+from shadowdev.services.errors import UserError
 from shadowdev.services.webhook import matching_issue, verify_signature
 from tests.helpers import HOME, OFFICE, add_developer, add_project, join, make_cfg, repo
 
@@ -240,7 +245,14 @@ class WebTest(Env):
                          "/?ok=github")
         self.github.user.return_value = {"login": "majid", "id": 7, "name": "Majid", "email": None}
         self.request("POST", "/github", {"csrf": csrf, "github_token": "gh-home", "github_label": "personal"})
-        self.assertIn("not a Claude token", self.request("POST", "/claude", {"csrf": csrf, "claude_token": "abc"})[2])
+        error_page = self.request("POST", "/claude", {"csrf": csrf, "claude_token": "abc"})[2]
+        self.assertIn("not a Claude token", error_page)
+        # The page opens on the tab of the form that failed, and after a form on the tab of its notice.
+        selected = lambda page: re.search(r'data-tab="(\w+)" aria-selected="true"', page).group(1)
+        self.assertEqual(selected(error_page), "accounts")
+        self.assertEqual(selected(self.request("GET", "/?ok=queued")[2]), "runs")
+        self.assertEqual(selected(self.request("GET", "/?tab=settings")[2]), "settings")
+        self.assertEqual(selected(self.request("GET", "/?tab=bogus")[2]), "accounts")  # no Claude account yet: the next step
         # A token copied from a wrapped terminal line, with a space and a line break in it.
         self.assertEqual(self.request("POST", "/claude", {"csrf": csrf, "claude_token": " sk-ant-oat01-ab cd\r\nef ",
                                                           "claude_label": "office"})[1], "/?ok=claude")
@@ -254,15 +266,33 @@ class WebTest(Env):
         self.assertEqual((cl["office"].token, cl["personal"].token), ("sk-ant-oat01-abcdef", "sk-ant-api03-home"))
         self.assertNotEqual(cl["office"].config_key, cl["personal"].config_key)
 
+        # Slack: the developer's own user token, checked with Slack.
+        self.assertIn("starts with xoxp-", self.request("POST", "/slack", {"csrf": csrf, "slack_token": "xoxb-bot"})[2])
+        with mock.patch.object(accounts, "Slack") as slack:
+            slack.return_value.whoami.return_value = {"user_id": "U0000MEME0", "team": "acme"}
+            self.assertEqual(self.request("POST", "/slack", {"csrf": csrf, "slack_token": "xoxp-secret"})[1], "/?ok=slack")
+        self.assertEqual((self.me().slack.token, self.me().slack.user_id), ("xoxp-secret", "U0000MEME0"))
+        page = self.request("GET", "/")[2]
+        self.assertIn("member U0000MEME0", page)
+        self.assertNotIn("xoxp-secret", page)
+
         # Add the office project from the page: repo URLs pasted, names and descriptions filled in.
         self.assertIn("Add a project", self.request("GET", "/project")[2])
         form = {"csrf": csrf, "name": "marketplace", "cloud_id": OFFICE.cloud_id, "jira_keys": "mar, mars",
                 "github_account_id": gh["office"].id,
                 "repo_github": ["https://github.com/acme/market-place-fe.git", "acme/services", ""],
                 "repo_name": ["fe", "", ""], "repo_description": ["", "Python services", ""],
-                "repo_release_prefix": ["", "", ""], "repo_setup": ["npm ci", "", ""], "repo_test": ["npm test", "", ""]}
+                "repo_release_prefix": ["", "", ""], "repo_setup": ["npm ci", "", ""], "repo_test": ["npm test", "", ""],
+                "slack_channel": "C0REVIEWS1", "repo_reviewers": ["<@U0000AAA1>, U0000BBB2", "", ""]}
+        self.assertIn("Slack channel: the channel", self.request("POST", "/project/save", {**form, "slack_channel": "#reviews"})[2])
+        self.assertIn("reviewers: &#x27;@sara&#x27; is not a member ID",
+                      self.request("POST", "/project/save", {**form, "repo_reviewers": ["@sara", "", ""]})[2])
         self.assertEqual(self.request("POST", "/project/save", form)[1], "/?ok=project")
         (market,) = self.app.project_service.visible(self.me())
+        self.assertEqual((market.slack_channel, [r.reviewers for r in market.repos]), ("C0REVIEWS1", [("U0000AAA1", "U0000BBB2"), ()]))
+        editor = self.request("GET", f"/project?id={market.id}")[2]
+        self.assertIn('value="C0REVIEWS1"', editor)
+        self.assertIn('value="U0000AAA1, U0000BBB2"', editor)
         self.assertEqual((market.name, market.jira_projects, market.owner_id, market.cloud_id),
                          ("marketplace", {"MAR", "MARS"}, me.id, OFFICE.cloud_id))
         self.assertEqual([(r.name, r.github, r.description, r.setup, r.test) for r in market.repos],
@@ -296,6 +326,20 @@ class WebTest(Env):
                          (ME_HOME, "majid", "personal", "bugs"))
         page = self.request("GET", "/")[2]
         self.assertIn("Active in 2 projects", page)
+        # What is automated is chosen per project: an unticked switch is off; saving without the
+        # settings fields keeps them.
+        self.assertIn('<input type="checkbox" name="set:fix_ci" checked>', page)
+        chosen = {"settings": "1", "set:auto_start": "on", "set:model": "sonnet", "set:publish": "draft"}
+        self.assertEqual(self.request("POST", "/project/join", {**join_form(side, gh["personal"], cl["personal"]),
+                                                                "mode": "bugs", **chosen})[1], "/?ok=joined")
+        for form in (chosen, {}):
+            self.request("POST", "/project/join", {**join_form(side, gh["personal"], cl["personal"]), "mode": "bugs", **form})
+            mine = self.me().actor(side.id).settings
+            self.assertEqual((mine.auto_start, mine.model, mine.publish, mine.fix_ci, mine.jira_comments),
+                             (True, "sonnet", "draft", False, False))
+        self.assertEqual(self.me().actor(market.id).settings, Settings())  # the other project keeps its own
+        self.assertIn("is not a choice", self.request("POST", "/project/join", {
+            **join_form(side, gh["personal"], cl["personal"]), **chosen, "set:publish": "force-push"})[2])
         for secret in ("gh-office", "gh-home", "sk-ant-oat01-abcdef"):
             self.assertNotIn(secret, page)  # tokens are never shown back
         self.assertIn(f"/webhook?project={market.id}", page)  # the owner sees each project's webhook
@@ -400,6 +444,17 @@ class WebTest(Env):
         self.cookies["shadowdev_oauth_state"] = "connect.abc"
         self.assertIn("expired or was started elsewhere", self.request("GET", "/oauth/jira/callback?code=c&state=abc")[2])
 
+    def test_pages_render_in_the_chosen_theme(self):
+        self.assertIn('<html lang="en">', self.request("GET", "/")[2])  # no choice: the system's
+        self.cookies["shadowdev_theme"] = "dark"
+        self.assertIn('<html lang="en" data-theme="dark">', self.request("GET", "/")[2])
+        self.sign_in()
+        page = self.request("GET", "/")[2]
+        self.assertIn('data-theme="dark"', page)
+        self.assertIn("data-theme-toggle", page)
+        self.cookies["shadowdev_theme"] = '"><script>'  # only light or dark is ever used
+        self.assertIn('<html lang="en">', self.request("GET", "/")[2])
+
     def test_pages_let_browsers_send_their_origin(self):
         # With Referrer-Policy: no-referrer, browsers send "Origin: null" on form posts, which the
         # Origin check rejects: no form would work.
@@ -429,6 +484,75 @@ class WebTest(Env):
         self.assertIsNone(self.users.get(uid))
         self.assertIn("Sign in with Jira", self.request("GET", "/")[2])
 
+    def test_running_a_range_of_issues(self):
+        self.sign_in()
+        csrf = self.csrf()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        self.users.save_github(uid, ME, "gh", ME, ME, f"{ME}@x")
+        self.users.save_claude(uid, ME, "sk-ant-oat01-x", f"key-{ME}")
+        join(self.users, uid, market, ME)  # bugs only
+
+        def issue(key):
+            if key == "MAR-2":
+                raise HTTPError("Jira GET … -> 404", 404)
+            return {"fields": {"assignee": {"accountId": "acc-sara" if key in ("MAR-3", "MAR-9") else ME},
+                               "issuetype": {"name": "Story" if key == "MAR-4" else "Bug"}}}
+        self.jira.get_issue.side_effect = issue
+
+        # Of a range, what isn't yours to run is skipped, and listed as a skipped run.
+        self.assertEqual(self.request("POST", "/run", {"csrf": csrf, "issue_keys": "mar-1 to mar-5, MAR-7"})[1], "/?ok=queued")
+        self.assertEqual(self.queued, [("marketplace", ["MAR-1"], uid), ("marketplace", ["MAR-5"], uid),
+                                       ("marketplace", ["MAR-7"], uid)])
+        skipped = self.runs.recent(uid)[0]
+        self.assertEqual((skipped["issue_key"], skipped["status"]), ("MAR-2, MAR-3, MAR-4", "skipped"))
+        self.assertEqual(skipped["message"], "Not run, from the range: MAR-2 was not found in Jira, or you cannot see it. "
+                                             "MAR-3 is not assigned to you. MAR-4 is a Story you don't automate in marketplace.")
+        # Left out of the range: not run, not looked up, not listed as skipped.
+        self.queued.clear()
+        self.jira.get_issue.reset_mock()
+        self.assertEqual(self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-8 except MAR-6"})[1], "/?ok=queued")
+        self.assertEqual([keys for _, keys, _ in self.queued], [["MAR-5"], ["MAR-7"], ["MAR-8"]])
+        self.assertNotIn("MAR-6", [c.args[0] for c in self.jira.get_issue.call_args_list])
+        self.assertIn("MAR-13 is left out, but not among the issues", self.request(
+            "POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-8, !MAR-13"})[2])
+        # A key typed by itself must be yours.
+        self.queued.clear()
+        self.assertIn("MAR-9 is not assigned to you.", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-6, MAR-9"})[2])
+        self.assertEqual(self.queued, [])
+        self.assertIn("None of those issues is yours to run", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-2 to MAR-4"})[2])
+        self.assertIn("a range stays in one Jira project", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-1 to HR-4"})[2])
+        # Together: one job, at most ten issues on one branch.
+        self.assertEqual(self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-8", "grouping": "together"})[1],
+                         "/?ok=queued")
+        self.assertEqual(self.queued, [("marketplace", ["MAR-5", "MAR-6", "MAR-7", "MAR-8"], uid)])
+        self.assertIn("At most 10 issues on one branch; 12 are yours", self.request(
+            "POST", "/run", {"csrf": csrf, "issue_keys": "MAR-10 to MAR-21", "grouping": "together"})[2])
+
+    def test_answering_the_questions_of_a_run(self):
+        self.sign_in()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        run_id = self.runs.add("MAR-1, MAR-2", uid, market.id, "marketplace")
+        self.runs.update(run_id, "question", "ShadowDev needs your decision before it works on MAR-1: …")
+        self.runs.set_questions(run_id, {"MAR-1": ["Keep the old <API>?"]})
+        page = self.request("GET", "/")[2]
+        self.assertIn(f'<a class="button small" href="/?tab=runs&amp;answer={run_id}#run-form">Answer</a>', page)
+        page = self.request("GET", f"/?answer={run_id}")[2]
+        self.assertIn('name="issue_keys" value="MAR-1, MAR-2"', page)
+        self.assertIn("<li>MAR-1: Keep the old &lt;API&gt;?</li>", page)
+        self.assertIn(" autofocus>MAR-1: \n</textarea>", page)
+        self.assertIn('value="together" checked', page)  # they were worked on together
+        # Someone else's run, or one that asked nothing, fills in nothing.
+        other = add_developer(self.users, "acc-sara")
+        theirs = self.runs.add("MAR-3", other, market.id, "marketplace")
+        self.runs.update(theirs, "question", "…")
+        self.runs.set_questions(theirs, {"MAR-3": ["Secret question?"]})
+        for answer in (theirs, "x"):
+            page = self.request("GET", f"/?answer={answer}")[2]
+            self.assertNotIn("Secret question", page)
+            self.assertIn('name="issue_keys" value=""', page)
+
     def test_stop_button(self):
         self.sign_in()
         csrf = self.csrf()
@@ -437,7 +561,7 @@ class WebTest(Env):
         run_id = self.runs.add("MAR-1", uid, market.id, "marketplace", "Only the <API>.")
         self.runs.set_model(run_id, "haiku → sonnet (medium)")
         page = self.request("GET", "/")[2]
-        self.assertIn(f'name="run_id" value="{run_id}"', page)  # queued: has a Stop button
+        self.assertIn(f'<input type="hidden" name="run_id" value="{run_id}">', page)  # queued: has a Stop button
         self.assertIn("<small>Model: haiku → sonnet (medium)</small><small>Your note: Only the &lt;API&gt;.</small>", page)
         # The page keeps Recent runs up to date by fetching its rows.
         self.assertIn("connect-src 'self'", self.headers["Content-Security-Policy"])
@@ -451,7 +575,39 @@ class WebTest(Env):
         self.assertIn("already finished, or is not yours", self.request("POST", "/stop", {"csrf": csrf, "run_id": "999"})[2])
         self.assertIn("already finished, or is not yours", self.request("POST", "/stop", {"csrf": csrf, "run_id": "x"})[2])
         self.runs.update(run_id, "done", "ok")
-        self.assertNotIn(f'name="run_id" value="{run_id}"', self.request("GET", "/")[2])  # finished: no button
+        finished = self.request("GET", "/")[2]
+        self.assertNotIn(f'<input type="hidden" name="run_id" value="{run_id}">', finished)  # finished: no Stop button
+        self.assertIn(f'name="run_id" value="{run_id}" form="delete-runs"', finished)  # but it can be selected for deletion
+
+    def test_finished_runs_are_selected_and_deleted_but_not_active_or_other_peoples(self):
+        self.sign_in()
+        csrf = self.csrf()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        other = add_developer(self.users, "acc-sara")
+        add = lambda key, status, owner=uid: (lambda run: (self.runs.update(run, status), run)[1])(
+            self.runs.add(key, owner, market.id, "marketplace"))
+        done, failed, running, queued, hers = (add("MAR-1", "done"), add("MAR-2", "failed"), add("MAR-3", "running"),
+                                               add("MAR-4", "queued"), add("MAR-5", "done", other))
+        page = self.request("GET", "/")[2]
+        for run in (done, failed):  # finished: a checkbox, bound to the delete form
+            self.assertIn(f'<input type="checkbox" name="run_id" value="{run}" form="delete-runs"', page)
+        for run in (running, queued):  # active: stopped first, not deleted
+            self.assertNotIn(f'name="run_id" value="{run}" form="delete-runs"', page)
+        self.assertIn('id="pick-all"', page)
+        self.assertIn('action="/runs/delete"', page)
+
+        self.assertIn("Select the runs to delete", self.request("POST", "/runs/delete", {"csrf": csrf})[2])
+        self.assertIn("still queued or running", self.request("POST", "/runs/delete", {"csrf": csrf, "run_id": [str(running), str(queued)]})[2])
+        # Selected finished ones go, with junk and other people's ids ignored; active ones in the same request stay.
+        form = {"csrf": csrf, "run_id": [str(done), str(failed), str(running), str(hers), "x", "../1"]}
+        self.assertEqual(self.request("POST", "/runs/delete", form)[1], "/?ok=runs-deleted")
+        self.assertEqual({r["id"] for r in self.runs.recent(uid)}, {running, queued})
+        self.assertEqual([r["id"] for r in self.runs.recent(other)], [hers])
+        self.assertIn("Selected runs removed", self.request("GET", "/?ok=runs-deleted")[2])
+        # Forms need the session's CSRF token.
+        self.request("POST", "/runs/delete", {"csrf": "forged", "run_id": [str(hers)]})
+        self.assertEqual([r["id"] for r in self.runs.recent(other)], [hers])
 
     def test_using_shadowdev_renews_the_session_but_the_pages_own_refresh_does_not(self):
         self.sign_in()
@@ -477,6 +633,28 @@ class WebTest(Env):
         self.cookies["shadowdev_session"] = token
         self.assertEqual(self.request("GET", "/runs")[0], 401)
 
+    def test_timing_and_limits_are_the_developers_own(self):
+        self.sign_in()
+        csrf = self.csrf()
+        page = self.request("GET", "/")[2]
+        self.assertIn("Timing and limits", page)
+        self.assertIn('name="max_parallel_runs" value="5"', page)  # the defaults until changed
+        self.assertIn('name="github_poll_minutes" value="1"', page)
+        self.assertNotIn("sec<", page)  # every time is in minutes
+        form = {"csrf": csrf, "jira_polling": "on", "jira_poll_minutes": "5", "github_poll_minutes": "0.5", "slack_poll_minutes": "1.5",
+                "review_quiet_minutes": "1", "claude_timeout_minutes": "45", "command_timeout_minutes": "20",
+                "max_parallel_runs": "2", "max_fix_attempts": "4"}
+        self.assertEqual(self.request("POST", "/limits", form)[1], "/?ok=limits")
+        self.assertEqual(self.me().limits, Limits(
+            jira_polling=True, jira_poll_minutes=5, github_poll_minutes=0.5, slack_poll_minutes=1.5, review_quiet_minutes=1,
+            claude_timeout_minutes=45, command_timeout_minutes=20, max_parallel_runs=2, max_fix_attempts=4))
+        status, _, body = self.request("POST", "/limits", {**form, "max_parallel_runs": "50"})
+        self.assertEqual(status, 400)
+        self.assertIn("Runs at the same time must be a whole number from 1 to 20.", html.unescape(body))
+        self.assertEqual(self.me().limits.max_parallel_runs, 2)  # unchanged
+        self.request("POST", "/limits", {**form, "csrf": "forged", "max_parallel_runs": "1"})  # needs the session's CSRF token
+        self.assertEqual(self.me().limits.max_parallel_runs, 2)
+
     def test_pause_and_resume(self):
         self.sign_in()
         csrf = self.csrf()
@@ -499,10 +677,14 @@ class WebTest(Env):
         self.assertEqual(self.request("POST", "/resume", {"csrf": csrf})[1], "/?ok=resumed")
         self.assertFalse(self.me().paused)
         self.assertIsNotNone(matching_issue(payload(), self.projects, self.users))
+        # With "Start by itself" off in the project, new assignments wait for Run issues now.
+        sub = self.me().subscriptions[market.id]
+        self.users.subscribe(self.me().id, dataclasses.replace(sub, settings=Settings(auto_start=False)))
+        self.assertIsNone(matching_issue(payload(), self.projects, self.users))
 
 
 def fake_process_factory(record=None, block: threading.Event | None = None):
-    def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None):
+    def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None, on_pr=None, **kw):
         if record is not None:
             record.append((actor.display_name, tuple(keys), *([note] if note else [])))
         if on_model:
@@ -516,9 +698,8 @@ def fake_process_factory(record=None, block: threading.Event | None = None):
 
 
 class QueueEnv(Env):
-    def pool(self, fake_process, max_parallel_runs=5, start=True):
-        cfg = Config(**{**self.cfg.__dict__, "max_parallel_runs": max_parallel_runs})
-        pool = RunQueue(cfg, self.users, self.projects, self.runs, mock.Mock())
+    def pool(self, fake_process, workers=5, start=True):
+        pool = RunQueue(self.cfg, self.users, self.projects, self.runs, mock.Mock(), workers=workers)
         for p in (mock.patch.object(run_queue, "process_issues", fake_process), mock.patch.object(run_queue, "jira_client")):
             p.start()
             self.addCleanup(p.stop)
@@ -539,7 +720,7 @@ class RunQueueTest(QueueEnv):
         me = self.developer()
         running, peak, lock, release = set(), [0], threading.Lock(), threading.Event()
 
-        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None):
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None, on_pr=None, **kw):
             with lock:
                 running.add(tuple(keys))
                 peak[0] = max(peak[0], len(running))
@@ -562,6 +743,31 @@ class RunQueueTest(QueueEnv):
         self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))  # finished, so it can run again
         self.wait_for(done)
 
+    def test_each_developer_runs_up_to_their_own_limit(self):
+        me, sara = self.developer(), self.developer("acc-sara")
+        self.users.set_limits(me, Limits(max_parallel_runs=2))
+        running, release = [], threading.Event()
+
+        def fake_process(keys, project, actor, cfg, jira, github, **kw):
+            running.append((actor.jira_account_id, keys[0], cfg.max_fix_attempts))
+            release.wait(5)
+            return "done", "ok"
+
+        pool = self.pool(fake_process, start=False)
+        for n in range(1, 5):
+            pool.submit(self.market, [f"MAR-{n}"], me)
+        pool.submit(self.market, ["MAR-9"], sara)
+        pool.start()
+        self.wait_for(lambda: len(running) == 3)
+        time.sleep(0.1)
+        self.assertEqual(sorted(running), [(ME, "MAR-1", 3), (ME, "MAR-2", 3), ("acc-sara", "MAR-9", 3)])
+        self.users.set_limits(me, Limits(max_parallel_runs=3, max_fix_attempts=5))
+        pool.limits_changed()  # as AccountService.set_limits does: waiting runs see the new limit
+        self.wait_for(lambda: len(running) == 4)
+        self.assertEqual(running[-1], (ME, "MAR-3", 5))  # a run gets its developer's limits when it starts
+        release.set()
+        self.wait_for(lambda: all(r["status"] == "done" for r in self.runs.recent(me)))
+
     def test_a_finished_run_logs_its_end(self):
         me = self.developer()
         pool = self.pool(fake_process_factory(), start=False)
@@ -583,7 +789,7 @@ class RunQueueTest(QueueEnv):
     def test_developers_take_turns(self):
         me, sara = self.developer(), self.developer("acc-sara")
         order = []
-        pool = self.pool(fake_process_factory(order), max_parallel_runs=1, start=False)
+        pool = self.pool(fake_process_factory(order), workers=1, start=False)
         for n in (1, 2, 3):
             pool.submit(self.market, [f"MAR-{n}"], me)
         pool.submit(self.market, ["MAR-9"], sara)
@@ -605,6 +811,30 @@ class RunQueueTest(QueueEnv):
         self.assertEqual(status[gone][0], "failed")
         self.assertIn("project was deleted", status[gone][1])
         self.assertIn(waiting, status)
+
+    def test_work_on_a_pull_request_runs_in_the_queue_and_is_not_resumed_after_a_restart(self):
+        me = self.developer()
+        left = self.runs.add("acme/fe#3", me, self.market.id, "marketplace")  # queued when the server stopped
+        pool = self.pool(fake_process_factory())
+        self.assertIn("starts again by itself", next(r for r in self.runs.recent(me) if r["id"] == left)["message"])
+        seen, ended = [], []
+
+        def work(project, actor, cfg, github, cancel, on_model):
+            seen.append((project.name, actor.display_name, cancel.cancelled))
+            on_model("default")
+            return "done", "approved https://github.com/acme/fe/pull/7"
+
+        self.assertIsNone(pool.submit(self.market, ["acme/fe#7"], me, work=work, after=lambda: ended.append("review")))
+        self.assertEqual(pool.submit(self.market, ["acme/fe#7"], me, work=work), "already queued or running: acme/fe#7")
+        self.wait_for(lambda: ended)
+        run = self.runs.recent(me)[0]
+        self.assertEqual((seen, run["issue_key"], run["status"], run["model"]),
+                         ([("marketplace", ME, False)], "acme/fe#7", "done", "default"))
+        # One that never starts (its developer paused) still ends, so what asked for it is told.
+        self.users.set_paused(me, True)
+        self.assertIsNone(pool.submit(self.market, ["acme/fe#8"], me, work=work, after=lambda: ended.append("skipped")))
+        self.wait_for(lambda: ended == ["review", "skipped"])
+        self.assertEqual(len(seen), 1)
 
     def test_runs_use_the_project_and_accounts_as_they_are_when_they_start(self):
         me = self.developer()
@@ -634,7 +864,7 @@ class StopAndPauseTest(QueueEnv):
         # Its failure comment updates the issue, which a webhook or the poller would take for new work.
         me, sara = self.developer(), self.developer("acc-sara")
 
-        def failing(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None):
+        def failing(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None, on_pr=None, **kw):
             raise RuntimeError("tests still failing")
 
         pool = self.pool(failing)
@@ -647,11 +877,36 @@ class StopAndPauseTest(QueueEnv):
         # Reassigned: it is new work for the other developer (once this developer's run is over).
         self.wait_for(lambda: pool.submit(self.market, ["MAR-2"], sara, automatic=True) is None)
         self.wait_for(lambda: all(r["status"] == "failed" for u in (me, sara) for r in self.runs.recent(u)))
+        # One that asked the developer waits for their note, not for the ticket to change.
+        run = self.runs.add("MAR-7", me, self.market.id, self.market.name)
+        self.runs.update(run, "question", "ShadowDev needs your decision…")
+        self.assertIn("the last run of MAR-7 asked you questions", pool.submit(self.market, ["MAR-7"], me, automatic=True))
+
+    def test_questions_for_the_developer_come_back_with_their_answer(self):
+        me = self.developer()
+        seen = []
+
+        def asking(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None, on_pr=None, asked=None,
+                   on_questions=None):
+            seen.append((note, asked))
+            if not note:
+                on_questions({"MAR-1": ["Keep the old API?"]})
+                return "question", "ShadowDev needs your decision…"
+            return "done", "ok"
+
+        pool = self.pool(asking)
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "question")
+        self.assertEqual(self.runs.asked(me, self.market.id, ["MAR-1", "MAR-2"]), {"MAR-1": ["Keep the old API?"]})
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me, note="MAR-1: yes, keep it."))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+        self.assertEqual(seen, [("", {}), ("MAR-1: yes, keep it.", {"MAR-1": ["Keep the old API?"]})])
+        self.assertEqual(self.runs.asked(me, self.market.id, ["MAR-1"]), {})  # answered: the latest run is done
 
     def test_a_developer_stops_one_of_their_runs(self):
         me, sara = self.developer(), self.developer("acc-sara")
         started = []
-        pool = self.pool(fake_process_factory(started, block=threading.Event()), max_parallel_runs=1)
+        pool = self.pool(fake_process_factory(started, block=threading.Event()), workers=1)
         self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
         self.assertIsNone(pool.submit(self.market, ["MAR-2"], me))  # waits behind MAR-1
         self.wait_for(lambda: started)
@@ -760,3 +1015,15 @@ class LimitsTest(Env):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlackMembersTest(unittest.TestCase):
+    def test_reviewers_as_pasted_from_slack_and_what_is_wrong_is_named(self):
+        from shadowdev.services.projects import slack_members
+        self.assertEqual(slack_members("U012ABC3DE, <@U045FGH6IJ>; @w0789klm0n <@U0111AAAA|majid>", "fe: reviewers"),
+                         ("U012ABC3DE", "U045FGH6IJ", "W0789KLM0N", "U0111AAAA"))
+        self.assertEqual(slack_members("", "fe: reviewers"), ())
+        with self.assertRaisesRegex(UserError, r"fe: reviewers: '@majid\.ali' is not a member ID\. Give up to 5"):
+            slack_members("U012ABC3DE @majid.ali", "fe: reviewers")
+        with self.assertRaisesRegex(UserError, "6 people; at most 5"):
+            slack_members(" ".join(f"U00000000{n}" for n in range(6)), "fe: reviewers")

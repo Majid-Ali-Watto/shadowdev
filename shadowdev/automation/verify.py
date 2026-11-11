@@ -22,7 +22,6 @@ from ..models.project import Repo
 
 log = logging.getLogger("shadowdev")
 
-COMMAND_TIMEOUT_SECONDS = 30 * 60
 OUTPUT_LIMIT = 8000
 MAX_FILE_BYTES = 2 * 1024**3  # a setup/test command cannot write a file bigger than this
 MAX_REPORT_BYTES = 50 * 1024**2  # a bigger JUnit report is not read
@@ -54,15 +53,15 @@ class Checkout:
 
 def run_command(cwd: Path, command: str, cfg: Config, label: str, cancel: CancelToken = NEVER, **env: str) -> tuple[bool, str]:
     """Run a project command (setup/test) in the sandbox: it executes code Claude wrote.
-    Limits: COMMAND_TIMEOUT_SECONDS, MAX_FILE_BYTES per file written, and only the last
+    Limits: cfg.command_timeout_seconds, MAX_FILE_BYTES per file written, and only the last
     OUTPUT_LIMIT characters of its output are kept in memory. Logged with `label`."""
     first_line = command.strip().splitlines()[0]
     log.info("%s: $ %s%s", label, first_line, " …" if "\n" in command.strip() else "")
-    started = time.monotonic()
+    started, timeout = time.monotonic(), cfg.command_timeout_seconds
     argv = ["prlimit", f"--fsize={MAX_FILE_BYTES}", "--core=0", "--", *sandbox.wrap_command(command, cfg, cwd)]
     proc = subprocess.Popen(argv, cwd=cwd, env=sandbox.env(Path.home(), **env),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    watchdog = threading.Timer(COMMAND_TIMEOUT_SECONDS, proc.kill)
+    watchdog = threading.Timer(timeout, proc.kill)
     watchdog.start()
     tail = bytearray()
     with cancel.tracking(proc):
@@ -77,9 +76,9 @@ def run_command(cwd: Path, command: str, cfg: Config, label: str, cancel: Cancel
     cancel.check()
     output = tail.decode(errors="replace")[-OUTPUT_LIMIT:]
     took = time.monotonic() - started
-    if took >= COMMAND_TIMEOUT_SECONDS:
-        log.warning("%s: timed out after %ds", label, COMMAND_TIMEOUT_SECONDS)
-        return False, f"timed out after {COMMAND_TIMEOUT_SECONDS}s\n{output}"
+    if took >= timeout:
+        log.warning("%s: timed out after %ds", label, timeout)
+        return False, f"timed out after {timeout}s\n{output}"
     if proc.returncode == 0:
         log.info("%s: ok in %.0fs", label, took)
     else:
@@ -225,6 +224,39 @@ def _check(c: Checkout, scratch: Path, cfg: Config) -> tuple[bool, str]:
     if new:
         problems.append(f"Tests that pass on {c.base} but fail now:\n" + "\n".join(new[:50]))
     return False, "\n".join(problems) + "\n" + run.output
+
+
+def changed_paths(c: Checkout, scratch: Path) -> set[str]:
+    """Files the change adds or modifies in the repo, as git names them (relative to the repo)."""
+    scratch.mkdir(parents=True, exist_ok=True)
+    tree = gitops.snapshot(c.worktree, scratch / f"{c.repo.name}.paths-index")
+    return set(gitops.changed_files(c.worktree, gitops.git(c.worktree, "rev-parse", "HEAD^{tree}"), tree))
+
+
+def reproduces(c: Checkout, tests: list[str], scratch: Path, cfg: Config) -> list[str]:
+    """Run the repo's tests on its untouched base commit with only the change's test files `tests`
+    (relative to the repo, among changed_paths) copied in, in a throwaway worktree outside Claude's
+    workspace. Returns the tests that fail there but not in the baseline: none means the tests do
+    not reproduce the bug. Needs the baseline, so call it after check()."""
+    path = scratch / "regression" / c.repo.name
+    label = f"{c.label}: {c.repo.name} regression tests on {c.base}"
+    gitops.git(c.worktree, "worktree", "add", "--detach", str(path), c.base_commit)
+    try:
+        for test in tests:
+            source = c.worktree / test
+            if source.is_symlink() or not source.is_file():
+                continue  # only plain files of the change are carried over
+            (path / test).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, path / test)
+        if c.repo.setup:
+            ok, output = run_command(path, c.repo.setup, cfg, f"{label}, setup", c.cancel)
+            if not ok:
+                log.warning("%s: setup failed, so the regression tests were not checked:\n%s", label, output[-1500:])
+                return []
+        run = run_tests(c.repo, path, scratch / "reports" / f"{c.repo.name}.regression", cfg, f"{label}, tests", c.cancel)
+        return sorted(run.failures - c.baseline.failures)
+    finally:
+        gitops.git(c.worktree, "worktree", "remove", "--force", str(path))
 
 
 def changed(checkouts: list[Checkout]) -> list[Checkout]:

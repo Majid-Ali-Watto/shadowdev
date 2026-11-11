@@ -12,8 +12,11 @@ from ..automation import gitops
 from ..clients.atlassian import AtlassianOAuth, jira_client
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
-from ..models.project import (CUSTOM_FIELD_RE, JIRA_PROJECT_RE, PROJECT_NAME_RE, REPO_NAME_RE, Project, Repo,
+from ..models.project import (CUSTOM_FIELD_RE, JIRA_PROJECT_RE, PROJECT_NAME_RE, REPO_NAME_RE, SLACK_CHANNEL_RE, SLACK_MEMBER_RE,
+                              Project, Repo,
                               default_repo_name, parse_github)
+from ..models import settings as automation
+from ..models.settings import Settings
 from ..models.user import MODES, Subscription, User
 from ..repositories.projects import ProjectRepository, Taken
 from ..repositories.users import UserRepository
@@ -24,6 +27,7 @@ from .run_queue import RunQueue
 MAX_REPOS = 10
 MAX_KEYS = 20
 MAX_COMMAND_CHARS = 4000
+MAX_REVIEWERS = 5
 
 
 @dataclass
@@ -34,6 +38,7 @@ class RepoForm:
     release_prefix: str = ""
     setup: str = ""
     test: str = ""
+    reviewers: str = ""  # Slack member IDs: "U012ABC, U034DEF"
 
 
 @dataclass
@@ -45,6 +50,7 @@ class ProjectForm:
     root_cause_field: str = ""
     start_statuses: str = ""  # "To Do, In Progress"
     review_statuses: str = ""
+    slack_channel: str = ""  # channel ID
     repos: list[RepoForm] = field(default_factory=list)
 
 
@@ -57,6 +63,20 @@ def statuses(text: str, default: tuple[str, ...], what: str) -> tuple[str, ...]:
     if len(names) > 8 or any(len(n) > 60 for n in names):
         raise UserError(f"{what}: at most 8 Jira status names, separated by commas.")
     return tuple(names)
+
+
+def slack_members(text: str, what: str) -> tuple[str, ...]:
+    """Slack member IDs as typed or pasted: U012ABC, <@U012ABC>, <@U012ABC|name> or @U012ABC, in any
+    case, separated by spaces or commas. The error names what is not one."""
+    typed = text.replace(",", " ").replace(";", " ").split()
+    members = tuple(dict.fromkeys(m.strip("<@>").split("|")[0].upper() for m in typed))
+    wrong = [m for m in typed if not SLACK_MEMBER_RE.match(m.strip("<@>").split("|")[0].upper())]
+    if wrong or len(members) > MAX_REVIEWERS:
+        problem = (f"{', '.join(repr(m) for m in wrong[:5])} {'is' if len(wrong) == 1 else 'are'} not a member ID"
+                   if wrong else f"{len(members)} people; at most {MAX_REVIEWERS}")
+        raise UserError(f"{what}: {problem}. Give up to {MAX_REVIEWERS} Slack member IDs like U012ABC3DE (in Slack: "
+                        "a person's profile → ⋮ → Copy member ID), not names.")
+    return members
 
 
 def run_all(checks: list):
@@ -116,6 +136,10 @@ class ProjectService:
             raise UserError("Root cause field: a Jira custom field ID like customfield_10201, or empty.")
         start = statuses(form.start_statuses, Project.start_statuses, "Start statuses")
         review = statuses(form.review_statuses, Project.review_statuses, "Review statuses")
+        channel = form.slack_channel.strip() or None
+        if channel and not SLACK_CHANNEL_RE.match(channel):
+            raise UserError("Slack channel: the channel's ID like C012ABC3DE (in Slack: the channel's details, at the "
+                            "bottom), or empty.")
         github_account = user.github(form_id(form.github_account_id))
         if not github_account:
             raise UserError("Choose your GitHub account that can push to the repos.")
@@ -136,7 +160,8 @@ class ProjectService:
             setup, test = row.setup.strip() or None, row.test.strip() or None
             if len(setup or "") > MAX_COMMAND_CHARS or len(test or "") > MAX_COMMAND_CHARS:
                 raise UserError(f"{owner_repo}: commands are limited to {MAX_COMMAND_CHARS} characters.")
-            repos.append(Repo(repo_name, owner_repo, " ".join(row.description.split()), prefix, setup, test))
+            repos.append(Repo(repo_name, owner_repo, " ".join(row.description.split()), prefix, setup, test,
+                              slack_members(row.reviewers, f"{owner_repo}: reviewers")))
         if len({r.name for r in repos}) != len(repos) or len({r.github for r in repos}) != len(repos):
             raise UserError("Each repo, and its folder name, can be in the project only once.")
         for key in keys:
@@ -156,9 +181,9 @@ class ProjectService:
         described = iter(infos)
         repos = [r if r.description else Repo(r.name, r.github, (next(described) or {}).get("description")
                                               or f"The {r.github.split('/')[1]} repository", r.release_prefix,
-                                              r.setup, r.test) for r in repos]
+                                              r.setup, r.test, r.reviewers) for r in repos]
         project = Project(existing.id if existing else 0, name, existing.owner_id if existing else user.id, cloud_id,
-                          site.url, frozenset(keys), root_cause, tuple(repos), start, review)
+                          site.url, frozenset(keys), root_cause, tuple(repos), start, review, channel)
         try:
             pid = self.projects.save(project)
         except Taken as e:
@@ -191,9 +216,11 @@ class ProjectService:
         return self.projects.webhook_secret(project.id) if project.owner_id == user.id else None
 
     def join(self, user: User, project_id: str, jira_account_id: str, github_account_id: str, claude_account_id: str,
-             mode: str, base_branches: dict[str, str]) -> None:
+             mode: str, base_branches: dict[str, str], settings: dict[str, str] | None = None) -> None:
         """Join, or change how the developer runs in, a project. `base_branches`: repo name ->
-        branch they typed; empty means the latest release branch, else the default branch."""
+        branch they typed; empty means the latest release branch, else the default branch.
+        `settings`: the automation switches as sent by the form (see models.settings.from_form);
+        None keeps the ones the developer has (or the defaults, when joining)."""
         project = self.visible_project(user, project_id)
         jira_account, jira = self._jira_for(user, project.cloud_id, form_id(jira_account_id))
         github_account = user.github(form_id(github_account_id))
@@ -202,6 +229,13 @@ class ProjectService:
             raise UserError("Choose the GitHub and the Claude account to work on this project with.")
         if mode not in MODES:
             raise UserError("Choose what to automate.")
+        if settings is None:
+            chosen = user.subscriptions[project.id].settings if project.id in user.subscriptions else Settings()
+        else:
+            try:
+                chosen = automation.from_form(settings)
+            except ValueError as e:
+                raise UserError(f"Not saved: {e}.") from None
         bases = {}
         for repo in project.repos:
             branch = base_branches.get(repo.name, "").strip()
@@ -225,7 +259,7 @@ class ProjectService:
         if problems:
             raise UserError("Not saved:\n" + "\n".join(problems))
         self.users.subscribe(user.id, Subscription(project.id, jira_account.id, github_account.id, claude_account.id,
-                                                   mode, bases))
+                                                   mode, bases, chosen))
 
     def leave(self, user: User, project_id: str) -> None:
         project = self.visible_project(user, project_id)

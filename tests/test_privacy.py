@@ -128,13 +128,24 @@ class PrivacyReporterTest(unittest.TestCase):
             db.execute("ALTER TABLE jira_accounts DROP COLUMN profile_at")
             db.execute("ALTER TABLE jira_accounts DROP COLUMN reported_at")
             db.execute("ALTER TABLE runs DROP COLUMN note")
+            db.execute("ALTER TABLE repos DROP COLUMN reviewers")
+            db.execute("ALTER TABLE subscriptions DROP COLUMN slack_seen")
+            db.execute("ALTER TABLE pull_requests DROP COLUMN ci_sha")
+            db.execute("ALTER TABLE pull_requests DROP COLUMN ci_rounds")
+            db.execute("ALTER TABLE subscriptions DROP COLUMN settings")
+            db.execute("ALTER TABLE runs DROP COLUMN questions")
             db.execute("PRAGMA user_version = 2")
         Database(path, self.cfg.secret_key)
         with sqlite3.connect(path) as db:
             columns = {r[1] for r in db.execute("PRAGMA table_info(jira_accounts)")}
             self.assertTrue({"profile_at", "reported_at"} <= columns)
             self.assertIn("note", {r[1] for r in db.execute("PRAGMA table_info(runs)")})  # added in schema 4
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertIn("reviewers", {r[1] for r in db.execute("PRAGMA table_info(repos)")})  # 6
+            self.assertIn("slack_seen", {r[1] for r in db.execute("PRAGMA table_info(subscriptions)")})
+            self.assertTrue({"ci_sha", "ci_rounds"} <= {r[1] for r in db.execute("PRAGMA table_info(pull_requests)")})  # 7
+            self.assertIn("settings", {r[1] for r in db.execute("PRAGMA table_info(subscriptions)")})  # 8
+            self.assertIn("questions", {r[1] for r in db.execute("PRAGMA table_info(runs)")})  # 9
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 10)
 
 
 if __name__ == "__main__":

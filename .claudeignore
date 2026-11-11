@@ -1,0 +1,10 @@
+# Secrets and live data: the token database, per-developer Claude config, run workspaces
+.env
+data/
+worktrees/
+
+# Generated
+.venv/
+__pycache__/
+*.egg-info/
+uv.lock

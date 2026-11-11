@@ -1,5 +1,6 @@
 """Usage:
     python -m shadowdev            # the server: web page at PUBLIC_URL, Jira webhook at /webhook
+    python -m shadowdev --reload   # the same, restarted whenever ShadowDev's code or .env changes (development)
     python -m shadowdev dry-run --summary "..." [--description "..."] [--type Bug|Task] [--note "..."]
                                 [--project NAME] [--as DEVELOPER]
                                    # try the pipeline on a made-up issue; nothing goes to Jira or GitHub
@@ -13,6 +14,8 @@ from .config import PROJECT_ROOT, Config, read_settings
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="python -m shadowdev")
+    parser.add_argument("--reload", action="store_true",
+                        help="restart the server whenever ShadowDev's code or .env changes (for development)")
     commands = parser.add_subparsers(dest="command")
     dry = commands.add_parser("dry-run", help="run the pipeline on a made-up issue, without Jira or GitHub")
     dry.add_argument("--summary", required=True, help="the made-up issue's title")
@@ -26,6 +29,12 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(threadName)s %(message)s")
+    if args.reload:
+        if args.command:
+            parser.error("--reload is for the server only")
+        from .reload import watch
+
+        return watch([])  # the server itself runs in a child process, restarted on changes
     cfg = Config.from_env(read_settings(PROJECT_ROOT / ".env"))
     if args.command == "dry-run":
         from .app import database

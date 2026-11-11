@@ -1,4 +1,4 @@
-"""Polling Jira for new assignments (JIRA_POLLING)."""
+"""Polling Jira for new assignments (Limits.jira_polling)."""
 import tempfile
 import time
 import unittest
@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, urlsplit
 from shadowdev.app import build_app
 from shadowdev.clients.jira import Jira
 from shadowdev.config import Config
+from shadowdev.models.limits import Limits
+from shadowdev.models import limits
 from shadowdev.services import poller
 from tests.helpers import add_developer, add_project, join, make_cfg
 
@@ -31,6 +33,8 @@ class PollerTest(unittest.TestCase):
         self.sara = add_developer(users, SARA)
         join(users, self.sara, self.market, SARA, mode="all")
         add_developer(users, "acc-new")  # in no project: never polled
+        for uid in (self.me, self.sara):
+            users.set_limits(uid, Limits(jira_polling=True))
         self.found = {ME: [], SARA: []}
         self.jqls = []
 
@@ -70,7 +74,20 @@ class PollerTest(unittest.TestCase):
         self.found[ME] = None  # makes iterating fail
         self.queued.clear()
         with self.assertLogs("shadowdev", "WARNING"):
-            self.assertEqual(self.app.poller.poll(), 1)
+            self.assertEqual(self.app.poller.poll(time.time() + 16 * 60), 1)
+
+    def test_each_developer_polls_at_their_own_interval_or_not_at_all(self):
+        self.app.users.set_limits(self.me, Limits(jira_polling=True, jira_poll_minutes=5))
+        self.app.users.set_limits(self.sara, Limits())  # polling off: the default
+        now = time.time()
+        self.app.poller.poll(now)
+        self.assertEqual(self.jqls, [(ME, self.jqls[0][1])])
+        self.assertIn('updated >= "-5m"', self.jqls[0][1])  # the first poll looks back one interval
+        self.jqls.clear()
+        self.app.poller.poll(now + 4 * 60)  # not due yet
+        self.assertEqual(self.jqls, [])
+        self.app.poller.poll(now + 5 * 60)
+        self.assertEqual([a for a, _ in self.jqls], [ME])
 
 
 class SearchTest(unittest.TestCase):
@@ -88,13 +105,39 @@ class SearchTest(unittest.TestCase):
         self.assertEqual(parse_qs(urlsplit(calls[1]).query)["nextPageToken"], ["t1"])
 
 
-class FlagTest(unittest.TestCase):
-    def test_polling_is_off_unless_set(self):
+class LimitsTest(unittest.TestCase):
+    def test_defaults_stored_values_and_the_form(self):
+        self.assertEqual(Limits.from_json(None), Limits())
+        self.assertEqual(Limits.from_json(Limits(github_poll_minutes=0.25, claude_timeout_minutes=45).to_json()),
+                         Limits(github_poll_minutes=0.25, claude_timeout_minutes=45))
+        self.assertEqual(Limits.from_json('{"github_poll_minutes": true, "max_fix_attempts": 2.5}'), Limits())
+        self.assertEqual(Limits.from_json('{"jira_poll_minutes": 0, "max_parallel_runs": 7, "jira_polling": 1}'),
+                         Limits(max_parallel_runs=7))  # out of range or the wrong type: the default
+        form = {"jira_polling": "on", "jira_poll_minutes": "5", "github_poll_minutes": "0.5", "slack_poll_minutes": "1.5", "review_quiet_minutes": "0",
+                "claude_timeout_minutes": "60", "command_timeout_minutes": "10", "max_parallel_runs": "2",
+                "max_fix_attempts": "4"}
+        self.assertEqual(limits.from_form(form), Limits(
+            jira_polling=True, jira_poll_minutes=5, github_poll_minutes=0.5, slack_poll_minutes=1.5, review_quiet_minutes=0,
+            claude_timeout_minutes=60, command_timeout_minutes=10, max_parallel_runs=2, max_fix_attempts=4))
+        self.assertFalse(limits.from_form({**form, "jira_polling": ""}).jira_polling)
+        for name, value in (("jira_poll_minutes", "0.5"), ("slack_poll_minutes", "0.2"), ("github_poll_minutes", "0.333"),
+                            ("review_quiet_minutes", "1e1"), ("claude_timeout_minutes", "nan"), ("claude_timeout_minutes", "x"),
+                            ("max_parallel_runs", "21"), ("max_fix_attempts", "-1"), ("command_timeout_minutes", "")):
+            with self.assertRaises(ValueError):
+                limits.from_form({**form, name: value})
+
+    def test_a_run_gets_its_developers_limits(self):
+        cfg = make_cfg(Path(tempfile.mkdtemp())).for_run(Limits(claude_timeout_minutes=60, command_timeout_minutes=10.5,
+                                                                max_fix_attempts=4))
+        self.assertEqual((cfg.claude_timeout_seconds, cfg.command_timeout_seconds, cfg.max_fix_attempts), (3600, 630, 4))
+
+    def test_env_keys_moved_to_settings_are_ignored_with_a_warning(self):
         env = {"JIRA_SITES": "https://a.atlassian.net", "ATLASSIAN_CLIENT_ID": "a", "ATLASSIAN_CLIENT_SECRET": "b",
-               "SHADOWDEV_SECRET_KEY": "d"}
-        self.assertFalse(Config.from_env(env).jira_polling)
-        self.assertFalse(Config.from_env({**env, "JIRA_POLLING": "false"}).jira_polling)
-        self.assertTrue(Config.from_env({**env, "JIRA_POLLING": "true"}).jira_polling)
+               "SHADOWDEV_SECRET_KEY": "d", "MAX_PARALLEL_RUNS": "9", "JIRA_POLLING": "true"}
+        with self.assertLogs("shadowdev", "WARNING") as logs:
+            cfg = Config.from_env(env)
+        self.assertIn("JIRA_POLLING, MAX_PARALLEL_RUNS", logs.output[0])
+        self.assertEqual(cfg.max_fix_attempts, 3)
 
 
 if __name__ == "__main__":

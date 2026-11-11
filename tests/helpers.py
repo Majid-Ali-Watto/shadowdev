@@ -6,6 +6,7 @@ from cryptography.fernet import Fernet
 from shadowdev.config import Config
 from shadowdev.models.project import Project, Repo
 from shadowdev.models.tokens import Tokens
+from shadowdev.models.settings import Settings
 from shadowdev.models.user import Site, Subscription
 from shadowdev.repositories.projects import ProjectRepository
 from shadowdev.repositories.users import UserRepository
@@ -46,11 +47,12 @@ def add_project(projects: ProjectRepository, owner_id: int, name: str, keys, rep
 
 
 def join(users: UserRepository, user_id: int, project: Project, account_id: str, mode: str = "bugs",
-         bases: dict | None = None, github_login: str | None = None, claude_label: str | None = None) -> None:
+         bases: dict | None = None, github_login: str | None = None, claude_label: str | None = None,
+         settings: Settings = Settings()) -> None:
     """Join with the Jira account `account_id`, and the GitHub/Claude accounts labelled after it
     (or the given ones)."""
     user = users.get(user_id)
     jira = next(a for a in user.jira_accounts if a.account_id == account_id)
     github = next(g for g in user.github_accounts if g.login == (github_login or account_id))
     claude = next(c for c in user.claude_accounts if c.label == (claude_label or account_id))
-    users.subscribe(user_id, Subscription(project.id, jira.id, github.id, claude.id, mode, bases or {}))
+    users.subscribe(user_id, Subscription(project.id, jira.id, github.id, claude.id, mode, bases or {}, settings))

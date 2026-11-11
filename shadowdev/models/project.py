@@ -9,6 +9,8 @@ REPO_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}\Z")
 GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/(?!\.{1,2}\Z)[A-Za-z0-9_.-]{1,100}\Z")
 JIRA_PROJECT_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,19}\Z")
 PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}\Z")
+SLACK_CHANNEL_RE = re.compile(r"^[CG][A-Z0-9]{6,20}\Z")  # a channel's ID, not its name
+SLACK_MEMBER_RE = re.compile(r"^[UW][A-Z0-9]{6,20}\Z")
 CUSTOM_FIELD_RE = re.compile(r"^customfield_[0-9]{1,10}\Z")
 _GITHUB_URL_RE = re.compile(r"^(?:https://github\.com/|git@github\.com:)?([^/\s]+/[^/\s]+?)(?:\.git)?/?\Z")
 
@@ -34,6 +36,7 @@ class Repo:
     release_prefix: str  # default base branch: the highest numeric <prefix><version>, else the default branch
     setup: str | None  # run once in a fresh worktree before its first test run, e.g. "npm ci"
     test: str | None  # writes JUnit XML to $SHADOWDEV_REPORT_DIR; None: the change is not tested
+    reviewers: tuple[str, ...] = ()  # Slack member IDs mentioned when a PR of this repo needs review
 
 
 @dataclass(frozen=True)
@@ -49,6 +52,7 @@ class Project:
     # Jira statuses to walk the issue through when work starts, and once the PR is open.
     start_statuses: tuple[str, ...] = ("In Progress",)
     review_statuses: tuple[str, ...] = ("In Review",)
+    slack_channel: str | None = None  # channel ID where PRs are announced for review, and reviews are asked for
 
     def repo(self, name: str) -> Repo | None:
         return next((r for r in self.repos if r.name == name), None)

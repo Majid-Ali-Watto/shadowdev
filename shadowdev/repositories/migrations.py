@@ -115,7 +115,8 @@ def upgrade_from_v1(db, conn: sqlite3.Connection, projects_dir: Path | None, sit
                 project_ids[p["name"]] = pid
                 conn.executemany("INSERT INTO project_keys VALUES (?, ?, ?)", [(pid, cloud_id, k) for k in p["keys"]])
                 conn.executemany(
-                    "INSERT INTO repos VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO repos (project_id, position, name, github, description, release_prefix, setup, test) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [(pid, i, r["name"], r["github"], r["description"], r["release_prefix"], r["setup"], r["test"])
                      for i, r in enumerate(p["repos"])])
         modes = {u["account_id"]: u["mode"] for u in users}

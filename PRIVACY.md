@@ -2,8 +2,8 @@
 
 ShadowDev runs on the machine of the developer who installed it. **It has no central server and
 sends nothing to its authors.** Everything it stores stays in that installation's folder on that
-machine. It only talks to Atlassian (Jira), GitHub and Anthropic (Claude), on that developer's
-behalf, with the accounts they connected.
+machine. It only talks to Atlassian (Jira), GitHub, Anthropic (Claude) and, if connected, Slack, on that
+developer's behalf, with the accounts they connected.
 
 ## What is stored
 
@@ -21,7 +21,10 @@ All of it is under the ShadowDev folder, readable only by the user running it (`
 | GitHub access | personal access token | encrypted |
 | Claude accounts | label, and the name of its config folder | |
 | Claude access | `claude setup-token` token or Anthropic API key | encrypted |
-| Projects | name, Jira site and project keys, repos (`owner/name`), descriptions, setup and test commands, Jira statuses | |
+| Slack account (optional) | Slack member ID and workspace name | |
+| Slack access | the developer's Slack user token | encrypted |
+| Pull requests in review | repo, PR number, branch, and the Slack channel and message where review was asked | |
+| Projects | name, Jira site and project keys, repos (`owner/name`), descriptions, setup and test commands, Jira statuses, the Slack review channel's ID and reviewers' Slack member IDs | |
 | Webhook secrets | one per project | encrypted |
 | Project memberships | which accounts each project runs with, mode, base branches, when Jira was last polled | |
 | Web sessions | a SHA-256 hash of the session cookie, a CSRF token, an expiry time | the cookie itself is not stored |
@@ -63,7 +66,8 @@ display names. ShadowDev does not keep log files of its own.
 |---|---|---|
 | Atlassian (Jira) | requests as the developer's Jira account: reading assigned issues, comments, fields, status changes | the work itself |
 | Atlassian | the stored Atlassian account IDs and when their data was fetched, once a week | [personal data reporting](https://developer.atlassian.com/cloud/jira/platform/user-privacy-developer-guide/), required by Atlassian |
-| GitHub | clones, pushes, pull requests as the developer's GitHub account | the work itself |
+| GitHub | clones, pushes, pull requests, reviews and review replies as the developer's GitHub account | the work itself |
+| Slack (optional) | messages posted as the developer in the projects' review channels; those channels' messages are read as them, to find review requests | asking for and answering reviews |
 | Anthropic (Claude) | the issue text and the code Claude reads, as the developer's Claude account | Claude does the analysis and the change |
 
 There is no analytics, telemetry or tracking.

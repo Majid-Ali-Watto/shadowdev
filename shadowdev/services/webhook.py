@@ -41,7 +41,8 @@ def site_of(issue: dict) -> str | None:
 def matching_issue(payload: dict, projects: ProjectRepository, users: UserRepository,
                    project: Project | None = None) -> tuple[str, Project, int] | None:
     """(issue key, its project, developer ID) when the assignee is a ShadowDev developer who
-    joined that project with that Jira account, and automates this issue type there."""
+    joined that project with that Jira account, automates this issue type there, and lets new
+    assignments start by themselves (Settings.auto_start)."""
     if payload.get("webhookEvent") not in HANDLED_EVENTS:
         return None
     issue = payload.get("issue") or {}
@@ -59,7 +60,8 @@ def matching_issue(payload: dict, projects: ProjectRepository, users: UserReposi
     user_id = users.owner_of(account_id) if isinstance(account_id, str) else None
     user = users.get(user_id) if user_id else None
     actor = user.actor(project.id) if user and not user.paused else None
-    if not actor or actor.jira_account_id != account_id or not rules.wanted(rules.issue_kind(fields), actor.mode):
+    if not actor or not actor.settings.auto_start or actor.jira_account_id != account_id \
+            or not rules.wanted(rules.issue_kind(fields), actor.mode):
         return None
     return key, project, user.id
 

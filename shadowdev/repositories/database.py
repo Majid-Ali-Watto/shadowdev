@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION = 5  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
+VERSION = 10  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS users (
     id           INTEGER PRIMARY KEY,
     display_name TEXT NOT NULL,
     email        TEXT NOT NULL DEFAULT '',
-    paused       INTEGER NOT NULL DEFAULT 0  -- 1: nothing runs for this developer
+    paused       INTEGER NOT NULL DEFAULT 0,  -- 1: nothing runs for this developer
+    limits       TEXT NOT NULL DEFAULT '{}'  -- JSON models.limits.Limits: polling, timeouts, runs; missing = default
 );
 CREATE TABLE IF NOT EXISTS jira_accounts (
     id            INTEGER PRIMARY KEY,
@@ -60,6 +61,12 @@ CREATE TABLE IF NOT EXISTS claude_accounts (
     config_key TEXT NOT NULL UNIQUE,  -- its Claude config dir: data/claude/<config_key>
     UNIQUE (user_id, label)
 );
+CREATE TABLE IF NOT EXISTS slack_accounts (
+    user_id       INTEGER PRIMARY KEY REFERENCES users ON DELETE CASCADE,
+    token         BLOB NOT NULL,  -- the developer's Slack user token
+    slack_user_id TEXT NOT NULL,
+    team          TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS projects (
     id               INTEGER PRIMARY KEY,
     name             TEXT NOT NULL,
@@ -69,6 +76,7 @@ CREATE TABLE IF NOT EXISTS projects (
     start_statuses   TEXT NOT NULL,  -- JSON list
     review_statuses  TEXT NOT NULL,  -- JSON list
     webhook_secret   BLOB NOT NULL,
+    slack_channel    TEXT,  -- channel ID for review requests
     UNIQUE (cloud_id, name)
 );
 CREATE TABLE IF NOT EXISTS project_keys (
@@ -87,6 +95,7 @@ CREATE TABLE IF NOT EXISTS repos (
     release_prefix TEXT NOT NULL,
     setup          TEXT,
     test           TEXT,
+    reviewers      TEXT NOT NULL DEFAULT '',  -- Slack member IDs, space-separated
     PRIMARY KEY (project_id, name)
 );
 CREATE TABLE IF NOT EXISTS subscriptions (
@@ -98,7 +107,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     mode              TEXT NOT NULL DEFAULT 'bugs',
     base_branches     TEXT NOT NULL DEFAULT '{}',  -- JSON {repo name: branch}; missing = default
     joined            INTEGER NOT NULL DEFAULT 0,  -- order of joining; the oldest member inherits a project
-    polled_at         REAL NOT NULL DEFAULT 0,  -- last time Jira was asked for its new assignments (JIRA_POLLING)
+    polled_at         REAL NOT NULL DEFAULT 0,  -- last time Jira was asked for its new assignments (Limits.jira_polling)
+    slack_seen        TEXT NOT NULL DEFAULT '',  -- timestamp of the last message read in the project's Slack channel
+    settings          TEXT NOT NULL DEFAULT '{}',  -- JSON models.settings.Settings: what is automated; missing = default
     PRIMARY KEY (user_id, project_id)
 );
 CREATE INDEX IF NOT EXISTS subscriptions_project ON subscriptions (project_id);
@@ -120,16 +131,61 @@ CREATE TABLE IF NOT EXISTS runs (
     message    TEXT NOT NULL DEFAULT '',
     note       TEXT NOT NULL DEFAULT '',  -- the developer's instructions for a run started by hand
     model      TEXT NOT NULL DEFAULT '',  -- the Claude model(s) that worked on it, e.g. "haiku → sonnet (medium)"
+    questions  TEXT NOT NULL DEFAULT '',  -- JSON {issue key: [questions]} it asked the developer (status "question")
     updated    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_user ON runs (user_id, id);
 CREATE INDEX IF NOT EXISTS runs_status ON runs (status);
+CREATE TABLE IF NOT EXISTS pull_requests (  -- PRs ShadowDev opened, watched for review comments and failing CI until they close
+    id            INTEGER PRIMARY KEY,
+    user_id       INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    project_id    INTEGER NOT NULL REFERENCES projects ON DELETE CASCADE,
+    repo          TEXT NOT NULL,  -- the repo's name in the project
+    github        TEXT NOT NULL,
+    number        INTEGER NOT NULL,
+    branch        TEXT NOT NULL,
+    slack_channel TEXT,  -- the message that asked for its review
+    slack_ts      TEXT,
+    handled_at    TEXT NOT NULL DEFAULT '',  -- time (as GitHub gives it) of the newest review comment acted on
+    rounds        INTEGER NOT NULL DEFAULT 0,
+    ci_sha        TEXT NOT NULL DEFAULT '',  -- the newest head commit whose failing CI was acted on
+    ci_rounds     INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (github, number)
+);
+CREATE TABLE IF NOT EXISTS reviews (  -- PRs a developer was asked in Slack to review
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects ON DELETE CASCADE,
+    github     TEXT NOT NULL,
+    number     INTEGER NOT NULL,
+    channel    TEXT NOT NULL,
+    ts         TEXT NOT NULL,  -- the Slack message (thread) it was asked in, where ShadowDev answers
+    last_ts    TEXT NOT NULL,  -- the newest message of that thread acted on
+    state      TEXT NOT NULL,  -- requested, commented, approved, failed, closed
+    rounds     INTEGER NOT NULL DEFAULT 0,
+    created    REAL NOT NULL,
+    UNIQUE (user_id, github, number)
+);
 CREATE TABLE IF NOT EXISTS webhook_events (
     id TEXT PRIMARY KEY,  -- hash of the signed event: each is accepted once, also across restarts
     at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS webhook_events_at ON webhook_events (at);
 """
+
+# Columns added since schema 2, which older databases get on upgrade.
+ADDED_COLUMNS = (
+    ("jira_accounts", "profile_at", "REAL NOT NULL DEFAULT 0"), ("jira_accounts", "reported_at", "REAL NOT NULL DEFAULT 0"),
+    ("subscriptions", "polled_at", "REAL NOT NULL DEFAULT 0"),  # schema 3
+    ("runs", "note", "TEXT NOT NULL DEFAULT ''"),  # 4
+    ("runs", "model", "TEXT NOT NULL DEFAULT ''"),  # 5
+    ("projects", "slack_channel", "TEXT"), ("repos", "reviewers", "TEXT NOT NULL DEFAULT ''"),  # 6
+    ("subscriptions", "slack_seen", "TEXT NOT NULL DEFAULT ''"),
+    ("pull_requests", "ci_sha", "TEXT NOT NULL DEFAULT ''"), ("pull_requests", "ci_rounds", "INTEGER NOT NULL DEFAULT 0"),  # 7
+    ("subscriptions", "settings", "TEXT NOT NULL DEFAULT '{}'"),  # 8
+    ("runs", "questions", "TEXT NOT NULL DEFAULT ''"),  # 9
+    ("users", "limits", "TEXT NOT NULL DEFAULT '{}'"),  # 10
+)
 
 
 class Database:
@@ -158,16 +214,9 @@ class Database:
             else:
                 with db:
                     db.executescript(SCHEMA)
-                    columns = {row["name"] for row in db.execute("PRAGMA table_info(jira_accounts)")}
-                    for column in ("profile_at", "reported_at"):  # added in schema 3
-                        if column not in columns:
-                            db.execute(f"ALTER TABLE jira_accounts ADD COLUMN {column} REAL NOT NULL DEFAULT 0")
-                    if "polled_at" not in {row["name"] for row in db.execute("PRAGMA table_info(subscriptions)")}:
-                        db.execute("ALTER TABLE subscriptions ADD COLUMN polled_at REAL NOT NULL DEFAULT 0")
-                    columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
-                    for column in ("note", "model"):  # added in schemas 4 and 5
-                        if column not in columns:
-                            db.execute(f"ALTER TABLE runs ADD COLUMN {column} TEXT NOT NULL DEFAULT ''")
+                    for table, column, definition in ADDED_COLUMNS:
+                        if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
+                            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     db.execute(f"PRAGMA user_version = {VERSION}")
         path.chmod(0o600)
 

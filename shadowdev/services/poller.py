@@ -1,9 +1,10 @@
-"""Polling Jira for new assignments, for machines Jira's webhooks can't reach (a laptop). Off unless
-JIRA_POLLING is set. Every 15 minutes, for each project each active developer joined, it asks Jira,
-as the Jira account of that subscription, for the project's unresolved issues assigned to that
+"""Polling Jira for new assignments, for machines Jira's webhooks can't reach (a laptop), for the
+developers who turned it on (Limits.jira_polling). Every Limits.jira_poll_minutes, for each project
+such a developer joined, it asks Jira, as the Jira account of that subscription, for the project's unresolved issues assigned to that
 account and updated since the last poll, and queues the ones of a type the developer automates.
 Like a webhook, a repeat is harmless: an issue already queued, running or handled is skipped."""
 import logging
+import math
 import random
 import threading
 import time
@@ -18,10 +19,9 @@ from .run_queue import RunQueue
 
 log = logging.getLogger("shadowdev")
 
-POLL_SECONDS = 15 * 60
-FIRST_LOOKBACK_MINUTES = 15  # a project never polled before: issues updated in the last 15 minutes
 OVERLAP_MINUTES = 2  # each poll looks a little further back than the last one, so nothing slips between
 MAX_ISSUES = 50  # per project and poll
+TICK_SECONDS = 60  # how often it looks for developers' projects due a poll
 
 
 class Poller:
@@ -39,18 +39,20 @@ class Poller:
             try:
                 self.poll()
             except Exception:
-                log.exception("polling Jira failed; trying again in 15 minutes")
-            time.sleep(POLL_SECONDS + random.uniform(0, 60))
+                log.exception("polling Jira failed; trying again in a minute")
+            time.sleep(TICK_SECONDS + random.uniform(0, 10))
 
     def poll(self, now: float | None = None) -> int:
-        """One round over every active developer's projects. Returns how many issues were queued."""
+        """Poll the projects of every active developer who polls, that are due by their interval.
+        Returns how many issues were queued."""
         now = now or time.time()
         queued = 0
         for user in self.users.all():
-            if user.paused:
+            if user.paused or not user.limits.jira_polling:
                 continue
             for project in self.projects.on_sites(list(user.sites)):
-                if user.actor(project.id):
+                actor = user.actor(project.id)
+                if actor and actor.settings.auto_start:
                     try:
                         queued += self._poll_project(user, project, now)
                     except Exception as e:  # e.g. revoked Jira access: the other projects still run
@@ -59,8 +61,11 @@ class Poller:
 
     def _poll_project(self, user: User, project: Project, now: float) -> int:
         actor = user.actor(project.id)
-        last = self.users.polled_at(user.id, project.id)
-        minutes = FIRST_LOOKBACK_MINUTES if not last else int((now - last) / 60) + OVERLAP_MINUTES
+        last, interval = self.users.polled_at(user.id, project.id), user.limits.jira_poll_minutes
+        if last and now - last < interval * 60:
+            return 0
+        # A project never polled before: the issues updated in the last interval (whole minutes, for the JQL).
+        minutes = math.ceil(interval) if not last else int((now - last) / 60) + OVERLAP_MINUTES
         keys = ", ".join(sorted(project.jira_projects))  # validated: letters, digits and _
         jql = (f'project in ({keys}) AND assignee = currentUser() AND statusCategory != Done '
                f'AND updated >= "-{minutes}m" ORDER BY updated ASC')
