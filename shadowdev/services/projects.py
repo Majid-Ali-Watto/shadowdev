@@ -12,10 +12,19 @@ from ..automation import gitops
 from ..clients.atlassian import AtlassianOAuth, jira_client
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
-from ..models.project import (CUSTOM_FIELD_RE, JIRA_PROJECT_RE, PROJECT_NAME_RE, REPO_NAME_RE, SLACK_CHANNEL_RE, SLACK_MEMBER_RE,
-                              Project, Repo,
-                              default_repo_name, parse_github)
 from ..models import settings as automation
+from ..models.project import (
+    CUSTOM_FIELD_RE,
+    JIRA_PROJECT_RE,
+    PROJECT_NAME_RE,
+    REPO_NAME_RE,
+    SLACK_CHANNEL_RE,
+    SLACK_MEMBER_RE,
+    Project,
+    Repo,
+    default_repo_name,
+    parse_github,
+)
 from ..models.settings import Settings
 from ..models.user import MODES, Subscription, User
 from ..repositories.projects import ProjectRepository, Taken

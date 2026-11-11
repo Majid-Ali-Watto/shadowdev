@@ -6,8 +6,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from shadowdev.clients import atlassian
 from shadowdev.clients.atlassian import AtlassianOAuth, JiraAccessLost, jira_client
-from shadowdev.models.tokens import Tokens
 from shadowdev.clients.rest import HTTPError
+from shadowdev.models.tokens import Tokens
 
 
 class FakeUsers:
@@ -110,6 +110,7 @@ class RestTest(unittest.TestCase):
         """`outcomes`: per attempt, an HTTP status to fail with, an exception, or a JSON body."""
         import io
         import urllib.error
+
         from shadowdev.clients import rest
         outcomes = list(outcomes)
 

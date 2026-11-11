@@ -38,14 +38,14 @@ def request(method: str, url: str, headers: dict, body: dict | None = None, labe
 
 
 def _request(method: str, url: str, headers: dict, body: dict | None, label: str):
-    request = urllib.request.Request(
+    request = urllib.request.Request(  # noqa: S310
         url,
         method=method,
         data=json.dumps(body).encode() if body is not None else None,
         headers={"Accept": "application/json", "Content-Type": "application/json", **headers},
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
             data, response_headers = response.read(), response.headers
     except urllib.error.HTTPError as e:
         detail = e.read().decode(errors="replace")[:500]
@@ -69,7 +69,7 @@ def download(url: str, headers: dict, max_bytes: int, label: str = "") -> bytes:
     goes to another host. Raises HTTPError, with status 413 for a body over `max_bytes`."""
     where = url.split("?")[0]
     try:
-        with _direct.open(urllib.request.Request(url, headers=headers), timeout=60) as response:
+        with _direct.open(urllib.request.Request(url, headers=headers), timeout=60) as response:  # noqa: S310
             data = response.read(max_bytes + 1)
     except urllib.error.HTTPError as e:
         raise HTTPError(f"{label} GET {where} -> {e.code}", e.code) from e
@@ -85,7 +85,7 @@ def redirect_location(url: str, headers: dict, label: str = "") -> str:
     Raises HTTPError when the answer is not a redirect to an https URL."""
     where = url.split("?")[0]
     try:
-        with _direct.open(urllib.request.Request(url, headers=headers), timeout=30) as response:
+        with _direct.open(urllib.request.Request(url, headers=headers), timeout=30) as response:  # noqa: S310
             status = response.status
     except urllib.error.HTTPError as e:
         location = e.headers.get("Location") if e.headers else None

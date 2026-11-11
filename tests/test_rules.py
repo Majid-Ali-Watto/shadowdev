@@ -3,7 +3,6 @@ import unittest
 from shadowdev.automation import rules
 from shadowdev.models.issue import Issue
 
-
 ME = "acc-majid"  # the developer a run posts as: "Majid" and "M" below
 
 
@@ -96,7 +95,8 @@ class RulesTest(unittest.TestCase):
         self.assertTrue(reopened("In Progress", "indeterminate", ("M", prs), ("M", "Checked: it still breaks on iOS.")))  # me, by hand
         self.assertFalse(reopened("In Progress", "indeterminate", ("M", prs)))  # no reason given
         self.assertFalse(reopened("In Progress", "indeterminate", ("QA", "x"), ("M", prs)))
-        self.assertFalse(reopened("In Progress", "indeterminate", ("M", prs), ("M", "I couldn't finish this one yet; I'll come back to it.")))
+        self.assertFalse(reopened("In Progress", "indeterminate", ("M", prs),
+                                  ("M", "I couldn't finish this one yet; I'll come back to it.")))
         self.assertFalse(reopened("In Progress", "indeterminate", ("M", prs), ("M", "ShadowDev pushed…")))  # an older version's
         self.assertFalse(reopened("In review", "indeterminate", ("M", prs), ("QA", "Looks odd.")))
         self.assertFalse(reopened("Done", "done", ("M", prs), ("QA", "Shipped.")))

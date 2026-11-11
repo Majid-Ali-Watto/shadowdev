@@ -6,14 +6,15 @@ from pathlib import Path
 from unittest import mock
 
 from shadowdev.app import build_app
-from shadowdev.clients import github as github_client, slack as slack_client
+from shadowdev.clients import github as github_client
+from shadowdev.clients import slack as slack_client
 from shadowdev.clients.github import GitHub
 from shadowdev.clients.rest import HTTPError
 from shadowdev.clients.slack import Slack
 from shadowdev.models.limits import Limits
 from shadowdev.models.project import Project
-from shadowdev.services import reviews
 from shadowdev.models.settings import Settings
+from shadowdev.services import reviews
 from tests.helpers import OFFICE, add_developer, join, make_cfg, repo
 
 ME, SARA = "acc-majid", "acc-sara"
@@ -175,9 +176,10 @@ class WatcherTest(unittest.TestCase):
                                    ("https://logs.example/signed?sig=1", {})])
 
     def test_a_redirect_is_read_not_followed(self):
-        from shadowdev.clients import rest
         import urllib.error
         from email.message import Message
+
+        from shadowdev.clients import rest
 
         def answer(code, location):
             headers = Message()
@@ -210,7 +212,8 @@ class WatcherTest(unittest.TestCase):
         self.slack.history.return_value = [
             {"user": "U0000SARA0", "ts": "1800000010.000100", "text": f"<@{MY_SLACK}> please review <https://github.com/Acme/FE/pull/12>"},
             {"user": "U0000SARA0", "ts": "1800000011.000100", "text": "https://github.com/acme/fe/pull/13 anyone?"},  # not for me
-            {"user": "U0000SARA0", "ts": "1800000012.000100", "text": f"<@{MY_SLACK}> https://github.com/other/repo/pull/1"},  # not the project's
+            # not the project's
+            {"user": "U0000SARA0", "ts": "1800000012.000100", "text": f"<@{MY_SLACK}> https://github.com/other/repo/pull/1"},
             {"user": MY_SLACK, "ts": "1800000013.000100", "text": f"<@{MY_SLACK}> https://github.com/acme/fe/pull/14"},  # my own message
         ]
         self.assertEqual(self.poll(), [("marketplace", ["acme/fe#12"])])

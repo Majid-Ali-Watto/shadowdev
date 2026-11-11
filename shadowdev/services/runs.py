@@ -28,10 +28,11 @@ class RunService:
         ranges like MAR-1 to MAR-10): each on its own branch and PR (run in parallel), or all
         together on one branch with one PR per repo. Of a range, the issues that aren't the
         developer's to run (not assigned to them, not found, or of a type they don't automate) are
-        skipped, and listed as one skipped run; a key typed by itself must be theirs. Each key's project is found among the developer's; `project_id` picks one
-        when the same Jira key is in several of them (e.g. MAR at work and at home). `note`: the
-        developer's own instructions, given to Claude with the issues. For issues run separately,
-        lines starting "MAR-12:" go only to that issue's run; the lines before them go to every run."""
+        skipped, and listed as one skipped run; a key typed by itself must be theirs. Each key's
+        project is found among the developer's; `project_id` picks one when the same Jira key is in
+        several of them (e.g. MAR at work and at home). `note`: the developer's own instructions,
+        given to Claude with the issues. For issues run separately, lines starting "MAR-12:" go only
+        to that issue's run; the lines before them go to every run."""
         try:
             keys, ranged = rules.parse_keys(issue_keys)
         except ValueError as e:
@@ -79,7 +80,7 @@ class RunService:
                 return f"{key} is a {(fields.get('issuetype') or {}).get('name') or 'type'} you don't automate in {project.name}."
             return None
 
-        found = dict(zip(keys, run_all([lambda k=k: assigned_problem(k) for k in keys])))
+        found = dict(zip(keys, run_all([lambda k=k: assigned_problem(k) for k in keys]), strict=True))
         problems = [p for k, p in found.items() if p and k not in ranged]
         if problems:
             raise UserError(" ".join(problems))

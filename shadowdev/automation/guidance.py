@@ -47,7 +47,7 @@ class Entry:
 def matches(path: str, pattern: str) -> bool:
     """`path` matches the glob `pattern` folder by folder: "*" never crosses a "/"."""
     parts, wanted = path.split("/"), pattern.split("/")
-    return len(parts) == len(wanted) and all(fnmatchcase(p, w) for p, w in zip(parts, wanted))
+    return len(parts) == len(wanted) and all(fnmatchcase(p, w) for p, w in zip(parts, wanted, strict=True))
 
 
 def frontmatter(text: str) -> dict[str, str]:

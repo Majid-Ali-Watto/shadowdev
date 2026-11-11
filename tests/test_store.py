@@ -4,16 +4,16 @@ import sqlite3
 import tempfile
 import time
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 from cryptography.fernet import Fernet
 
 from shadowdev.models.tokens import Tokens
 from shadowdev.models.user import Subscription
+from shadowdev.repositories import runs as runs_repository
 from shadowdev.repositories.database import Database
 from shadowdev.repositories.projects import ProjectRepository, Taken
-from shadowdev.repositories import runs as runs_repository
 from shadowdev.repositories.runs import RunRepository
 from shadowdev.repositories.sessions import SessionRepository
 from shadowdev.repositories.users import AccountInUse, UserRepository

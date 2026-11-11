@@ -13,7 +13,7 @@ This file covers what to know before editing.
 ```bash
 .venv/bin/python -m unittest            # all tests (~25 s); needs git, bwrap, prlimit on PATH
 .venv/bin/python -m unittest tests.test_server.WebTest.test_stop_button   # one test
-uvx pyflakes shadowdev tests            # unused/undefined names; there is no other linter
+uv run ruff check                       # lint (config in pyproject.toml); `--fix` sorts imports and the like
 .venv/bin/python -m shadowdev           # the server (needs .env, bwrap, claude)
 .venv/bin/python -m shadowdev --reload  # the same, restarted whenever shadowdev/ or .env changes (development)
 .venv/bin/python -m shadowdev dry-run --summary "..."   # real pipeline, nothing sent to Jira/GitHub
@@ -52,6 +52,9 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
 
 - **No new dependencies** without asking. It is deliberately stdlib-only (`http.server`, `sqlite3`,
   `urllib`) plus `cryptography`. No web framework, no ORM, no requests.
+  Ruff is a development-only dependency (`uv sync` installs it); the server never imports it.
+- Lint must pass (`uv run ruff check`). Silence a security finding only on its line, with the reason
+  (`# noqa: S… (why)`), never for a whole file.
 - **Security invariants. Never weaken these:**
   - Jira issue text, comments and attachments, Claude's output, and repo code are hostile. Attachments
     are only written to `_attachments/` in the workspace (allowlisted types, size-limited, safe

@@ -9,8 +9,8 @@ from urllib.parse import parse_qs, urlsplit
 from shadowdev.app import build_app
 from shadowdev.clients.jira import Jira
 from shadowdev.config import Config
-from shadowdev.models.limits import Limits
 from shadowdev.models import limits
+from shadowdev.models.limits import Limits
 from shadowdev.services import poller
 from tests.helpers import add_developer, add_project, join, make_cfg
 
@@ -113,7 +113,8 @@ class LimitsTest(unittest.TestCase):
         self.assertEqual(Limits.from_json('{"github_poll_minutes": true, "max_fix_attempts": 2.5}'), Limits())
         self.assertEqual(Limits.from_json('{"jira_poll_minutes": 0, "max_parallel_runs": 7, "jira_polling": 1}'),
                          Limits(max_parallel_runs=7))  # out of range or the wrong type: the default
-        form = {"jira_polling": "on", "jira_poll_minutes": "5", "github_poll_minutes": "0.5", "slack_poll_minutes": "1.5", "review_quiet_minutes": "0",
+        form = {"jira_polling": "on", "jira_poll_minutes": "5", "github_poll_minutes": "0.5", "slack_poll_minutes": "1.5",
+                "review_quiet_minutes": "0",
                 "claude_timeout_minutes": "60", "command_timeout_minutes": "10", "max_parallel_runs": "2",
                 "max_fix_attempts": "4"}
         self.assertEqual(limits.from_form(form), Limits(

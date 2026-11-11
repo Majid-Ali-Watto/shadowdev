@@ -18,20 +18,30 @@ Like any run, both work in their own folders, which are deleted when they end.
 import logging
 import re
 
-from . import gitops, guidance
-from .agent import EDIT_TOOLS, MODELS, READ_ONLY_TOOLS, ClaudeSession, claude_config_dir, claude_env
-from .cancel import NEVER, CancelToken
-from .pipeline import ask_for_review, escalating, heal, model_name, run_folders
-from .prompts import (CHANGE_SCHEMA, REVIEW_SCHEMA, ask_usable, ci_prompt, fix_problem, fix_prompt, fix_schema,
-                      review_problem, review_prompt, summary_problem)
-from .timing import Timings
-from .verify import Checkout
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
 from ..clients.slack import Slack
 from ..config import Config
 from ..models.project import Project, Repo
 from ..models.user import Actor
+from . import gitops, guidance
+from .agent import EDIT_TOOLS, MODELS, READ_ONLY_TOOLS, ClaudeSession, claude_config_dir, claude_env
+from .cancel import NEVER, CancelToken
+from .pipeline import ask_for_review, escalating, heal, model_name, run_folders
+from .prompts import (
+    CHANGE_SCHEMA,
+    REVIEW_SCHEMA,
+    ask_usable,
+    ci_prompt,
+    fix_problem,
+    fix_prompt,
+    fix_schema,
+    review_problem,
+    review_prompt,
+    summary_problem,
+)
+from .timing import Timings
+from .verify import Checkout
 
 log = logging.getLogger("shadowdev")
 

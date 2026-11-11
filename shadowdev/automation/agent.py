@@ -8,10 +8,10 @@ import threading
 import time
 from pathlib import Path
 
-from . import sandbox
-from .cancel import NEVER, CancelToken
 from ..config import Config
 from ..models.user import ClaudeAccount
+from . import sandbox
+from .cancel import NEVER, CancelToken
 
 READ_ONLY_TOOLS = "Read,Glob,Grep"
 EDIT_TOOLS = "Read,Glob,Grep,Edit,Write"

@@ -33,23 +33,47 @@ from contextlib import contextmanager
 from functools import partial
 from pathlib import Path
 
-from . import gitops, guidance, rules
-from .agent import (EDIT_TOOLS, FIXED_MODELS, MODELS, READ_ONLY_TOOLS, TRIAGE_MODEL, ClaudeSession, claude_config_dir, claude_env,
-                    forget_claude_sessions)
-from .cancel import NEVER, CancelToken, Cancelled
-from .timing import Timings
-from .prompts import (CHANGE_SCHEMA, REGRESSION_SCHEMA, TRIAGE_SCHEMA, analysis_problem, analysis_prompt,
-                      analysis_schema, ask_usable, change_prompt, regression_problem, regression_prompt,
-                      regression_retry_prompt, reopened_text, retry_prompt, summary_problem, triage_prompt)
-from .verify import Checkout, changed, changed_paths, check, reproduces
 from ..clients.github import GitHub
 from ..clients.jira import Jira
 from ..clients.rest import HTTPError
-from ..clients.slack import Slack, escape as slack_escape
+from ..clients.slack import Slack
+from ..clients.slack import escape as slack_escape
 from ..config import Config
 from ..models.issue import NO_CHANGE, PLAN_HEAD, PRS_UNOPENED, ROOT_CAUSE_HEAD, TESTS_FAILING, Issue
 from ..models.project import Project, Repo
 from ..models.user import Actor
+from . import gitops, guidance, rules
+from .agent import (
+    EDIT_TOOLS,
+    FIXED_MODELS,
+    MODELS,
+    READ_ONLY_TOOLS,
+    TRIAGE_MODEL,
+    ClaudeSession,
+    claude_config_dir,
+    claude_env,
+    forget_claude_sessions,
+)
+from .cancel import NEVER, Cancelled, CancelToken
+from .prompts import (
+    CHANGE_SCHEMA,
+    REGRESSION_SCHEMA,
+    TRIAGE_SCHEMA,
+    analysis_problem,
+    analysis_prompt,
+    analysis_schema,
+    ask_usable,
+    change_prompt,
+    regression_problem,
+    regression_prompt,
+    regression_retry_prompt,
+    reopened_text,
+    retry_prompt,
+    summary_problem,
+    triage_prompt,
+)
+from .timing import Timings
+from .verify import Checkout, changed, changed_paths, check, reproduces
 
 log = logging.getLogger("shadowdev")
 
@@ -418,9 +442,10 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     developer, by issue key, which the note answers. `on_questions` is told the questions this run
     asks the developer, when it stops for them. `on_model` is told which model(s) work on it,
     e.g. "haiku → sonnet (medium)"; `on_pr` of each PR opened: (repo, its number, the branch, and
-    (channel, timestamp) of the Slack message that asked for its review, or None). Returns (status, message): status "done",
-    "skipped", "waiting" (questions asked on the ticket), "question" (the developer is asked) or "failed". Raises on errors, and Cancelled when `cancel` stops the run. With
-    publish=False (dry run) it stops once the tests pass: nothing is committed, pushed or
+    (channel, timestamp) of the Slack message that asked for its review, or None). Returns
+    (status, message): status "done", "skipped", "waiting" (questions asked on the ticket),
+    "question" (the developer is asked) or "failed". Raises on errors, and Cancelled when
+    `cancel` stops the run. With publish=False (dry run) it stops once the tests pass: nothing is committed, pushed or
     opened, and the change stays in the workspace. Each step's time is logged, and at the end
     the outcome with the whole run's time."""
     if not 1 <= len(keys) <= MAX_GROUP:
@@ -454,7 +479,7 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
         token = actor.github.token
         with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
             listed = pool.map(lambda r: gitops.remote_branches(r.github, token), project.repos)
-            remote = dict(zip((r.name for r in project.repos), listed))
+            remote = dict(zip((r.name for r in project.repos), listed, strict=True))
         reopened = False
         for issue in list(issues):
             existing = next((b for names in remote.values() for b in names if handled_by(b, issue.key)), None)
@@ -492,7 +517,7 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
                 base = continued[repo.name]["base"]["ref"]
             targets.append((repo, base))
         with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
-            no_push = [r.github for r, ok in zip(project.repos, pool.map(lambda r: github.can_push(r.github), project.repos))
+            no_push = [r.github for r, ok in zip(project.repos, pool.map(lambda r: github.can_push(r.github), project.repos), strict=True)
                        if not ok]
         if no_push:
             raise RuntimeError(f"your GitHub account {actor.github.login} cannot push to {', '.join(no_push)}")
