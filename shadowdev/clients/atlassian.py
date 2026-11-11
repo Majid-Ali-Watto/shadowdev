@@ -7,7 +7,7 @@ https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/
 import threading
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 
 from ..models.tokens import Tokens
@@ -16,7 +16,7 @@ from .jira import Jira
 from .rest import HTTPError, request, request_json
 
 AUTHORIZE_URL = "https://auth.atlassian.com/authorize"
-TOKEN_URL = "https://auth.atlassian.com/oauth/token"
+TOKEN_URL = "https://auth.atlassian.com/oauth/token"  # noqa: S105 (a URL, not a secret)
 API = "https://api.atlassian.com"
 # read/write issues, comments, fields and versions; read the signed-in user; refresh tokens.
 SCOPES = ("read:jira-work", "write:jira-work", "read:jira-user", "offline_access")
@@ -110,7 +110,7 @@ def jira_client(oauth: AtlassianOAuth, users, jira_account_id: int, cloud_id: st
 
 
 def rfc3339(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def report_accounts(token: str, accounts: list[tuple[str, float]]) -> tuple[list[dict], int | None]:

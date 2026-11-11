@@ -56,7 +56,7 @@ class ReviewRepository:
 
     def in_state(self, *states: str) -> list[sqlite3.Row]:
         with closing(self.db.connect()) as conn:
-            return conn.execute(f"SELECT * FROM reviews WHERE state IN ({','.join('?' * len(states))}) ORDER BY id",
+            return conn.execute(f"SELECT * FROM reviews WHERE state IN ({','.join('?' * len(states))}) ORDER BY id",  # noqa: S608
                                 states).fetchall()
 
     def finish(self, review_id: int, state: str) -> None:

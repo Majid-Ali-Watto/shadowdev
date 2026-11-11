@@ -8,7 +8,7 @@ import time
 from collections import Counter, deque
 from collections.abc import Callable
 
-from ..automation.cancel import CancelToken, Cancelled
+from ..automation.cancel import Cancelled, CancelToken
 from ..automation.pipeline import process_issues
 from ..automation.timing import END, duration
 from ..clients.atlassian import AtlassianOAuth, jira_client

@@ -5,8 +5,8 @@ from cryptography.fernet import Fernet
 
 from shadowdev.config import Config
 from shadowdev.models.project import Project, Repo
-from shadowdev.models.tokens import Tokens
 from shadowdev.models.settings import Settings
+from shadowdev.models.tokens import Tokens
 from shadowdev.models.user import Site, Subscription
 from shadowdev.repositories.projects import ProjectRepository
 from shadowdev.repositories.users import UserRepository

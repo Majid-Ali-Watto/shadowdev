@@ -4,8 +4,8 @@ import contextlib
 import dataclasses
 import io
 import json
-import re
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -293,8 +293,9 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(self.choose_model(session, [], "", "PROJ-1"), (None, None))
         answers = {"complex": (None, None), "standard": ("sonnet", "medium"), "nonsense": (None, None)}
         for rating, expected in answers.items():
-            self.assertEqual(self.choose_model(lambda model=None: mock.Mock(ask=lambda *a: {"complexity": rating}),
-                                               [], "", "PROJ-1"), expected)
+            def session(model=None, rating=rating):
+                return mock.Mock(ask=lambda *a: {"complexity": rating})
+            self.assertEqual(self.choose_model(session, [], "", "PROJ-1"), expected)
 
     def test_a_long_summary_and_a_jira_error_after_the_pr_do_not_fail_the_run(self):
         from shadowdev.clients.rest import HTTPError

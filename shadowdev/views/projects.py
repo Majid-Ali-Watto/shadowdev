@@ -101,7 +101,7 @@ def _subscription_form(user: User, project: Project, sub: Subscription | None, h
   <fieldset><legend>Work is branched from here and the PR goes into it</legend>{branches}</fieldset></details>
 {_settings_fields(sub.settings if sub else Settings())}
 <div class="actions"><button>{"Save" if sub else "Join"}</button>{leave}</div>
-</form>"""
+</form>"""  # noqa: S608
 
 
 def _settings_fields(settings: Settings) -> str:

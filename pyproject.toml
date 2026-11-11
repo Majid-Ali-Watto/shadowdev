@@ -19,3 +19,26 @@ include = ["shadowdev*"]
 
 [tool.setuptools.package-data]
 "shadowdev.views" = ["static/*.css", "static/*.js"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.17.4",
+]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+extend-exclude = ["worktrees", "data"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, import order, bugbear, pyupgrade, and security checks (bandit).
+select = ["F", "E", "W", "I", "B", "UP", "S"]
+ignore = [
+    "E731",  # small named lambdas are the house style
+    "S603", "S607",  # commands run as argv lists (never a shell), found on PATH like git and bwrap
+    "S311",  # random is used for polling jitter, never for secrets
+]
+
+[tool.ruff.lint.per-file-ignores]
+"shadowdev/views/*" = ["E501"]  # HTML templates: splitting a line of markup can change the page
+"tests/*" = ["S101", "S105", "S106", "S107", "B008"]  # test fixtures: fake secrets, asserts, frozen defaults

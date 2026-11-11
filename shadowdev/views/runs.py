@@ -17,7 +17,7 @@ def runs_panel(max_parallel_runs: int, joined: list[Project], runs: list, csrf: 
     keys = answering["issue_key"] if answering else ""
     project_pick = ""
     if len(joined) > 1:
-        project_pick = (f'<label>Project <select name="project_id">'
+        project_pick = (f'<label>Project <select name="project_id">'  # noqa: S608
                         f'{options([(p.id, p.name) for p in joined], answering and answering["project_id"], "Find it from the issue key")}'
                         '</select></label>')
     questions = ""

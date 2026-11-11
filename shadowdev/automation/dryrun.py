@@ -10,14 +10,14 @@ import dataclasses
 import logging
 import time
 
-from . import gitops
-from .pipeline import process_issues, workspace_name
-from .timing import END, duration
 from ..config import Config
 from ..models.project import Project
 from ..models.user import Actor, User
 from ..repositories.projects import ProjectRepository
 from ..repositories.users import UserRepository
+from . import gitops
+from .pipeline import process_issues, workspace_name
+from .timing import END, duration
 
 log = logging.getLogger("shadowdev")
 

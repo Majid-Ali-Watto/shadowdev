@@ -24,7 +24,7 @@ ENV_ALLOW = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM", "NVM_DIR", "NVM
 
 def env(home: Path, **extra: str) -> dict:
     kept = {k: os.environ[k] for k in ENV_ALLOW if k in os.environ}
-    return {**kept, "HOME": str(home), "TMPDIR": "/tmp", "CI": "1", **extra}
+    return {**kept, "HOME": str(home), "TMPDIR": "/tmp", "CI": "1", **extra}  # noqa: S108
 
 
 def run_dirs(cfg: Config, cwd: Path) -> list[Path]:
@@ -48,7 +48,7 @@ def wrap(argv: list[str], cfg: Config, writable: list[Path], readonly: list[Path
     only writable paths, and `readonly` mounted read-only on top (e.g. .git inside them)."""
     home = Path.home()
     args = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", str(home),
+            "--tmpfs", "/tmp", "--tmpfs", "/run", "--tmpfs", str(home),  # noqa: S108
             "--unshare-pid", "--unshare-ipc", "--die-with-parent", "--new-session"]
     resolv = Path("/etc/resolv.conf").resolve()  # e.g. /run/systemd/resolve/stub-resolv.conf
     if resolv.is_relative_to("/run") and resolv.exists():

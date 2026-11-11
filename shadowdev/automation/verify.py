@@ -15,10 +15,10 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import gitops, sandbox
-from .cancel import NEVER, CancelToken
 from ..config import Config
 from ..models.project import Repo
+from . import gitops, sandbox
+from .cancel import NEVER, CancelToken
 
 log = logging.getLogger("shadowdev")
 
@@ -96,7 +96,9 @@ def junit_results(report_dir: Path) -> tuple[set[str], set[str]]:
         try:
             if path.is_symlink() or not path.is_file() or path.stat().st_size > MAX_REPORT_BYTES:
                 continue
-            cases = list(ET.parse(path).iter("testcase"))
+            # Hostile XML: ElementTree never resolves external entities, expat (>= 2.4) caps entity
+            # expansion, and the file's size is capped above.
+            cases = list(ET.parse(path).iter("testcase"))  # noqa: S314
         except (ET.ParseError, OSError):
             continue  # unreadable counts as missing
         reports.add(path.name)

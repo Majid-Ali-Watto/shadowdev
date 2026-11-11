@@ -22,17 +22,17 @@ class ProjectRepository:
 
     def _query(self, where: str, args: tuple) -> list[Project]:
         with closing(self.db.connect()) as conn:
-            rows = conn.execute(f"SELECT p.*, s.url FROM projects p JOIN sites s ON s.cloud_id = p.cloud_id "
+            rows = conn.execute(f"SELECT p.*, s.url FROM projects p JOIN sites s ON s.cloud_id = p.cloud_id "  # noqa: S608
                                 f"WHERE {where} ORDER BY p.name", args).fetchall()
             if not rows:
                 return []
             ids = [r["id"] for r in rows]
             marks = ",".join("?" * len(ids))
             keys: dict[int, set[str]] = {}
-            for k in conn.execute(f"SELECT project_id, jira_key FROM project_keys WHERE project_id IN ({marks})", ids):
+            for k in conn.execute(f"SELECT project_id, jira_key FROM project_keys WHERE project_id IN ({marks})", ids):  # noqa: S608
                 keys.setdefault(k[0], set()).add(k[1])
             repos: dict[int, list[Repo]] = {}
-            for r in conn.execute(f"SELECT * FROM repos WHERE project_id IN ({marks}) ORDER BY position", ids):
+            for r in conn.execute(f"SELECT * FROM repos WHERE project_id IN ({marks}) ORDER BY position", ids):  # noqa: S608
                 repos.setdefault(r["project_id"], []).append(
                     Repo(r["name"], r["github"], r["description"], r["release_prefix"], r["setup"], r["test"],
                          tuple(r["reviewers"].split())))

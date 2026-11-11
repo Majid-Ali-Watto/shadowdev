@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 
 from .clients.atlassian import AtlassianOAuth
-from .config import LEGACY_PROJECTS_DIR, ANY_SITE, Config
+from .config import ANY_SITE, LEGACY_PROJECTS_DIR, Config
 from .repositories.database import Database
 from .repositories.projects import ProjectRepository
 from .repositories.reviews import ReviewRepository

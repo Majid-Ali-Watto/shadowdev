@@ -15,8 +15,10 @@ from unittest import mock
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from shadowdev.app import build_app, database
+from shadowdev.clients.rest import HTTPError
 from shadowdev.config import Config
 from shadowdev.models.limits import Limits
+from shadowdev.models.settings import Settings
 from shadowdev.models.tokens import Tokens
 from shadowdev.models.user import Site
 from shadowdev.repositories.projects import ProjectRepository
@@ -24,11 +26,10 @@ from shadowdev.repositories.runs import RunRepository
 from shadowdev.repositories.sessions import SessionRepository
 from shadowdev.repositories.users import UserRepository
 from shadowdev.server import Server, make_handler
-from shadowdev.services import accounts, projects as project_service, run_queue, runs
-from shadowdev.services.run_queue import RunQueue
-from shadowdev.clients.rest import HTTPError
-from shadowdev.models.settings import Settings
+from shadowdev.services import accounts, run_queue, runs
+from shadowdev.services import projects as project_service
 from shadowdev.services.errors import UserError
+from shadowdev.services.run_queue import RunQueue
 from shadowdev.services.webhook import matching_issue, verify_signature
 from tests.helpers import HOME, OFFICE, add_developer, add_project, join, make_cfg, repo
 
@@ -113,7 +114,8 @@ class WebTest(Env):
     def setUp(self):
         super().setUp()
         self.queued = []
-        self.pool = mock.Mock(submit=lambda project, keys, uid, note="", **kw: self.queued.append((project.name, keys, uid, *([note] if note else []))))
+        self.pool = mock.Mock(submit=lambda project, keys, uid, note="", **kw: self.queued.append(
+            (project.name, keys, uid, *([note] if note else []))))
         self.oauth = mock.Mock()
         self.oauth.authorize_url.side_effect = lambda state: f"https://auth.atlassian.com/authorize?state={state}"
         self.oauth.exchange.return_value = Tokens("access-1", "refresh-1", time.time() + 3600)
@@ -518,9 +520,11 @@ class WebTest(Env):
             "POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-8, !MAR-13"})[2])
         # A key typed by itself must be yours.
         self.queued.clear()
-        self.assertIn("MAR-9 is not assigned to you.", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-6, MAR-9"})[2])
+        self.assertIn("MAR-9 is not assigned to you.",
+                      self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-6, MAR-9"})[2])
         self.assertEqual(self.queued, [])
-        self.assertIn("None of those issues is yours to run", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-2 to MAR-4"})[2])
+        self.assertIn("None of those issues is yours to run",
+                      self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-2 to MAR-4"})[2])
         self.assertIn("a range stays in one Jira project", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-1 to HR-4"})[2])
         # Together: one job, at most ten issues on one branch.
         self.assertEqual(self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MAR-5 to MAR-8", "grouping": "together"})[1],
@@ -598,7 +602,8 @@ class WebTest(Env):
         self.assertIn('action="/runs/delete"', page)
 
         self.assertIn("Select the runs to delete", self.request("POST", "/runs/delete", {"csrf": csrf})[2])
-        self.assertIn("still queued or running", self.request("POST", "/runs/delete", {"csrf": csrf, "run_id": [str(running), str(queued)]})[2])
+        self.assertIn("still queued or running",
+                      self.request("POST", "/runs/delete", {"csrf": csrf, "run_id": [str(running), str(queued)]})[2])
         # Selected finished ones go, with junk and other people's ids ignored; active ones in the same request stay.
         form = {"csrf": csrf, "run_id": [str(done), str(failed), str(running), str(hers), "x", "../1"]}
         self.assertEqual(self.request("POST", "/runs/delete", form)[1], "/?ok=runs-deleted")

@@ -33,7 +33,7 @@ class RunRepository:
         queued, running or being stopped are kept: they are stopped first."""
         with closing(self.db.connect()) as conn, conn:
             return conn.execute(
-                f"DELETE FROM runs WHERE user_id = ? AND status NOT IN ('queued', 'running', 'stopping') "
+                f"DELETE FROM runs WHERE user_id = ? AND status NOT IN ('queued', 'running', 'stopping') "  # noqa: S608
                 f"AND id IN ({','.join('?' * len(run_ids))})", (user_id, *run_ids)).rowcount
 
     def set_model(self, run_id: int, model: str) -> None:

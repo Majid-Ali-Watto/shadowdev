@@ -11,7 +11,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-TOKEN_ENV = "SHADOWDEV_GIT_TOKEN"
+TOKEN_ENV = "SHADOWDEV_GIT_TOKEN"  # noqa: S105 (a variable's name, not a secret)
 # Answers only for https://github.com, so a rewritten URL can never send the token elsewhere.
 CREDENTIAL_HELPER = (
     '!f() { test "$1" = get || exit 0; h=; p=; '
