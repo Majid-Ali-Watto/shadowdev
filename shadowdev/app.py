@@ -5,6 +5,7 @@ from .clients.atlassian import AtlassianOAuth
 from .config import LEGACY_PROJECTS_DIR, ANY_SITE, Config
 from .repositories.database import Database
 from .repositories.projects import ProjectRepository
+from .repositories.reviews import ReviewRepository
 from .repositories.runs import RunRepository
 from .repositories.sessions import SessionRepository
 from .repositories.users import UserRepository
@@ -12,6 +13,7 @@ from .services.accounts import AccountService
 from .services.poller import Poller
 from .services.privacy import PrivacyReporter
 from .services.projects import ProjectService
+from .services.reviews import ReviewWatcher
 from .services.run_queue import RunQueue
 from .services.runs import RunService
 from .services.webhook import WebhookService
@@ -32,6 +34,8 @@ class App:
     webhooks: WebhookService
     privacy: PrivacyReporter
     poller: Poller
+    reviews: ReviewRepository
+    watcher: ReviewWatcher
 
 
 def database(cfg: Config) -> Database:
@@ -45,14 +49,16 @@ def build_app(cfg: Config, oauth: AtlassianOAuth | None = None, queue: RunQueue 
     db = database(cfg)
     users, projects, sessions, runs = UserRepository(db), ProjectRepository(db), SessionRepository(db), RunRepository(db)
     oauth = oauth or AtlassianOAuth(cfg.atlassian_client_id, cfg.atlassian_client_secret, cfg.oauth_redirect_uri)
-    queue = queue or RunQueue(cfg, users, projects, runs, oauth)
+    reviews = ReviewRepository(db)
+    queue = queue or RunQueue(cfg, users, projects, runs, oauth, reviews)
     accounts = AccountService(cfg, users, oauth, queue)
     return App(
         cfg=cfg, oauth=oauth, users=users, projects=projects, sessions=sessions, runs=runs, queue=queue,
         accounts=accounts,
         project_service=ProjectService(users, projects, oauth, queue),
-        run_service=RunService(users, projects, oauth, queue),
+        run_service=RunService(users, projects, oauth, queue, runs),
         webhooks=WebhookService(cfg, users, projects, runs, queue),
         privacy=PrivacyReporter(users, oauth, accounts),
         poller=Poller(users, projects, oauth, queue),
+        reviews=reviews, watcher=ReviewWatcher(cfg, users, projects, reviews, queue),
     )

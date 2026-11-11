@@ -6,7 +6,9 @@ import time
 from contextlib import closing
 
 from ..models.tokens import Tokens
-from ..models.user import MODES, ClaudeAccount, GitHubAccount, JiraAccount, Site, Subscription, User
+from ..models.limits import Limits
+from ..models.settings import Settings
+from ..models.user import MODES, ClaudeAccount, GitHubAccount, JiraAccount, Site, SlackAccount, Subscription, User
 from .database import Database
 
 
@@ -133,6 +135,29 @@ class UserRepository:
                 "ON CONFLICT (user_id, label) DO UPDATE SET token = excluded.token RETURNING id",
                 (user_id, label, self.db.encrypt(token), config_key)).fetchone()[0]
 
+    def save_slack(self, user_id: int, token: str, slack_user_id: str, team: str) -> None:
+        """The developer's one Slack account; saving again replaces it."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("INSERT INTO slack_accounts VALUES (?, ?, ?, ?) ON CONFLICT (user_id) DO UPDATE SET "
+                         "token = excluded.token, slack_user_id = excluded.slack_user_id, team = excluded.team",
+                         (user_id, self.db.encrypt(token), slack_user_id, team))
+
+    def remove_slack(self, user_id: int) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("DELETE FROM slack_accounts WHERE user_id = ?", (user_id,))
+
+    def slack_seen(self, user_id: int, project_id: int) -> str:
+        """Timestamp of the last message read, as the developer, in the project's Slack channel."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT slack_seen FROM subscriptions WHERE user_id = ? AND project_id = ?",
+                               (user_id, project_id)).fetchone()
+        return row[0] if row else ""
+
+    def mark_slack_seen(self, user_id: int, project_id: int, ts: str) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE subscriptions SET slack_seen = ? WHERE user_id = ? AND project_id = ?",
+                         (ts, user_id, project_id))
+
     def remove_github(self, user_id: int, github_account_id: int) -> None:
         """Subscriptions that used it are kept, without a GitHub account (ON DELETE SET NULL)."""
         with closing(self.db.connect()) as conn, conn:
@@ -169,9 +194,13 @@ class UserRepository:
         claude = tuple(ClaudeAccount(c["id"], c["label"], self.db.decrypt(c["token"]), c["config_key"])
                        for c in conn.execute("SELECT * FROM claude_accounts WHERE user_id = ? ORDER BY id", (uid,)))
         subs = {s["project_id"]: Subscription(s["project_id"], s["jira_account_id"], s["github_account_id"],
-                                              s["claude_account_id"], s["mode"], json.loads(s["base_branches"]))
+                                              s["claude_account_id"], s["mode"], json.loads(s["base_branches"]),
+                                              Settings.from_json(s["settings"]))
                 for s in conn.execute("SELECT * FROM subscriptions WHERE user_id = ?", (uid,))}
-        return User(uid, row["display_name"], row["email"], bool(row["paused"]), jira, github, claude, subs)
+        s = conn.execute("SELECT * FROM slack_accounts WHERE user_id = ?", (uid,)).fetchone()
+        slack = SlackAccount(self.db.decrypt(s["token"]), s["slack_user_id"], s["team"]) if s else None
+        return User(uid, row["display_name"], row["email"], bool(row["paused"]), jira, github, claude, subs, slack,
+                    Limits.from_json(row["limits"]))
 
     def subscribe(self, user_id: int, sub: Subscription) -> None:
         if sub.mode not in MODES:
@@ -179,12 +208,13 @@ class UserRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute(
                 "INSERT INTO subscriptions (user_id, project_id, jira_account_id, github_account_id, claude_account_id, mode, "
-                "base_branches, joined) VALUES (?, ?, ?, ?, ?, ?, ?, (SELECT COALESCE(MAX(joined), 0) + 1 FROM subscriptions)) "
+                "base_branches, settings, joined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
+                "(SELECT COALESCE(MAX(joined), 0) + 1 FROM subscriptions)) "
                 "ON CONFLICT (user_id, project_id) DO UPDATE SET jira_account_id = excluded.jira_account_id, "
                 "github_account_id = excluded.github_account_id, claude_account_id = excluded.claude_account_id, "
-                "mode = excluded.mode, base_branches = excluded.base_branches",
+                "mode = excluded.mode, base_branches = excluded.base_branches, settings = excluded.settings",
                 (user_id, sub.project_id, sub.jira_account_id, sub.github_account_id, sub.claude_account_id, sub.mode,
-                 json.dumps(sub.base_branches)))
+                 json.dumps(sub.base_branches), sub.settings.to_json()))
 
     def polled_at(self, user_id: int, project_id: int) -> float:
         with closing(self.db.connect()) as conn:
@@ -204,6 +234,16 @@ class UserRepository:
     def set_paused(self, user_id: int, paused: bool) -> None:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE users SET paused = ? WHERE id = ?", (int(paused), user_id))
+
+    def set_limits(self, user_id: int, limits: Limits) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE users SET limits = ? WHERE id = ?", (limits.to_json(), user_id))
+
+    def limits(self, user_id: int) -> Limits:
+        """The developer's limits alone, without loading (and decrypting) their accounts."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT limits FROM users WHERE id = ?", (user_id,)).fetchone()
+        return Limits.from_json(row[0] if row else None)
 
     def delete(self, user_id: int) -> list[str]:
         """Removes the developer with their accounts, sessions, subscriptions and runs. Each project

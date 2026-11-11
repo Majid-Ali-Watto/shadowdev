@@ -1,10 +1,12 @@
-"""The pool that works on issues. Up to MAX_PARALLEL_RUNS issues (or groups of issues fixed
-together) run at once, taken from the developers in turn. Every run acts as the developer the
+"""The pool that works on issues. Each developer's issues (or groups of issues fixed together) run up
+to their own Limits.max_parallel_runs at once, and at most MAX_WORKERS in all, taken from the
+developers in turn. Every run acts as the developer the
 issues are assigned to, with the Jira, GitHub and Claude accounts of their subscription."""
 import logging
 import threading
 import time
-from collections import deque
+from collections import Counter, deque
+from collections.abc import Callable
 
 from ..automation.cancel import CancelToken, Cancelled
 from ..automation.pipeline import process_issues
@@ -12,23 +14,29 @@ from ..automation.timing import END, duration
 from ..clients.atlassian import AtlassianOAuth, jira_client
 from ..clients.github import GitHub
 from ..config import Config
+from ..models.issue import NOT_FINISHED
 from ..models.project import Project
 from ..repositories.projects import ProjectRepository
+from ..repositories.reviews import ReviewRepository
 from ..repositories.runs import RunRepository
 from ..repositories.users import UserRepository
 
 log = logging.getLogger("shadowdev")
 
 MAX_JOBS_PER_DEVELOPER = 10  # queued or running
+MAX_WORKERS = 20  # runs at the same time, of all developers: what one machine can take
 
 
 class FairQueue:
     """Jobs waiting for a worker, handed out one developer at a time in turn: a developer with ten
-    queued jobs doesn't hold up one who just queued one."""
+    queued jobs doesn't hold up one who just queued one. A developer with `limit(developer)` jobs
+    running gets no more until one is done(), or wake() says a limit was raised."""
 
-    def __init__(self):
+    def __init__(self, limit: Callable[[int], int] = lambda user_id: MAX_WORKERS):
         self._jobs: dict[int, deque] = {}  # developer -> their waiting jobs
         self._turn: deque[int] = deque()  # developers with waiting jobs, whose turn is next first
+        self._running: Counter[int] = Counter()  # developer -> their jobs handed out and not done
+        self._limit = limit
         self._ready = threading.Condition()
 
     def put(self, user_id: int, job) -> None:
@@ -41,33 +49,48 @@ class FairQueue:
 
     def get(self):
         with self._ready:
-            while not self._turn:
+            while True:
+                user_id = next((u for u in self._turn if self._running[u] < self._limit(u)), None)
+                if user_id is not None:
+                    break
                 self._ready.wait()
-            user_id = self._turn.popleft()
+            self._turn.remove(user_id)
             jobs = self._jobs[user_id]
             job = jobs.popleft()
             if jobs:
                 self._turn.append(user_id)
             else:
                 del self._jobs[user_id]
+            self._running[user_id] += 1
             return job
+
+    def done(self, user_id: int) -> None:
+        with self._ready:
+            self._running[user_id] -= 1
+            self._ready.notify_all()
+
+    def wake(self) -> None:
+        with self._ready:
+            self._ready.notify_all()
 
 
 class RunQueue:
-    """Runs issues on up to `cfg.max_parallel_runs` worker threads. A job is one issue, or several
+    """Runs issues on `workers` threads, each developer's up to their own limit. A job is one issue, or several
     issues of one project fixed together on one branch. Each run works in its own clones.
 
     Every job gets a cancel token when it is queued, so it can be stopped by its developer
     whether it is still queued (it never starts) or running (it stops at once: see cancel.py)."""
 
     def __init__(self, cfg: Config, users: UserRepository, projects: ProjectRepository, runs: RunRepository,
-                 oauth: AtlassianOAuth):
+                 oauth: AtlassianOAuth, reviews: ReviewRepository | None = None, workers: int = MAX_WORKERS):
         self.cfg = cfg
+        self.workers = workers
         self.users = users
         self.projects = projects
         self.runs = runs
         self.oauth = oauth
-        self._queue = FairQueue()
+        self.reviews = reviews  # set: the PRs runs open are tracked, to act on their review comments
+        self._queue = FairQueue(lambda user_id: users.limits(user_id).max_parallel_runs)
         self._pending: set[tuple[str, str]] = set()  # (Jira site, issue key) queued or running
         self._jobs: dict[int, tuple[int, int, CancelToken]] = {}  # run id -> (developer, project, token)
         self._lock = threading.Lock()
@@ -83,20 +106,27 @@ class RunQueue:
                        if project else "its project was deleted")
             if refusal:
                 self.runs.update(row["id"], "failed", f"not resumed after a ShadowDev restart: {refusal}")
-        for n in range(1, self.cfg.max_parallel_runs + 1):
+        for n in range(1, self.workers + 1):
             threading.Thread(target=self.run_forever, daemon=True, name=f"run-{n}").start()
 
     def submit(self, project: Project, keys: list[str], user_id: int, run_id: int | None = None,
-               note: str = "", automatic: bool = False) -> str | None:
+               note: str = "", automatic: bool = False, work=None, after=None) -> str | None:
         """Queue the issues as one job. Returns why not, or None when queued. `run_id`: an
         existing queued run, resumed after a restart. `note`: the developer's instructions for it.
         `automatic`: queued by a webhook or by polling, not by the developer. An issue whose last
         run failed or was stopped is then left alone: ShadowDev's own comment about the failure
-        updates the issue, which would start it again, and again, each time it fails."""
+        updates the issue, which would start it again, and again, each time it fails.
+
+        `work`: a job that is not about issues (a PR's review comments, a review): `keys` is then
+        its name (["acme/fe#12"]), and work(project, actor, cfg, github, cancel=, on_model=) does
+        it, returning (status, message). `after()` is called when the job is over, however it
+        ended, also when it never started."""
         pending = {(project.cloud_id, k) for k in keys}
         if automatic:
             for key in keys:
                 last = self.runs.last_status(user_id, project.id, key)
+                if last == "question":  # an update to the ticket is no answer: the developer's note is
+                    return f"the last run of {key} asked you questions; answer them in a note when you run it from the page"
                 if last in ("failed", "stopped"):
                     return f"the last run of {key} {'failed' if last == 'failed' else 'was stopped'}; run it again from the page"
         with self._lock:
@@ -108,15 +138,15 @@ class RunQueue:
             self._pending |= pending
             run_id = run_id or self.runs.add(", ".join(keys), user_id, project.id, project.name, note)
             self._jobs[run_id] = (user_id, project.id, CancelToken())
-        self._queue.put(user_id, (project.id, tuple(keys), user_id, run_id, frozenset(pending), note))
+        self._queue.put(user_id, (project.id, tuple(keys), user_id, run_id, frozenset(pending), note, work, after))
         return None
 
     def run_forever(self) -> None:
         while True:
-            project_id, keys, user_id, run_id, pending, note = self._queue.get()
+            project_id, keys, user_id, run_id, pending, note, work, after = self._queue.get()
             started = time.monotonic()
             try:
-                self._run(project_id, list(keys), user_id, run_id, note)
+                self._run(project_id, list(keys), user_id, run_id, note, work)
             except Exception:
                 log.exception("run %d: could not be run", run_id)
                 self.runs.update(run_id, "failed", "ShadowDev could not run it; see the server log")
@@ -124,8 +154,18 @@ class RunQueue:
                 with self._lock:
                     self._pending -= pending
                     del self._jobs[run_id]
+                self._queue.done(user_id)
+                if after:
+                    try:
+                        after()
+                    except Exception:
+                        log.exception("run %d: could not record its end", run_id)
                 log.info("%s run %d (%s) finished after %s", END, run_id, ", ".join(keys),
                          duration(time.monotonic() - started))
+
+    def limits_changed(self) -> None:
+        """A developer changed their limits: runs waiting for a free slot of theirs look again."""
+        self._queue.wake()
 
     def stop_run(self, run_id: int, user_id: int) -> bool:
         """Stop one of the developer's queued or running jobs. False if there is no such job of
@@ -151,7 +191,11 @@ class RunQueue:
             log.info("stopped %d run(s) (developer %s, projects %s)", len(tokens), user_id, project_ids)
         return len(tokens)
 
-    def _run(self, project_id: int, keys: list[str], user_id: int, run_id: int, note: str = "") -> None:
+    def _track(self, user_id: int, project_id: int, repo, number: int, branch: str, slack) -> None:
+        if self.reviews:
+            self.reviews.track_pr(user_id, project_id, repo.name, repo.github, number, branch, slack)
+
+    def _run(self, project_id: int, keys: list[str], user_id: int, run_id: int, note: str = "", work=None) -> None:
         label = ", ".join(keys)
         with self._lock:
             token = self._jobs[run_id][2]
@@ -171,10 +215,19 @@ class RunQueue:
                                                        "was removed")
         self.runs.update(run_id, "running")
         jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
+        cfg = self.cfg.for_run(user.limits)
+        on_model = lambda models: self.runs.set_model(run_id, models)
+        # A note after a run that asked the developer answers its questions: Claude gets them together.
+        asked = self.runs.asked(user_id, project_id, keys, before=run_id) if note and not work else {}
         try:
-            status, message = process_issues(keys, project, actor, self.cfg, jira, GitHub(actor.github.token),
-                                             cancel=token, note=note,
-                                             on_model=lambda models: self.runs.set_model(run_id, models))
+            if work:
+                status, message = work(project, actor, cfg, GitHub(actor.github.token), cancel=token, on_model=on_model)
+            else:
+                status, message = process_issues(keys, project, actor, cfg, jira, GitHub(actor.github.token),
+                                                 cancel=token, note=note, on_model=on_model,
+                                                 on_pr=lambda repo, number, branch, slack: self._track(
+                                                     user_id, project_id, repo, number, branch, slack),
+                                                 asked=asked, on_questions=lambda q: self.runs.set_questions(run_id, q))
             log.info("%s: %s: %s", label, status, message)
             self.runs.update(run_id, status, message)
         except Cancelled:
@@ -184,9 +237,8 @@ class RunQueue:
         except Exception as e:
             log.exception("%s: pipeline failed", label)
             self.runs.update(run_id, "failed", str(e))
-            for key in keys:
+            for key in keys if not work and actor.settings.jira_comments else ():
                 try:
-                    jira.comment(key, "ShadowDev could not finish working on this issue. The reason is under "
-                                      "Recent runs on the ShadowDev page; it runs again when started from there.")
+                    jira.comment(key, NOT_FINISHED)  # the reason is under Recent runs, on the developer's page
                 except Exception:
                     log.exception("%s: could not report failure to Jira", key)

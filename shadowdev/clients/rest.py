@@ -78,3 +78,20 @@ def download(url: str, headers: dict, max_bytes: int, label: str = "") -> bytes:
     if len(data) > max_bytes:
         raise HTTPError(f"{label} GET {where}: larger than {max_bytes} bytes", 413)
     return data
+
+
+def redirect_location(url: str, headers: dict, label: str = "") -> str:
+    """Where a GET redirects to, without following it (so the Authorization header stays here).
+    Raises HTTPError when the answer is not a redirect to an https URL."""
+    where = url.split("?")[0]
+    try:
+        with _direct.open(urllib.request.Request(url, headers=headers), timeout=30) as response:
+            status = response.status
+    except urllib.error.HTTPError as e:
+        location = e.headers.get("Location") if e.headers else None
+        if 300 <= e.code < 400 and location and location.startswith("https://"):
+            return location
+        raise HTTPError(f"{label} GET {where} -> {e.code}", e.code) from e
+    except OSError as e:
+        raise HTTPError(f"{label} GET {where} could not be reached: {e}", 0) from e
+    raise HTTPError(f"{label} GET {where}: {status}, not the redirect expected", status)

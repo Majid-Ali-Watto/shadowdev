@@ -15,12 +15,12 @@ from ..models.user import ClaudeAccount
 
 READ_ONLY_TOOLS = "Read,Glob,Grep"
 EDIT_TOOLS = "Read,Glob,Grep,Edit,Write"
-TIMEOUT_SECONDS = 30 * 60
 LOG_TEXT_CHARS = 400
 
 TRIAGE_MODEL = "haiku"  # rates how hard an issue is, from its text alone
 # What works on an issue of each difficulty: (--model, --effort). None: the Claude account's default.
 MODELS = {"simple": ("haiku", None), "standard": ("sonnet", "medium"), "complex": (None, None)}
+FIXED_MODELS = {"haiku": MODELS["simple"], "sonnet": MODELS["standard"], "default": MODELS["complex"]}  # Settings.model
 
 log = logging.getLogger("shadowdev")
 
@@ -177,11 +177,12 @@ class ClaudeSession:
         cmd = in_sandbox(cmd, self.cfg, self.cwd, Path(self.env["CLAUDE_CONFIG_DIR"])) if self.cfg else cmd
         self.cancel.check()
         started = time.monotonic()
+        timeout = self.cfg.claude_timeout_seconds if self.cfg else Config.claude_timeout_seconds
         result = None
         with tempfile.TemporaryFile("w+") as stderr:
             proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, text=True,
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr)
-            watchdog = threading.Timer(TIMEOUT_SECONDS, proc.kill)
+            watchdog = threading.Timer(timeout, proc.kill)
             watchdog.start()
             with self.cancel.tracking(proc):
                 try:
@@ -209,8 +210,8 @@ class ClaudeSession:
                     proc.stdout.close()
             self.cancel.check()
             if result is None:
-                if time.monotonic() - started >= TIMEOUT_SECONDS:
-                    raise RuntimeError(f"claude timed out after {TIMEOUT_SECONDS}s")
+                if time.monotonic() - started >= timeout:
+                    raise RuntimeError(f"claude timed out after {timeout}s")
                 stderr.seek(0)
                 raise RuntimeError(f"claude exited {proc.returncode} without a result: {stderr.read()[-2000:]}")
         if result.get("is_error"):

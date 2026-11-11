@@ -26,7 +26,7 @@ class Jira:
 
     def get_issue(self, key: str) -> dict:
         return self._request(
-            "GET", f"/rest/api/2/issue/{key}?fields=summary,description,issuetype,assignee,project,status,comment,attachment"
+            "GET", f"/rest/api/2/issue/{key}?fields=summary,description,issuetype,assignee,reporter,project,status,comment,attachment"
         )
 
     def attachment(self, attachment_id: str, max_bytes: int) -> bytes:

@@ -9,7 +9,9 @@ from ..clients.atlassian import AtlassianOAuth, access_token, jira_api_base
 from ..clients.github import GitHub, commit_identity
 from ..clients.jira import Jira
 from ..clients.rest import HTTPError
+from ..clients.slack import SCOPES, Slack
 from ..config import ANY_SITE, Config
+from ..models import limits
 from ..models.user import User
 from ..repositories.users import AccountInUse, UserRepository
 from .errors import UserError
@@ -128,10 +130,34 @@ class AccountService:
         if self.users.remove_claude(user.id, account.id):
             shutil.rmtree(claude_config_dir(self.cfg, account), ignore_errors=True)
 
+    def connect_slack(self, user: User, token: str) -> None:
+        """The developer's own Slack user token: review requests are posted, and mentions of them
+        read, as them. Saving another one replaces it."""
+        token = without_whitespace(token)
+        if not token.startswith("xoxp-"):
+            raise UserError("Paste a Slack user token: it starts with xoxp-.")
+        try:
+            me = Slack(token).whoami()
+        except HTTPError as e:
+            raise UserError(f"Slack did not accept this token ({e}). It needs the scopes {', '.join(SCOPES)}.") from None
+        self.users.save_slack(user.id, token, me["user_id"], me.get("team") or "Slack")
+
+    def remove_slack(self, user: User) -> None:
+        self.users.remove_slack(user.id)
+
     def set_paused(self, user: User, paused: bool) -> None:
         """Paused: nothing runs for the developer (webhooks are ignored, queued runs are
         skipped, runs can't be started); a run in progress finishes. Settings are kept."""
         self.users.set_paused(user.id, paused)
+
+    def set_limits(self, user: User, values: dict[str, str]) -> None:
+        """The developer's timing and limits, as sent by the Settings form (see models.limits.from_form).
+        Polls pick them up at their next round, runs when they start."""
+        try:
+            self.users.set_limits(user.id, limits.from_form(values))
+        except ValueError as e:
+            raise UserError(str(e)) from None
+        self.queue.limits_changed()
 
     def delete_account(self, user: User) -> None:
         """Stops the developer's runs in progress, then removes everything ShadowDev holds for

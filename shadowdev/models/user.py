@@ -2,6 +2,9 @@
 personal and an office Jira, GitHub and Claude; each project they join says which ones it uses."""
 from dataclasses import dataclass, field
 
+from .limits import Limits
+from .settings import Settings
+
 MODES = ("bugs", "all")  # "bugs": only Bugs; "all": Bugs, Tasks and Stories
 
 
@@ -45,6 +48,14 @@ class ClaudeAccount:
 
 
 @dataclass(frozen=True)
+class SlackAccount:
+    """The developer in Slack: ShadowDev posts and reads there as them, with their user token."""
+    token: str  # xoxp-…
+    user_id: str  # Slack member ID, as in <@U012ABC> mentions
+    team: str  # the workspace's name
+
+
+@dataclass(frozen=True)
 class Subscription:
     """A developer in a project: the accounts it runs with there, and what it automates."""
     project_id: int
@@ -53,6 +64,7 @@ class Subscription:
     claude_account_id: int | None
     mode: str
     base_branches: dict[str, str] = field(default_factory=dict)  # repo name -> branch; missing = default
+    settings: Settings = Settings()
 
 
 @dataclass(frozen=True)
@@ -65,6 +77,8 @@ class Actor:
     claude: ClaudeAccount
     mode: str
     base_branches: dict[str, str]
+    slack: SlackAccount | None = None
+    settings: Settings = Settings()
 
 
 @dataclass
@@ -77,6 +91,8 @@ class User:
     github_accounts: tuple[GitHubAccount, ...] = ()
     claude_accounts: tuple[ClaudeAccount, ...] = ()
     subscriptions: dict[int, Subscription] = field(default_factory=dict)  # project id -> subscription
+    slack: SlackAccount | None = None
+    limits: Limits = Limits()
 
     def jira(self, jira_account_id: int | None) -> JiraAccount | None:
         return next((a for a in self.jira_accounts if a.id == jira_account_id), None)
@@ -100,7 +116,8 @@ class User:
         claude = self.claude(sub.claude_account_id) if sub else None
         if not (jira and github and claude):
             return None
-        return Actor(self.id, self.display_name, jira.account_id, github, claude, sub.mode, sub.base_branches)
+        return Actor(self.id, self.display_name, jira.account_id, github, claude, sub.mode, sub.base_branches, self.slack,
+                     sub.settings)
 
     @property
     def ready_projects(self) -> list[int]:

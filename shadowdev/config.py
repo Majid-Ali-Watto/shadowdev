@@ -1,8 +1,11 @@
+import logging
 import os
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+
+from .models.limits import Limits
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # Where v1 kept its project files; read once, when a v1 database is upgraded.
@@ -43,6 +46,12 @@ def _home_paths(value: str | None, default: tuple[str, ...], name: str) -> tuple
     return paths
 
 
+# Once .env settings, now each developer's own (models.limits, on the Settings tab).
+MOVED_TO_SETTINGS = ("JIRA_POLLING", "JIRA_POLL_MINUTES", "REVIEW_POLL_SECONDS", "REVIEW_QUIET_SECONDS",
+                     "CLAUDE_TIMEOUT_MINUTES", "COMMAND_TIMEOUT_MINUTES", "MAX_PARALLEL_RUNS", "MAX_FIX_ATTEMPTS")
+_DEFAULT = Limits()
+
+
 def _site_urls(value: str) -> tuple[str, ...]:
     if value.strip() == ANY_SITE:
         return (ANY_SITE,)
@@ -65,11 +74,12 @@ class Config:
     public_url: str  # where developers open ShadowDev; the OAuth callback is registered under it
     webhook_secret: str | None  # optional: the shared secret of the /webhook endpoint (projects have their own)
     secret_key: str  # Fernet key that encrypts developers' tokens in the database
-    max_fix_attempts: int
     host: str
     port: int
-    max_parallel_runs: int = 5  # issues (or groups fixed together) worked on at the same time
-    jira_polling: bool = False  # JIRA_POLLING: ask Jira every 15 minutes for newly assigned issues
+    # A run's limits: the developer's own (models.limits), set for each run by RunQueue.
+    max_fix_attempts: int = _DEFAULT.max_fix_attempts
+    claude_timeout_seconds: int = round(_DEFAULT.claude_timeout_minutes * 60)
+    command_timeout_seconds: int = round(_DEFAULT.command_timeout_minutes * 60)
     sandbox_tools: tuple[str, ...] = SANDBOX_TOOLS
     sandbox_caches: tuple[str, ...] = SANDBOX_CACHES
     data_dir: Path = PROJECT_ROOT / "data"  # database and per-developer Claude config; never in a sandbox
@@ -78,6 +88,12 @@ class Config:
     @property
     def oauth_redirect_uri(self) -> str:
         return self.public_url + OAUTH_CALLBACK_PATH
+
+    def for_run(self, limits: Limits) -> "Config":
+        """This config with a developer's own limits, for one of their runs."""
+        return replace(self, max_fix_attempts=limits.max_fix_attempts,
+                       claude_timeout_seconds=round(limits.claude_timeout_minutes * 60),
+                       command_timeout_seconds=round(limits.command_timeout_minutes * 60))
 
     def allows_site(self, url: str) -> bool:
         return self.jira_sites == (ANY_SITE,) or url.rstrip("/") in self.jira_sites
@@ -93,13 +109,11 @@ class Config:
         for tool in ("git", "claude", "bwrap", "prlimit"):
             if not shutil.which(tool):
                 raise SystemExit(f"{tool} is not installed or not on PATH")
-        max_fix_attempts = int(env.get("MAX_FIX_ATTEMPTS", "3"))
-        if max_fix_attempts < 1:
-            raise SystemExit("MAX_FIX_ATTEMPTS must be at least 1")
+        moved = [name for name in MOVED_TO_SETTINGS if name in env]
+        if moved:
+            logging.getLogger("shadowdev").warning(
+                "%s: now set by each developer on the Settings tab; remove from .env", ", ".join(moved))
         port = int(env.get("PORT", "8080"))
-        max_parallel_runs = int(env.get("MAX_PARALLEL_RUNS", "5"))
-        if not 1 <= max_parallel_runs <= 20:
-            raise SystemExit("MAX_PARALLEL_RUNS must be between 1 and 20")
         public_url = (env.get("PUBLIC_URL") or f"http://localhost:{port}").rstrip("/")
         if not re.match(r"^https?://[^/]+\Z", public_url):
             raise SystemExit("PUBLIC_URL must look like https://shadowdev.example.com (no path)")
@@ -117,11 +131,8 @@ class Config:
             public_url=public_url,
             webhook_secret=env.get("WEBHOOK_SECRET") or None,
             secret_key=required("SHADOWDEV_SECRET_KEY"),
-            max_fix_attempts=max_fix_attempts,
             host=env.get("HOST", "127.0.0.1"),
             port=port,
-            max_parallel_runs=max_parallel_runs,
-            jira_polling=(env.get("JIRA_POLLING") or "").strip().lower() in ("1", "true", "yes", "on"),
             sandbox_tools=_home_paths(env.get("SANDBOX_HOME_TOOLS"), SANDBOX_TOOLS, "SANDBOX_HOME_TOOLS"),
             sandbox_caches=_home_paths(env.get("SANDBOX_HOME_CACHES"), SANDBOX_CACHES, "SANDBOX_HOME_CACHES"),
         )

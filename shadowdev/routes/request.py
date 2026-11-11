@@ -10,9 +10,11 @@ from urllib.parse import parse_qs, urlsplit
 from ..app import App
 from ..models.user import User
 from ..repositories.sessions import SESSION_SECONDS
+from ..views.components import THEMES
 
 MAX_FORM_BYTES = 64_000
 COOKIE = "shadowdev_session"
+THEME_COOKIE = "shadowdev_theme"  # set by the page's theme switcher (views/static/theme.js)
 
 
 class Request:
@@ -36,6 +38,11 @@ class Request:
     def cookie(self, name: str) -> str | None:
         morsel = SimpleCookie(self.headers.get("Cookie") or "").get(name)
         return morsel.value if morsel else None
+
+    def theme(self) -> str:
+        """The theme the developer chose, or "" to follow the system's setting."""
+        value = self.cookie(THEME_COOKIE)
+        return value if value in THEMES else ""
 
     def session(self, renew: bool = True) -> tuple[str, int, str] | None:
         """(cookie token, user ID, csrf) of the browser's live session. Using it renews it,

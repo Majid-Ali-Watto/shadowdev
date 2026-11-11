@@ -4,20 +4,21 @@ import secrets
 from ..models.project import Project
 from ..services.errors import UserError
 from ..services.projects import ProjectForm, RepoForm
-from ..views import pages
+from ..views.project_editor import project_page
 from .request import FormPost, Request, form_action
 from .settings import action
 
-REPO_FIELDS = ("github", "name", "description", "release_prefix", "setup", "test")
+REPO_FIELDS = ("github", "name", "description", "release_prefix", "setup", "test", "reviewers")
 
 
 def project_values(project: Project) -> dict:
     """What the editor shows for an existing project."""
     return {"name": project.name, "jira_keys": ", ".join(sorted(project.jira_projects)),
             "root_cause_field": project.root_cause_field or "", "start_statuses": ", ".join(project.start_statuses),
-            "review_statuses": ", ".join(project.review_statuses),
+            "review_statuses": ", ".join(project.review_statuses), "slack_channel": project.slack_channel or "",
             "repos": [{"github": r.github, "name": r.name, "description": r.description,
-                       "release_prefix": r.release_prefix, "setup": r.setup or "", "test": r.test or ""}
+                       "release_prefix": r.release_prefix, "setup": r.setup or "", "test": r.test or "",
+                       "reviewers": ", ".join(r.reviewers)}
                       for r in project.repos]}
 
 
@@ -25,7 +26,7 @@ def show_editor(req: Request, user, csrf: str, project: Project | None, values: 
                 status: int = 200) -> None:
     nonce = secrets.token_urlsafe(16)
     secret = req.app.project_service.webhook_secret(user, project) if project else None
-    req.html(pages.project_page(req.app.cfg, user, values, project, secret, csrf, nonce, error), nonce, status=status)
+    req.html(project_page(req.app.cfg, user, values, project, secret, csrf, nonce, req.theme(), error), nonce, status=status)
 
 
 def editor(req: Request) -> None:
@@ -53,6 +54,7 @@ def save(req: Request, post: FormPost) -> None:
         name=post.form.get("name", ""), cloud_id=post.form.get("cloud_id", ""), jira_keys=post.form.get("jira_keys", ""),
         github_account_id=post.form.get("github_account_id", ""), root_cause_field=post.form.get("root_cause_field", ""),
         start_statuses=post.form.get("start_statuses", ""), review_statuses=post.form.get("review_statuses", ""),
+        slack_channel=post.form.get("slack_channel", ""),
         repos=[RepoForm(**row) for row in rows])
     project_id = post.form.get("project_id", "")
     try:
@@ -70,11 +72,14 @@ def save(req: Request, post: FormPost) -> None:
 
 
 def join(req: Request, post: FormPost) -> None:
-    # Base branch fields are named base:<repo>; repo names contain no ":".
+    # Base branch fields are named base:<repo>; repo names contain no ":". Automation settings are
+    # named set:<setting>, sent with the marker `settings` (an unticked checkbox sends nothing).
     bases = {name.removeprefix("base:"): value for name, value in post.form.items() if name.startswith("base:")}
+    settings = ({name.removeprefix("set:"): value for name, value in post.form.items() if name.startswith("set:")}
+                if "settings" in post.form else None)
     req.app.project_service.join(post.user, post.form.get("project_id", ""), post.form.get("jira_account_id", ""),
                                  post.form.get("github_account_id", ""), post.form.get("claude_account_id", ""),
-                                 post.form.get("mode", ""), bases)
+                                 post.form.get("mode", ""), bases, settings)
 
 
 ROUTES = {

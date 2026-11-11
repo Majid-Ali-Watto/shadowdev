@@ -54,7 +54,13 @@ def remote_branches(owner_repo: str, token: str, prefix: str = "") -> list[str]:
 
 
 def remote_branch_exists(owner_repo: str, token: str, branch: str) -> bool:
-    return bool(_remote(token, "ls-remote", "--heads", repo_url(owner_repo), f"refs/heads/{branch}"))
+    return bool(remote_branch_sha(owner_repo, token, branch))
+
+
+def remote_branch_sha(owner_repo: str, token: str, branch: str) -> str | None:
+    """The commit the branch is at on GitHub; None when there is no such branch."""
+    out = _remote(token, "ls-remote", "--heads", repo_url(owner_repo), f"refs/heads/{branch}")
+    return next((line.split("\t")[0] for line in out.splitlines() if line.endswith(f"refs/heads/{branch}")), None)
 
 
 def default_branch(owner_repo: str, token: str) -> str | None:
