@@ -25,6 +25,7 @@ from ..models.project import (
     default_repo_name,
     parse_github,
 )
+from ..models.release import DEFAULT_RULES, parse_rules
 from ..models.settings import Settings
 from ..models.user import MODES, Subscription, User
 from ..repositories.projects import ProjectRepository, Taken
@@ -60,6 +61,7 @@ class ProjectForm:
     start_statuses: str = ""  # "To Do, In Progress"
     review_statuses: str = ""
     slack_channel: str = ""  # channel ID
+    status_rules: str = ""  # one per line: "Ready for Release -> Done: fix version, parent"; empty: the defaults
     repos: list[RepoForm] = field(default_factory=list)
 
 
@@ -145,6 +147,10 @@ class ProjectService:
             raise UserError("Root cause field: a Jira custom field ID like customfield_10201, or empty.")
         start = statuses(form.start_statuses, Project.start_statuses, "Start statuses")
         review = statuses(form.review_statuses, Project.review_statuses, "Review statuses")
+        try:
+            status_rules = parse_rules(form.status_rules) or DEFAULT_RULES
+        except ValueError as e:
+            raise UserError(f"Status rules: {e}.") from None
         channel = form.slack_channel.strip() or None
         if channel and not SLACK_CHANNEL_RE.match(channel):
             raise UserError("Slack channel: the channel's ID like C012ABC3DE (in Slack: the channel's details, at the "
@@ -192,7 +198,7 @@ class ProjectService:
                                               or f"The {r.github.split('/')[1]} repository", r.release_prefix,
                                               r.setup, r.test, r.reviewers) for r in repos]
         project = Project(existing.id if existing else 0, name, existing.owner_id if existing else user.id, cloud_id,
-                          site.url, frozenset(keys), root_cause, tuple(repos), start, review, channel)
+                          site.url, frozenset(keys), root_cause, tuple(repos), start, review, channel, status_rules)
         try:
             pid = self.projects.save(project)
         except Taken as e:
@@ -242,7 +248,7 @@ class ProjectService:
             chosen = user.subscriptions[project.id].settings if project.id in user.subscriptions else Settings()
         else:
             try:
-                chosen = automation.from_form(settings)
+                chosen = automation.from_form(settings, tuple(r.name for r in project.repos))
             except ValueError as e:
                 raise UserError(f"Not saved: {e}.") from None
         bases = {}

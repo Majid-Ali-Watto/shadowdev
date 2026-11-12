@@ -40,7 +40,9 @@ app.py builds everything (build_app); server.py dispatches to routes.ROUTES[(met
   call (`with closing(self.db.connect()) as conn, conn:`); the web threads and run workers share it.
 - **models/**: `User` holds its `JiraAccount`s (with `Site`s), `GitHubAccount`s, `ClaudeAccount`s
   and `Subscription`s; `User.actor(project_id)` resolves the `Actor` a run acts as. The pipeline
-  only ever sees an `Actor`, never a `User`.
+  only ever sees an `Actor`, never a `User`. `models/release.py` holds a project's `StatusRule`s
+  (moving complete tickets, run by `services/releases.py`); `models/run.py` holds `RunFilter` and
+  `RunPage` for searching Recent runs.
 - **automation/**: `pipeline.py` orders the steps, `prompts.py` is what Claude is asked and checks
   that its answers are usable, `verify.py` runs setup/test commands and compares them with the
   base-branch baseline, `agent.py` runs the `claude` CLI, `sandbox.py` builds the bwrap command,
@@ -109,7 +111,7 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
 - Mocks patch names **where they are used**, so moving a function means updating the patch target:
   `services.accounts.{GitHub, Jira, check_token}`, `services.projects.{GitHub, jira_client, gitops}`,
   `services.runs.jira_client`, `services.run_queue.{process_issues, jira_client}`,
-  `services.privacy.{report_accounts, access_token}`, `services.poller.jira_client`,
+  `services.privacy.{report_accounts, access_token}`, `services.poller.jira_client`, `services.releases.{jira_client, Slack}`,
   `automation.pipeline.{ClaudeSession, Slack}`, `automation.review.{ClaudeSession, Slack}`,
   `services.reviews.{GitHub, Slack, address_review, fix_ci, review_pr}`.
 - `verify.BASELINES` caches baseline results across runs; tests clear it in `setUp`.

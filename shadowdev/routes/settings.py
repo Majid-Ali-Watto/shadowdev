@@ -2,20 +2,21 @@
 import secrets
 from collections.abc import Callable
 
+from ..models.run import RunFilter
 from ..models.user import User
 from ..services.errors import UserError
 from ..views.auth import login_page
 from ..views.home import NOTICES, home_page
-from ..views.runs import run_rows
+from ..views.runs import run_results
 from .request import COOKIE, FormPost, Request, form_action
 
 
 def render(req: Request, user: User, csrf: str, tab: str = "", error: str = "", notice: str = "", status: int = 200,
-           cookies: tuple[str, ...] = (), answering=None) -> None:
+           cookies: tuple[str, ...] = (), answering=None, run_filter: RunFilter | None = None) -> None:
     nonce = secrets.token_urlsafe(16)
     projects = req.app.project_service.visible(user)
     hooks = {p.id: req.app.project_service.webhook_secret(user, p) for p in projects if p.owner_id == user.id}
-    page = home_page(req.app.cfg, user, projects, hooks, req.app.runs.recent(user.id), csrf, nonce,
+    page = home_page(req.app.cfg, user, projects, hooks, req.app.runs.search(user.id, run_filter or RunFilter()), csrf, nonce,
                      theme=req.theme(), tab=tab, error=error, notice=notice, answering=answering)
     req.html(page, nonce, status=status, cookies=cookies)
 
@@ -31,15 +32,21 @@ def show(req: Request) -> None:
     answer = req.arg("answer")
     run = req.app.runs.get(user.id, int(answer)) if answer.isdigit() else None
     answering = run if run and run["status"] == "question" else None
-    render(req, user, session[2], tab="runs" if answering else req.arg("tab") or tab, notice=notice, answering=answering)
+    render(req, user, session[2], tab="runs" if answering else req.arg("tab") or tab, notice=notice, answering=answering,
+           run_filter=_run_filter(req))
 
 
 def runs(req: Request) -> None:
-    """The rows of Recent runs, which the page fetches to keep itself up to date."""
+    """Recent runs, as the address's search, filters and page find them: the page fetches it to keep
+    itself up to date and to search without reloading."""
     session = req.session(renew=False)
     if not session:
         return req.json(401, "signed out")
-    req.html(run_rows(req.app.runs.recent(session[1]), session[2]))
+    req.html(run_results(req.app.runs.search(session[1], _run_filter(req)), session[2]))
+
+
+def _run_filter(req: Request) -> RunFilter:
+    return RunFilter.of(req.arg("q"), req.arg("status"), req.arg("project"), req.arg("kind"), req.arg("page"))
 
 
 def action(notice: str, do: Callable[[Request, FormPost], None]) -> Callable[[Request], None]:

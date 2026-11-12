@@ -59,6 +59,12 @@ class ReviewRepository:
             return conn.execute(f"SELECT * FROM reviews WHERE state IN ({','.join('?' * len(states))}) ORDER BY id",  # noqa: S608
                                 states).fetchall()
 
+    def asked_with(self, user_id: int, channel: str, last_ts: str) -> list[str]:
+        """The states of the developer's reviews asked for in the Slack message `last_ts`."""
+        with closing(self.db.connect()) as conn:
+            return [r[0] for r in conn.execute("SELECT state FROM reviews WHERE user_id = ? AND channel = ? AND last_ts = ?",
+                                               (user_id, channel, last_ts))]
+
     def finish(self, review_id: int, state: str) -> None:
         """A review round ended: commented, approved, failed, or closed (nothing more to do)."""
         with closing(self.db.connect()) as conn, conn:

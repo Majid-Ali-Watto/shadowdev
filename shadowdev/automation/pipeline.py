@@ -36,7 +36,7 @@ from pathlib import Path
 from ..clients.github import GitHub
 from ..clients.jira import Jira
 from ..clients.rest import HTTPError
-from ..clients.slack import Slack
+from ..clients.slack import Slack, link, link_issues
 from ..clients.slack import escape as slack_escape
 from ..config import Config
 from ..models.issue import NO_CHANGE, PLAN_HEAD, PRS_UNOPENED, ROOT_CAUSE_HEAD, TESTS_FAILING, Issue
@@ -154,16 +154,21 @@ def fetch_attachments(jira: Jira, issues: list[Issue], workspace: Path, label: s
 
 
 def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tuple[Repo, str]], label: str,
-                   thread: tuple[str, str] | None = None) -> tuple[str, str] | None:
+                   thread: tuple[str, str] | None = None, again: bool = False, done: str = "") -> tuple[str, str] | None:
     """Ask in the project's Slack channel, as the developer, for review of the PRs, mentioning
-    each repo's reviewers (`thread`: as a reply to that earlier request). Returns (channel,
-    timestamp) of the message; None without Slack, or when it could not be posted: not fatal."""
+    each repo's reviewers (`thread`: as a reply to that earlier request): "Kindly review these PRs:
+    <title>", the PRs, "Thanks". `done`: what changed since they last looked, said first. Returns
+    (channel, timestamp) of the message; None without Slack, or when it could not be posted: not fatal."""
     channel = thread[0] if thread else project.slack_channel
     if not (actor.slack and channel and opened):
         return None
-    lines = [f"• {repo.name}: {url} {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip() for repo, url in opened]
+    ask = f"Kindly review {'this PR' if len(opened) == 1 else 'these PRs'}{' again' if again else ''}"
+    # The title starts with its issue keys ("MAR-12: summary", "MAR-1 to MAR-4: …"): those become links.
+    keys = rules.ISSUE_KEYS_RE.findall(title.partition(": ")[0])
+    ask = f"{done} {ask}".lstrip() + (f": {link_issues(slack_escape(title), project.site_url, keys)}" if title else ".")
+    lines = [f"• {repo.name}: {link(url)} {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip() for repo, url in opened]
     try:
-        ts = Slack(actor.slack.token).post(channel, f"{slack_escape(title)}\n" + "\n".join(lines), thread and thread[1])
+        ts = Slack(actor.slack.token).post(channel, "\n".join([ask, *lines, "Thanks"]), thread and thread[1])
     except HTTPError as e:
         log.warning("%s: could not ask for review in Slack: %s", label, e)
         return None
@@ -171,13 +176,15 @@ def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tupl
     return thread or (channel, ts)
 
 
-def notify_developer(actor: Actor, text: str, label: str) -> None:
-    """Tell the developer, in Slack, in their own direct messages (if they connected Slack). Not
-    fatal: the run's message on their page says the same."""
+def notify_developer(actor: Actor, text: str, label: str, site_url: str = "", keys=()) -> None:
+    """Tell the developer, in Slack, in their own direct messages (if they connected Slack), with
+    the issue `keys` in it linked to their issues on `site_url`. Not fatal: the run's message on
+    their page says the same."""
     if not actor.slack:
         return
     try:
-        Slack(actor.slack.token).post(actor.slack.user_id, slack_escape(text))
+        Slack(actor.slack.token).post(actor.slack.user_id, link_issues(slack_escape(text), site_url, keys) if site_url
+                                      else slack_escape(text))
         log.info("%s: %s told in Slack", label, actor.display_name)
     except HTTPError as e:
         log.warning("%s: could not tell the developer in Slack: %s", label, e)
@@ -634,7 +641,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
         log.info("%s: asked %s: %s", label, actor.display_name, asked.replace("\n", " | "))
         message = (f"Your decision is needed before work on {', '.join(for_developer)} goes on:\n{asked}\n"
                    "Answer in a note (a line per issue, like the questions) when you run it again from Run issues now.")
-        notify_developer(actor, message, label)
+        notify_developer(actor, message, label, project.site_url, list(for_developer))
         on_questions(for_developer)
         return "question", message + ("\nIts questions for the reporter are on the ticket too." if questions else "")
     if questions:
@@ -772,7 +779,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     asked = None
     if settings.slack_review_request and settings.publish == "pr":  # a draft is not ready for review yet
         with timings.step("Slack review request"):
-            asked = ask_for_review(actor, project, f"Please review{' again' if continued else ''}: {title}", opened, label)
+            asked = ask_for_review(actor, project, title, opened, label, again=bool(continued))
     for repo, pr_url in new:  # an updated PR is watched already
         on_pr(repo, int(pr_url.rstrip("/").rsplit("/", 1)[1]), branch, asked)
     unreported = []

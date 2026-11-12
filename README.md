@@ -96,6 +96,17 @@ Jira can't reach, like a laptop), and **Run issues now** on the page (always ava
 each developer's Jira account in each project, for unresolved issues assigned to it and updated
 since the last poll (the first time, the last polling interval); repeats are harmless, as with webhooks.
 
+Finished tickets are moved along by the project's **status rules** (its owner sets them under *Jira
+workflow and fields*; the default is `Ready for Release -> Done: root cause, fix version, parent,
+original estimate, logged time`). A rule moves a ticket assigned to the developer only once it passes
+the rule's checks; root cause is checked on bugs only (the root cause field, or a comment giving it),
+and a rule without checks moves tickets as they are. Each developer switches this on per project
+(**Move complete tickets**, off by default), checked every 4, 8 (default), 12 or 24 hours, or
+whenever they press **Check now** under the project's *Status rules*, which also shows what the last
+check moved and what each ticket still misses. A ticket that misses something stays in its status,
+and the developer gets a Slack direct message (if they connected Slack) with each such ticket and what
+it misses: on every **Check now**, and on a scheduled check when something new is missing.
+
 Each developer's runs work up to their **Runs at the same time** (Settings, default 5) at once, and
 at most 20 in all on the server; more wait their turn, **developers taking turns**, so one developer's ten queued issues
 don't hold up everyone else. Runs still waiting when the server restarts are queued again. Each
@@ -118,7 +129,7 @@ ShadowDev/
 │   ├── config.py          .env settings
 │   ├── app.py             wires repositories and services together
 │   ├── server.py          HTTP server: dispatches each request to its route
-│   ├── models/            plain dataclasses: User and its accounts and Limits, Subscription and its Settings, Actor, Project/Repo, Issue, Tokens
+│   ├── models/            plain dataclasses: User and its accounts and Limits, Subscription and its Settings, Actor, Project/Repo, Issue, Tokens, status rules (release.py), run search (run.py)
 │   ├── repositories/      SQLite, one class per table group
 │   │   ├── database.py    schema, connections, token encryption
 │   │   ├── migrations.py  upgrading a v1 database (and its projects/*.toml) in one transaction
@@ -135,6 +146,7 @@ ShadowDev/
 │   │   ├── webhook.py     Jira webhook: signature, replay protection, matching the developer
 │   │   ├── privacy.py     Atlassian's personal data reporting: erase closed accounts, refresh changed ones
 │   │   ├── poller.py      Poll Jira (Settings): ask Jira for new assignments, each developer at their interval
+│   │   ├── releases.py    move complete tickets by the project's status rules, tell the developer in Slack what others miss
 │   │   └── reviews.py     at each developer's interval: review comments and CI on its PRs (GitHub), review requests (Slack)
 │   ├── routes/            HTTP only: parse the request, call a service, respond
 │   │   ├── request.py     Request helpers, security headers, the signed-in form guard
@@ -145,7 +157,7 @@ ShadowDev/
 │   ├── views/             HTML: one module per page or tab
 │   │   ├── components.py  esc(), page(), and the pieces every page shares
 │   │   ├── home.py        the developer's page: header, status, tabs, NOTICES
-│   │   ├── runs.py        Runs tab: run issues now, Recent runs
+│   │   ├── runs.py        Runs tab: run issues now, Recent runs (search, filters, pages)
 │   │   ├── projects.py    Projects tab: projects to join, webhook help
 │   │   ├── accounts.py    Accounts tab: Jira, GitHub, Claude, Slack
 │   │   ├── settings.py    Settings tab: timing and limits, pause, delete account
@@ -276,6 +288,9 @@ leave alone); it is given to Claude with the issues, and is not posted to Jira o
 with a key (`MAR-123: ...`) begins a note for that issue only; the lines before those are for all.
 **Recent runs** (it keeps itself up to date) shows what happened, with the model and your note,
 and the ticket gets comments with the analysis and the PRs. Your latest 200 finished runs are kept.
+Search them by issue key, message or note, narrow them under **Filters** by status, project, and
+type (Jira issues or pull requests), and page through them 20 at a time; the search and filters are
+in the address, so a filtered list can be bookmarked or shared.
 Tick finished runs (or the box in the header, for all) and press **Delete selected** to remove them from the list;
 queued and running ones are stopped first, and tickets and PRs are never touched.
 
@@ -292,7 +307,7 @@ theirs. You remain the author of all of it, so you answer for it like for your o
 ### What is automated: per project, under *Automation*
 
 Each project you join has its own switches, so one server can do everything for a work project
-and, say, only reviews for a personal one. All are on by default.
+and, say, only reviews for a personal one. All but *Move complete tickets* are on by default.
 
 | | Off means |
 |---|---|
@@ -306,9 +321,11 @@ and, say, only reviews for a personal one. All are on by default.
 | Move the ticket | its status is never changed |
 | Comment on the ticket | no root cause or plan, PR links, failures or questions (and so no questions, and no reopening: it is found by the PR links comment) |
 | Set the fix version | the fix version is left alone |
+| Move complete tickets (**off** by default) | tickets are moved by the status rules only when you press **Check now** |
 | Ask for review in Slack | no review request is posted |
 | Fix review comments / Fix failing CI | its PRs are left to you |
 | Review when asked in Slack | mentions in the project's channel are not read |
+| Review PRs of these repos (one per repo) | that repo's PRs are not reviewed for you, even when you are mentioned with them |
 | Approve as me | a PR that needs no changes gets a comment saying so, and you approve it |
 
 ### The projects' own instructions for AI
@@ -326,15 +343,16 @@ PR's base branch, so a PR cannot change how it is judged. They are text: a repo'
 ### Slack and reviews (optional)
 
 Connect **Slack** on your page with your own user token: create a Slack app for yourself at
-api.slack.com/apps, give it the *User Token Scopes* `chat:write`, `channels:history` and
-`groups:history`, install it, and paste its *User OAuth Token* (`xoxp-…`). ShadowDev then posts and
+api.slack.com/apps, give it the *User Token Scopes* `chat:write`, `reactions:write`,
+`channels:history` and `groups:history`, install it, and paste its *User OAuth Token* (`xoxp-…`). ShadowDev then posts and
 reads in Slack as you. A project's owner sets its **Slack channel for reviews** (the channel's ID)
 and each repo's **reviewers** (Slack member IDs, e.g. two for the frontend repo and two for the
 backend one) in the project editor. Then, checked once a minute, with nothing having to reach
 ShadowDev from outside:
 
 - **Review requests.** When a run opens its PRs, it posts in the channel, as you:
-  `Please review: MAR-123: …` with each PR and its repo's reviewers mentioned.
+  `Kindly review these PRs: MAR-123: …` with each PR and its repo's reviewers mentioned, ending with
+  `Thanks`.
 - **Review comments fix themselves.** When reviewers with access to the repo comment on a PR
   ShadowDev opened (and two minutes pass without another comment), a run makes the changes they
   ask for on the PR's branch, runs the tests as for any change, pushes, answers each thread and
@@ -349,9 +367,18 @@ ShadowDev from outside:
   on the PR go first. This needs no Slack.
 - **Reviews for you.** When someone mentions you in the channel, or in the thread of one of its
   last 20 messages, with a link to a PR of the project (not your own, not from a fork), ShadowDev
-  replies **Reviewing…**, reads the diff and
-  the code, and either posts a review with comments as you and replies **Comments added**, or
-  **approves the PR as you** and replies **Approved**. When someone in that thread mentions you
+  replies **Reviewing PR 830**, reads the diff and
+  the code, and either posts a review with comments as you and replies **Comments added on PR 830**, or
+  **approves the PR as you** and replies **Approved PR 830 ✅**. A message that asks several people
+  about different PRs (`@a @b <fe PRs> @c @d <services PRs>`) gives each the PRs listed after their
+  mention. The message that asked gets 👀 while its PRs are reviewed, then ✅ when all were approved,
+  📝 when some got comments, or ⚠️ when a review failed. A PR is left alone when it is already
+  approved (by anyone, you too), when another reviewer with access to the repo has commented on it
+  or asked for changes, or when someone asked about it with you reacted 👀 on the message before
+  you did: they are reviewing it. Asked later in the thread of a message that asked others ("@you can
+  you review these?", no links), you review that message's PRs, unless one of those it asked has
+  reacted 👀. Such a reply counts only when it mentions you and asks in words (can you review, please
+  review, take a look, PTAL), and not when it says not to ("no need", "don't"). When someone in that thread mentions you
   again or writes "review again", it reviews again. Each message counts once: only the ones posted
   after the last one read are acted on, from when you connected Slack on.
 
@@ -626,3 +653,5 @@ python3 -m unittest -v
 - `tests/test_store.py` covers the repositories: token encryption, several accounts per developer,
   projects per site, ownership passing on, sessions, account deletion, and the v1 upgrade.
 - `tests/test_rules.py` covers release branches, fix versions, and issue types.
+- `tests/test_releases.py` covers the status rules: their checks (root cause on bugs only), moving
+  complete tickets, the Slack message for incomplete ones, the schedule, and **Check now**.

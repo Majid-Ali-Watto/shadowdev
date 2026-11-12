@@ -2,6 +2,7 @@
 import secrets
 
 from ..models.project import Project
+from ..models.release import rules_text
 from ..services.errors import UserError
 from ..services.projects import ProjectForm, RepoForm
 from ..views.project_editor import project_page
@@ -16,6 +17,7 @@ def project_values(project: Project) -> dict:
     return {"name": project.name, "jira_keys": ", ".join(sorted(project.jira_projects)),
             "root_cause_field": project.root_cause_field or "", "start_statuses": ", ".join(project.start_statuses),
             "review_statuses": ", ".join(project.review_statuses), "slack_channel": project.slack_channel or "",
+            "status_rules": rules_text(project.status_rules),
             "repos": [{"github": r.github, "name": r.name, "description": r.description,
                        "release_prefix": r.release_prefix, "setup": r.setup or "", "test": r.test or "",
                        "reviewers": ", ".join(r.reviewers)}
@@ -54,7 +56,7 @@ def save(req: Request, post: FormPost) -> None:
         name=post.form.get("name", ""), cloud_id=post.form.get("cloud_id", ""), jira_keys=post.form.get("jira_keys", ""),
         github_account_id=post.form.get("github_account_id", ""), root_cause_field=post.form.get("root_cause_field", ""),
         start_statuses=post.form.get("start_statuses", ""), review_statuses=post.form.get("review_statuses", ""),
-        slack_channel=post.form.get("slack_channel", ""),
+        slack_channel=post.form.get("slack_channel", ""), status_rules=post.form.get("status_rules", ""),
         repos=[RepoForm(**row) for row in rows])
     project_id = post.form.get("project_id", "")
     try:
@@ -88,6 +90,8 @@ ROUTES = {
     ("POST", "/project/delete"): action("project-deleted", lambda req, p: req.app.project_service.delete(
         p.user, p.form.get("project_id", ""))),
     ("POST", "/project/join"): action("joined", join),
+    ("POST", "/project/release"): action("released", lambda req, p: req.app.releases.check_now(
+        p.user, p.form.get("project_id", ""))),
     ("POST", "/project/leave"): action("left", lambda req, p: req.app.project_service.leave(
         p.user, p.form.get("project_id", ""))),
 }

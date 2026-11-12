@@ -264,8 +264,9 @@ An issue with questions waits for the answers, so ask only what you cannot do wi
 VOICE = """Everything you write for people (the root cause or plan on the ticket, the summary in the
 pull request and its commit, replies to reviewers, review comments, questions) is posted under
 the developer's own name, as their own. Write it the way they would: plainly, as a colleague, in
-the first person where it needs one. Never mention Claude, AI, a model, a tool, an assistant or
-an automated run."""
+the first person where it needs one. When you ask someone for something (a question, a review,
+an answer), write "kindly", never "please", and end with "Thanks". Never mention Claude, AI, a
+model, a tool, an assistant or an automated run."""
 
 
 def reopened_text(branch: str, continued: list[str]) -> str:

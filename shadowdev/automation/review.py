@@ -11,7 +11,8 @@ pushed. A failure that is not the PR's (flaky, infrastructure) is left, and the 
 
 review_pr: the developer was asked in Slack to review a colleague's PR. Claude reads the diff
 and the code (read-only); its findings are posted as a review with comments, or the PR is
-approved, and the Slack thread is told.
+approved, and the Slack thread is told. A PR someone approved already, or that another reviewer
+has commented on, is left alone: it is reviewed, or being reviewed, by them.
 
 Like any run, both work in their own folders, which are deleted when they end.
 """
@@ -20,7 +21,7 @@ import re
 
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
-from ..clients.slack import Slack
+from ..clients.slack import Slack, link
 from ..config import Config
 from ..models.project import Project, Repo
 from ..models.user import Actor
@@ -66,6 +67,18 @@ def is_approved(reviews: list[dict]) -> bool:
     """A reviewer with access to the repository approved the PR, and none of them still asks for changes."""
     states = {r["state"] for r in reviews if r["association"] in REVIEWERS}
     return "APPROVED" in states and "CHANGES_REQUESTED" not in states
+
+
+def reviewed_by_others(pr: dict, reviews: list[dict], threads: list[dict], login: str) -> str | None:
+    """Why the developer should not review the PR: it is approved (by anyone, them too), or a
+    reviewer other than them and its author has commented on it or asked for changes. None: review it."""
+    if any(r["state"] == "APPROVED" for r in reviews):
+        return "it is already approved"
+    mine = {login.lower(), pr["user"]["login"].lower()}
+    others = [r["author"] for r in reviews if r["association"] in REVIEWERS and r["author"].lower() not in mine]
+    others += [c["author"] for t in threads for c in t["comments"]
+               if c["association"] in REVIEWERS and c["author"].lower() not in mine]
+    return f"{others[0]} is already reviewing it" if others else None
 
 
 def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] | None, project: Project, actor: Actor,
@@ -127,7 +140,7 @@ def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] 
             outcome = "done"
             if not to_ship:
                 return outcome, f"answered the review comments on {url}; no code needed changing"
-            ask_for_review(actor, project, "Review comments addressed, please review again:", [(repo, url)], label, slack)
+            ask_for_review(actor, project, "", [(repo, url)], label, slack, again=True, done="Review comments addressed.")
             return outcome, f"review comments addressed on {url}"
     finally:
         timings.report(outcome)
@@ -251,16 +264,19 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
                    else "it is your own" if pr["user"]["login"].lower() == actor.github.login.lower()
                    else "it comes from a fork" if ((pr["head"].get("repo") or {}).get("full_name") or "").lower() != repo.github.lower()
                    else None)
+        threads = []
+        if not refusal:
+            _, threads = github.review_threads(repo.github, number)
+            refusal = reviewed_by_others(pr, github.latest_reviews(repo.github, number), threads, actor.github.login)
         if refusal:
             outcome = "skipped"
             return outcome, f"{url} was not reviewed: {refusal}", "closed"
-        say("Reviewing…")
+        say(f"Reviewing {link(url, f'PR {number}')}")
         log.info("%s: reviewing for %s", label, actor.display_name)
-        with timings.step("diff and review threads"):
+        with timings.step("diff"):
             diff = github.pr_diff(repo.github, number)
             if len(diff) > MAX_DIFF_CHARS:
                 diff = diff[:MAX_DIFF_CHARS] + "\n… (the diff is cut here: read the rest in the files)"
-            _, threads = github.review_threads(repo.github, number)
         claude_dir = claude_config_dir(cfg, actor.claude)
         with run_folders(cfg, project, f"review-{repo.name}-{number}", claude_dir) as (workspace, scratch):
             with timings.step(f"clone {repo.name}"):
@@ -282,11 +298,11 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
         outcome = "done"
         if result["verdict"] == "approve" and actor.settings.review_approve:
             github.create_review(repo.github, number, "APPROVE", result["summary"])
-            say("Approved ✅")
+            say(f"Approved {link(url, f'PR {number}')} ✅")
             return outcome, f"approved {url}", "approved"
         if result["verdict"] == "approve":  # the developer approves themselves: say only that nothing must change
             github.create_review(repo.github, number, "COMMENT", f"Nothing that must change. {result['summary']}")
-            say(f"Reviewed, nothing blocking: {url}")
+            say(f"Reviewed {link(url, f'PR {number}')}, nothing blocking")
             return outcome, f"reviewed {url}: nothing to change; not approved, as chosen", "approved"
         comments = result["comments"]
         try:
@@ -297,7 +313,7 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
             # A comment was not on a line of the diff: GitHub refuses the whole review. Post them as text.
             listed = "\n".join(f"- `{c['path']}:{c['line']}` {c['body']}" for c in comments)
             github.create_review(repo.github, number, "COMMENT", f"{result['summary']}\n\n{listed}")
-        say(f"Comments added ({len(comments)}): {url}")
+        say(f"Comments added on {link(url, f'PR {number}')} ({len(comments)})")
         return outcome, f"{len(comments)} review comment(s) on {url}", "commented"
     finally:
         timings.report(outcome)

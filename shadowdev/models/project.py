@@ -3,6 +3,8 @@ Projects are created and edited by developers on the web page and kept in the da
 import re
 from dataclasses import dataclass
 
+from .release import DEFAULT_RULES, StatusRule
+
 # Repo names become directory names inside the issue's workspace.
 REPO_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}\Z")
 # owner/name. GitHub owners are letters, digits and -; repo names never "." or "..".
@@ -53,6 +55,8 @@ class Project:
     start_statuses: tuple[str, ...] = ("In Progress",)
     review_statuses: tuple[str, ...] = ("In Review",)
     slack_channel: str | None = None  # channel ID where PRs are announced for review, and reviews are asked for
+    # Finished tickets moved along once complete (Settings.release_moves), e.g. Ready for Release -> Done.
+    status_rules: tuple[StatusRule, ...] = DEFAULT_RULES
 
     def repo(self, name: str) -> Repo | None:
         return next((r for r in self.repos if r.name == name), None)

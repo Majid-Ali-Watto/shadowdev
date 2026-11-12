@@ -9,6 +9,7 @@ from unittest import mock
 
 from cryptography.fernet import Fernet
 
+from shadowdev.models.run import PAGE_SIZE, RunFilter
 from shadowdev.models.tokens import Tokens
 from shadowdev.models.user import Subscription
 from shadowdev.repositories import runs as runs_repository
@@ -154,6 +155,52 @@ class RepositoriesTest(unittest.TestCase):
         self.assertIsNone(self.users.get(self.me))
         self.assertIsNone(self.sessions.get(token))
         self.assertEqual(self.runs.recent(self.me), [])
+
+    def test_runs_are_searched_filtered_and_paged(self):
+        market, side = (add_project(self.projects, self.me, name, [key]) for name, key in (("market", "MAR"), ("side", "SID")))
+        other = add_developer(self.users, "acc-sara")
+        add = lambda key, status, project=market, user=self.me, message="": self.runs.update(
+            self.runs.add(key, user, project.id, project.name), status, message)
+        for n in range(1, 46):  # MAR-1 … MAR-45: every third failed
+            add(f"MAR-{n}", "failed" if n % 3 == 0 else "done", message=f"checkout {n}")
+        add("SID-1", "running", side)
+        add("acme/fe#12", "question", side, message="100% sure_not")
+        add("MAR-99", "done", user=other, message="checkout")
+        search = lambda **kw: self.runs.search(self.me, RunFilter(**kw))
+        keys = lambda found: [r["issue_key"] for r in found.rows]
+
+        everything = search()
+        self.assertEqual((everything.total, everything.pages, len(everything.rows)), (47, 3, PAGE_SIZE))
+        self.assertEqual(keys(everything)[:3], ["acme/fe#12", "SID-1", "MAR-45"])  # newest first
+        self.assertEqual(everything.projects, ["market", "side"])
+        third = search(page=3)
+        self.assertEqual((third.filter.page, keys(third)[-1]), (3, "MAR-1"))
+        self.assertEqual(search(page=9).filter.page, 3)  # past the last: the last
+        # Search in the key, message and note; another developer's runs are never found.
+        self.assertEqual(keys(search(text="MAR-4")), ["MAR-45", "MAR-44", "MAR-43", "MAR-42", "MAR-41", "MAR-40", "MAR-4"])
+        self.assertEqual(search(text="checkout").total, 45)
+        self.assertEqual(keys(search(text="100%")), ["acme/fe#12"])  # % and _ are found as themselves
+        self.assertEqual(search(text="0_ s").total, 0)
+        self.assertEqual(keys(search(text="0% sure_")), ["acme/fe#12"])
+        # Filters, alone and together.
+        self.assertEqual(search(status="failed").total, 15)
+        self.assertEqual(keys(search(status="active")), ["SID-1"])
+        self.assertEqual(keys(search(kind="pr")), ["acme/fe#12"])
+        self.assertEqual(search(kind="issue").total, 46)
+        self.assertEqual(keys(search(project="side")), ["acme/fe#12", "SID-1"])
+        self.assertEqual(keys(search(project="side", kind="issue", status="active")), ["SID-1"])
+        self.assertEqual(keys(search(status="failed", text="MAR-4")), ["MAR-45", "MAR-42"])
+        empty = search(project="nope")
+        self.assertEqual((empty.rows, empty.total, empty.pages, empty.filter.page), ([], 0, 1, 1))
+
+    def test_run_filters_from_the_address_drop_what_they_dont_know(self):
+        self.assertEqual(RunFilter.of("  MAR-1 ", "bogus", " side ", "x", "0"), RunFilter("MAR-1", "", "side", "", 1))
+        self.assertEqual(RunFilter.of(page="2"), RunFilter(page=2))
+        for page in ("-1", "x", "99999", ""):
+            self.assertEqual(RunFilter.of(page=page).page, 1)
+        self.assertEqual(len(RunFilter.of("x" * 500).text), 100)
+        self.assertEqual(RunFilter.of("a&b", "failed", page="3").query(), "tab=runs&q=a%26b&status=failed&page=3")
+        self.assertEqual(RunFilter(page=4).query(page=1), "tab=runs")
 
     def test_webhook_events_are_accepted_once(self):
         self.assertTrue(self.runs.first_time("e1", 1000, 0))
