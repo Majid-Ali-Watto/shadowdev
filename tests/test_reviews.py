@@ -52,6 +52,7 @@ class WatcherTest(unittest.TestCase):
         self.github.statuses.return_value = []
         self.slack.history.return_value = []
         self.slack.replies.return_value = []
+        self.slack.message.return_value = None
         for name, client in (("GitHub", self.github), ("Slack", self.slack)):
             patch = mock.patch.object(reviews, name, return_value=client)
             patch.start()
@@ -266,6 +267,103 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(self.reviews.in_state("requested"), [])
 
 
+    def test_a_message_asking_several_people_gives_each_the_prs_after_their_mention(self):
+        fe, services = "https://github.com/acme/fe/pull", "https://github.com/acme/services/pull"
+        text = (f"please review these PRs:\n<@U0000RAJA0> <@{MY_SLACK}|majid>\n<{fe}/830>\n<{fe}/831>\n\n"
+                f"<@U0000FASI0> <@U0000NABI0>\n<{services}/939>\n<{services}/940>")
+        self.assertEqual(reviews.asked_prs(text, MY_SLACK), [("acme/fe", 830), ("acme/fe", 831)])
+        self.assertEqual(reviews.asked_prs(text, "U0000NABI0"), [("acme/services", 939), ("acme/services", 940)])
+        self.assertEqual(reviews.asked_prs(f"{fe}/1 and {fe}/2, <@{MY_SLACK}> please, cc <@U0000LEAD0>", MY_SLACK),
+                         [("acme/fe", 1), ("acme/fe", 2)])  # links before the first mention belong to it
+        self.assertEqual(reviews.asked_prs(f"{fe}/1 <@U0000RAJA0>", MY_SLACK), [])
+
+    def test_a_pr_a_colleague_asked_with_me_reacted_eyes_to_first_is_theirs(self):
+        fe = "https://github.com/acme/fe/pull"
+        text = f"<@U0000RAJA0> <@{MY_SLACK}> {fe}/830 <@U0000FASI0> https://github.com/acme/services/pull/939"
+        eyes = lambda *users: {"text": text, "reactions": [{"name": "thumbsup", "users": ["U0000RAJA0"]},
+                                                            {"name": "eyes", "users": list(users)}]}
+        self.assertEqual(reviews.claimed_by(eyes("U0000RAJA0", MY_SLACK), MY_SLACK, "acme/fe", 830), "U0000RAJA0")
+        self.assertIsNone(reviews.claimed_by(eyes(MY_SLACK, "U0000RAJA0"), MY_SLACK, "acme/fe", 830))  # mine came first
+        self.assertIsNone(reviews.claimed_by(eyes("U0000FASI0"), MY_SLACK, "acme/fe", 830))  # not asked about it
+        self.assertIsNone(reviews.claimed_by({"text": text}, MY_SLACK, "acme/fe", 830))
+        # A review about to start is skipped.
+        self.reviews.request(self.me, self.market.id, "acme/fe", 830, "C0REVIEWS1", "1800000010.000100", "1800000010.000100")
+        self.slack.message.return_value = eyes("U0000RAJA0")
+        self.poll()
+        (_, _, _, work, after), = self.jobs
+        user = self.app.users.get(self.me)
+        with mock.patch.object(reviews, "review_pr") as review_pr:
+            status, message = work(self.market, user.actor(self.market.id), self.app.cfg, self.github, None, None)
+        review_pr.assert_not_called()
+        self.assertEqual(status, "skipped")
+        self.assertIn("U0000RAJA0", message)
+        self.assertEqual(self.slack.message.call_args.args, ("C0REVIEWS1", "1800000010.000100", "1800000010.000100"))
+        after()
+        self.assertEqual(self.reviews.in_state("closed")[0]["number"], 830)
+
+    def test_mentioned_later_in_the_thread_of_a_request_to_others_reviews_its_prs_unless_one_started(self):
+        self.poll()  # the first look
+        fe, services = "https://github.com/acme/fe/pull", "https://github.com/acme/services/pull"
+        first = {"user": "U0000SARA0", "ts": "1799999000.000100", "latest_reply": "1800000030.000100",
+                 "text": f"please review <@U0000RAJA0> <{fe}/830> <@U0000FASI0> <{services}/939>"}
+        self.slack.history.return_value = [first]
+        replies = [  # not asking me: thanks, a no, someone else, a question
+            {"user": "U0000SARA0", "ts": "1800000010.000100", "thread_ts": first["ts"], "text": f"<@{MY_SLACK}> thanks"},
+            {"user": "U0000SARA0", "ts": "1800000011.000100", "thread_ts": first["ts"], "text": f"<@{MY_SLACK}> no need to review"},
+            {"user": "U0000SARA0", "ts": "1800000012.000100", "thread_ts": first["ts"], "text": "<@U0000NABI0> can you review?"},
+            {"user": "U0000SARA0", "ts": "1800000013.000100", "thread_ts": first["ts"], "text": f"<@{MY_SLACK}> are you reviewing?"},
+            {"user": MY_SLACK, "ts": "1800000014.000100", "thread_ts": first["ts"], "text": f"<@{MY_SLACK}> please review"}]
+        self.slack.replies.return_value = replies
+        self.assertEqual(self.poll(), [])
+        join(self.app.users, self.me, self.market, ME, settings=Settings(no_review_repos=("services",)))
+        self.slack.replies.return_value = [{"user": "U0000SARA0", "ts": "1800000030.000100", "thread_ts": first["ts"],
+                                            "text": f"<@{MY_SLACK}> can you review these? Raja is out"}]
+        self.assertEqual(self.poll(), [("marketplace", ["acme/fe#830"])])  # not services: I don't review it
+        row = self.reviews.in_state("requested")[0]
+        self.assertEqual((row["ts"], row["last_ts"]), (first["ts"], "1800000030.000100"))  # answered in the thread
+        # When it starts, Raja, asked first, has reacted 👀 on the first message: he has it.
+        asking = {"text": self.slack.replies.return_value[0]["text"], "reactions": [{"name": "eyes", "users": [MY_SLACK]}]}
+        self.slack.message.side_effect = lambda channel, thread, ts: asking if ts != thread else {
+            **first, "reactions": [{"name": "eyes", "users": ["U0000RAJA0"]}]}
+        work = self.jobs[0][3]
+        user = self.app.users.get(self.me)
+        with mock.patch.object(reviews, "review_pr", return_value=("done", "1 comment", "commented")) as review_pr:
+            self.assertEqual(work(self.market, user.actor(self.market.id), self.app.cfg, self.github, None, None)[0], "skipped")
+            review_pr.assert_not_called()
+            first["reactions"] = [{"name": "eyes", "users": ["U0000FASI0"]}]  # 👀 only from those asked about services
+            self.slack.message.side_effect = lambda channel, thread, ts: asking if ts != thread else first
+            work(self.market, user.actor(self.market.id), self.app.cfg, self.github, None, None)
+            review_pr.assert_called_once()
+
+    def test_only_the_chosen_repos_are_reviewed_and_the_asking_message_gets_reactions(self):
+        self.poll()  # the first look
+        fe, services = "https://github.com/acme/fe/pull", "https://github.com/acme/services/pull"
+        self.slack.history.return_value = [{"user": "U0000SARA0", "ts": "1800000010.000100", "text":
+                                            f"<@{MY_SLACK}> {fe}/1 {fe}/2 {services}/3"}]
+        join(self.app.users, self.me, self.market, ME, settings=Settings(no_review_repos=("services",)))
+        self.assertEqual(self.poll(), [("marketplace", ["acme/fe#1"]), ("marketplace", ["acme/fe#2"])])
+        asking = ("C0REVIEWS1", "1800000010.000100")
+        self.assertEqual(self.slack.react.call_args_list, [mock.call(*asking, "eyes", on=True)] * 2)
+        self.slack.react.reset_mock()
+        (_, _, _, work1, after1), (_, _, _, work2, after2) = self.jobs
+        user = self.app.users.get(self.me)
+        with mock.patch.object(reviews, "review_pr", return_value=("done", "approved", "approved")):
+            work1(self.market, user.actor(self.market.id), self.app.cfg, self.github, None, None)
+        after1()
+        self.assertEqual(self.slack.react.call_args_list, [mock.call(*asking, "eyes", on=True)])  # #2 is still waiting
+        self.slack.react.reset_mock()
+        with mock.patch.object(reviews, "review_pr", return_value=("done", "1 comment", "commented")):
+            work2(self.market, user.actor(self.market.id), self.app.cfg, self.github, None, None)
+        after2()
+        self.assertEqual(self.slack.react.call_args_list, [mock.call(*asking, "eyes", on=False), mock.call(*asking, "memo")])
+        # Turned off after being asked: not reviewed.
+        self.reviews.request(self.me, self.market.id, "acme/fe", 9, *asking, "1800000020.000100")
+        join(self.app.users, self.me, self.market, ME, settings=Settings(no_review_repos=("fe",)))
+        self.slack.history.return_value = []
+        self.assertEqual(self.poll(), [])
+        self.assertEqual(self.reviews.in_state("requested"), [])
+
+
 class ClientsTest(unittest.TestCase):
     def test_slack_errors_are_raised_and_messages_come_oldest_first(self):
         calls = []
@@ -276,6 +374,8 @@ class ClientsTest(unittest.TestCase):
                 return {"ok": False, "error": "invalid_auth"}
             if "chat.postMessage" in url:
                 return {"ok": True, "ts": "5.5"}
+            if "reactions." in url:
+                return {"ok": False, "error": "already_reacted" if body["name"] == "eyes" else "missing_scope"}
             return {"ok": True, "messages": [{"ts": "3.0"}, {"ts": "1.0"}, {"ts": "2.0"}]}
 
         with mock.patch.object(slack_client, "request_json", fake):
@@ -287,6 +387,13 @@ class ClientsTest(unittest.TestCase):
             self.assertEqual([m["ts"] for m in slack.history("C1", 20)], ["1.0", "2.0", "3.0"])
             self.assertIn("conversations.history?channel=C1&limit=20", calls[-1][1])
             self.assertEqual([m["ts"] for m in slack.replies("C1", "1.0", "2.0")], ["3.0"])  # not the thread's first message
+            slack.react("C1", "1.0", "eyes")  # already there: fine
+            self.assertEqual(calls[-1][2], {"channel": "C1", "timestamp": "1.0", "name": "eyes"})
+            with self.assertRaisesRegex(HTTPError, "missing_scope"):
+                slack.react("C1", "1.0", "memo", on=False)
+            self.assertIn("reactions.remove", calls[-1][1])
+            self.assertEqual(slack.message("C1", "1.0", "2.0"), {"ts": "2.0"})
+            self.assertIn("conversations.replies?channel=C1&ts=1.0&oldest=2.0&latest=2.0&inclusive=true", calls[-1][1])
         self.assertEqual(slack_client.escape("a <b> & c"), "a &lt;b&gt; &amp; c")
 
     def test_github_review_threads_and_reviews(self):

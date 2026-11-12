@@ -26,6 +26,12 @@ class SettingsTest(unittest.TestCase):
         self.assertEqual((picked.auto_start, picked.model, picked.publish, picked.fix_ci, picked.jira_comments),
                          (True, "haiku", "branch", False, False))
         self.assertEqual(settings.from_form({}).model, "auto")
+        picked = settings.from_form({"review_for_me": "on", "review:fe": "on"}, ("fe", "services"))
+        self.assertEqual(picked.no_review_repos, ("services",))
+        self.assertTrue(picked.reviews("fe"))
+        self.assertFalse(picked.reviews("services"))
+        self.assertEqual(Settings.from_json(picked.to_json()), picked)  # stored as a JSON list, read as a tuple
+        self.assertEqual(Settings.from_json('{"no_review_repos": [1]}').no_review_repos, ())
         with self.assertRaisesRegex(ValueError, "not a choice"):
             settings.from_form({"publish": "force-push"})
 

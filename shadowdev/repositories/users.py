@@ -6,6 +6,7 @@ import time
 from contextlib import closing
 
 from ..models.limits import Limits
+from ..models.release import ReleaseReport
 from ..models.settings import Settings
 from ..models.tokens import Tokens
 from ..models.user import MODES, ClaudeAccount, GitHubAccount, JiraAccount, Site, SlackAccount, Subscription, User
@@ -195,7 +196,7 @@ class UserRepository:
                        for c in conn.execute("SELECT * FROM claude_accounts WHERE user_id = ? ORDER BY id", (uid,)))
         subs = {s["project_id"]: Subscription(s["project_id"], s["jira_account_id"], s["github_account_id"],
                                               s["claude_account_id"], s["mode"], json.loads(s["base_branches"]),
-                                              Settings.from_json(s["settings"]))
+                                              Settings.from_json(s["settings"]), ReleaseReport.from_json(s["release_report"]))
                 for s in conn.execute("SELECT * FROM subscriptions WHERE user_id = ?", (uid,))}
         s = conn.execute("SELECT * FROM slack_accounts WHERE user_id = ?", (uid,)).fetchone()
         slack = SlackAccount(self.db.decrypt(s["token"]), s["slack_user_id"], s["team"]) if s else None
@@ -226,6 +227,17 @@ class UserRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE subscriptions SET polled_at = ? WHERE user_id = ? AND project_id = ?",
                          (at, user_id, project_id))
+
+    def released_at(self, user_id: int, project_id: int) -> float:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT released_at FROM subscriptions WHERE user_id = ? AND project_id = ?",
+                               (user_id, project_id)).fetchone()
+        return row[0] if row else 0.0
+
+    def save_release_report(self, user_id: int, project_id: int, report: ReleaseReport) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE subscriptions SET released_at = ?, release_report = ? WHERE user_id = ? AND project_id = ?",
+                         (report.at, report.to_json(), user_id, project_id))
 
     def unsubscribe(self, user_id: int, project_id: int) -> None:
         with closing(self.db.connect()) as conn, conn:

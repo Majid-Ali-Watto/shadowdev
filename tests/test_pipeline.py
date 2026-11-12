@@ -434,8 +434,8 @@ class PipelineTest(unittest.TestCase):
         self.jira.get_issue.return_value["fields"]["summary"] = "Totals <are> wrong"
         self.assertEqual(self.run_pipeline([RIGHT_FIX], on_pr=lambda *pr: opened.append(pr))[0], "done")
         slack.post.assert_called_once_with(
-            "C0REVIEWS1", "Please review: PROJ-1: Totals &lt;are&gt; wrong\n"
-                          "• app: https://github.com/o/r/pull/1 <@U0000AAA1> <@U0000BBB2>", None)
+            "C0REVIEWS1", "Kindly review this PR: <https://office.atlassian.net/browse/PROJ-1|PROJ-1>: Totals &lt;are&gt; wrong\n"
+                          "• app: <https://github.com/o/r/pull/1> <@U0000AAA1> <@U0000BBB2>\nThanks", None)
         self.assertEqual(opened, [(self.project.repos[0], 1, "PROJ-1", ("C0REVIEWS1", "111.222"))])
         # Slack being down is not fatal, and the PR is still reported.
         slack.post.side_effect = pipeline.HTTPError("Slack chat.postMessage: channel_not_found", 400)
@@ -503,8 +503,8 @@ class PipelineTest(unittest.TestCase):
         self.github.reply_to_thread.assert_called_once_with("T1", "Renamed them.")
         self.github.resolve_thread.assert_called_once_with("T1")
         slack.post.assert_called_once_with(
-            "C0REVIEWS1", "Review comments addressed, please review again:\n"
-                          "• app: https://github.com/acme/app/pull/1 <@U0000AAA1> <@U0000BBB2>", "111.222")
+            "C0REVIEWS1", "Review comments addressed. Kindly review this PR again.\n"
+                          "• app: <https://github.com/acme/app/pull/1> <@U0000AAA1> <@U0000BBB2>\nThanks", "111.222")
         self.assertEqual((self.fixer.model, self.fixer.effort), ("sonnet", "medium"))
         self.assertEqual(self.code_left_on_server(), [])
 
@@ -549,6 +549,20 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(review.is_approved(reviews(("NONE", "APPROVED"))))  # a passer-by
         self.assertFalse(review.is_approved(reviews(("MEMBER", "APPROVED"), ("OWNER", "CHANGES_REQUESTED"))))
 
+    def test_a_pr_approved_or_commented_on_by_another_reviewer_is_left_to_them(self):
+        pr = {"user": {"login": "sara"}}
+        said = lambda author, association="MEMBER": [{"comments": [{"author": author, "association": association}]}]
+        verdict = lambda author, state, association="MEMBER": [{"author": author, "association": association, "state": state}]
+        self.assertIsNone(review.reviewed_by_others(pr, [], [], "Majid"))
+        self.assertEqual(review.reviewed_by_others(pr, verdict("majid", "APPROVED"), [], "Majid"), "it is already approved")
+        self.assertEqual(review.reviewed_by_others(pr, verdict("x", "APPROVED", "NONE"), [], "Majid"), "it is already approved")
+        self.assertEqual(review.reviewed_by_others(pr, [], said("tom"), "Majid"), "tom is already reviewing it")
+        self.assertEqual(review.reviewed_by_others(pr, verdict("tom", "CHANGES_REQUESTED"), [], "Majid"),
+                         "tom is already reviewing it")
+        self.assertIsNone(review.reviewed_by_others(pr, verdict("majid", "CHANGES_REQUESTED"), said("Majid"), "Majid"))  # mine
+        self.assertIsNone(review.reviewed_by_others(pr, [], said("Sara"), "Majid"))  # the author answering
+        self.assertIsNone(review.reviewed_by_others(pr, [], said("ci-bot", "NONE"), "Majid"))  # no access: a bot, a passer-by
+
     def review(self, answer, author="sara"):
         self.github.pr.return_value = {
             "number": 1, "state": "open", "user": {"login": author}, "title": "PROJ-1: totals", "body": "Fixes add().",
@@ -586,7 +600,7 @@ class PipelineTest(unittest.TestCase):
         self.github.create_review.assert_called_once_with("acme/app", 1, "COMMENT",
                                                           "Nothing that must change. Correct, and its test covers the case.")
         self.assertEqual(slack.post.call_args.args[1],
-                         "Reviewed, nothing blocking: https://github.com/acme/app/pull/1")
+                         "Reviewed <https://github.com/acme/app/pull/1|PR 1>, nothing blocking")
 
     def test_a_review_follows_the_instructions_of_the_base_branch_not_the_prs(self):
         seed = self.tmp / "app-seed"
@@ -618,8 +632,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(result, ("done", "1 review comment(s) on https://github.com/acme/app/pull/1", "commented"))
         self.github.create_review.assert_called_once_with("acme/app", 1, "COMMENT", summary, comments)
         self.assertEqual([c.args for c in slack.post.call_args_list],
-                         [("C0REVIEWS1", "Reviewing…", "333.444"),
-                          ("C0REVIEWS1", "Comments added (1): https://github.com/acme/app/pull/1", "333.444")])
+                         [("C0REVIEWS1", "Reviewing <https://github.com/acme/app/pull/1|PR 1>", "333.444"),
+                          ("C0REVIEWS1", "Comments added on <https://github.com/acme/app/pull/1|PR 1> (1)", "333.444")])
         self.assertEqual(self.review_tools, "Read,Glob,Grep")  # a review changes nothing
         self.assertIn("+    return a + b", self.review_prompt)
         self.assertIn('resolved="yes"', self.review_prompt)  # earlier threads, so points are not repeated
@@ -635,7 +649,14 @@ class PipelineTest(unittest.TestCase):
         approved = self.review({"verdict": "approve", "comments": [], "summary": "Fixes the sign in add(), with a test."})
         self.assertEqual(approved, ("done", "approved https://github.com/acme/app/pull/1", "approved"))
         self.assertEqual(self.github.create_review.call_args.args, ("acme/app", 1, "APPROVE", "Fixes the sign in add(), with a test."))
-        self.assertEqual(slack.post.call_args.args, ("C0REVIEWS1", "Approved ✅", "333.444"))
+        self.assertEqual(slack.post.call_args.args, ("C0REVIEWS1", "Approved <https://github.com/acme/app/pull/1|PR 1> ✅", "333.444"))
+
+        # Approved by anyone, or commented on by another reviewer: left to them.
+        self.github.create_review.reset_mock()
+        self.github.latest_reviews.return_value = [{"author": "Majid", "association": "MEMBER", "state": "APPROVED"}]
+        self.assertEqual(self.review({})[1], "https://github.com/acme/app/pull/1 was not reviewed: it is already approved")
+        self.github.latest_reviews.return_value = []
+        self.github.create_review.assert_not_called()
 
         # The developer's own PR is not reviewed.
         self.github.create_review.reset_mock()
@@ -714,6 +735,8 @@ class PipelineTest(unittest.TestCase):
         self.jira.comment.assert_not_called()  # QA and the reporter never see it
         slack.post.assert_called_once()
         self.assertEqual(slack.post.call_args.args[0], "U0000MEME0")  # the developer's own direct messages
+        self.assertIn("work on <https://office.atlassian.net/browse/PROJ-1|PROJ-1> goes on:\n"
+                      "<https://office.atlassian.net/browse/PROJ-1|PROJ-1>: Change the public", slack.post.call_args.args[1])
         self.assertEqual([c.args for c in self.jira.move_along.call_args_list],
                          [("PROJ-1", ["In Progress"]), ("PROJ-1", ["To Do"])])
         self.github.create_pr.assert_not_called()

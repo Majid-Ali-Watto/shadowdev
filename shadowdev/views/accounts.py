@@ -95,7 +95,8 @@ def _slack_card(user: User, hidden: str) -> str:
 <label>Slack user token <input name="slack_token" type="password" autocomplete="off" required placeholder="xoxp-…"></label>
 <p class="hint">For projects with a Slack channel: ShadowDev asks there for review of the PRs it opens, as you,
   and reviews the PRs you are mentioned on. Create a Slack app for yourself at <b>api.slack.com/apps</b>, add the
-  <b>User Token Scopes</b> <code>chat:write</code>, <code>channels:history</code> and <code>groups:history</code>,
+  <b>User Token Scopes</b> <code>chat:write</code>, <code>reactions:write</code>, <code>channels:history</code>
+  and <code>groups:history</code>,
   install it to the workspace, and paste its <b>User OAuth Token</b>.</p>
 <button>Save Slack account</button>
   </form>

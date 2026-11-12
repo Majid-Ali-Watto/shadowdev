@@ -1,6 +1,7 @@
 """The project editor: add a project, or edit or delete one the developer owns."""
 from ..config import Config
 from ..models.project import Project
+from ..models.release import DEFAULT_RULES, LABELS, rules_text
 from ..models.user import User
 from .components import MARK, THEME_TOGGLE, alert, csrf_field, esc, options, page, script
 from .projects import webhook_help
@@ -45,6 +46,12 @@ def project_page(cfg: Config, user: User, form: dict, project: Project | None, s
   <label>Statuses to move an issue through when work starts <input name="start_statuses" value="{v('start_statuses')}" placeholder="In Progress"></label>
   <label>Statuses once the PR is open <input name="review_statuses" value="{v('review_statuses')}" placeholder="In Review"></label>
   <label>Root cause field <input name="root_cause_field" value="{v('root_cause_field')}" placeholder="customfield_10201 (empty: post it as a comment)" spellcheck="false"></label>
+  <label>Status rules <span class="muted">(members who switch on "Move complete tickets" get them)</span>
+    <textarea name="status_rules" spellcheck="false" placeholder="{esc(rules_text(DEFAULT_RULES))}">{v('status_rules')}</textarea></label>
+  <p class="hint">One per line: <code>From status -&gt; To status: checks</code>. A ticket assigned to the member moves
+    only once it passes the checks: {esc(", ".join(LABELS.values()))}. Root cause is checked on bugs only (the root cause
+    field, or a comment giving it). No checks: it moves as it is, e.g. <code>Merged -&gt; Ready for QA</code>. Empty: the
+    rule above.</p>
 </details>
 <div class="actions"><button>{"Save project" if project else "Add project"}</button></div>
   </form>

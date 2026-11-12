@@ -3,6 +3,7 @@ personal and an office Jira, GitHub and Claude; each project they join says whic
 from dataclasses import dataclass, field
 
 from .limits import Limits
+from .release import ReleaseReport
 from .settings import Settings
 
 MODES = ("bugs", "all")  # "bugs": only Bugs; "all": Bugs, Tasks and Stories
@@ -65,6 +66,7 @@ class Subscription:
     mode: str
     base_branches: dict[str, str] = field(default_factory=dict)  # repo name -> branch; missing = default
     settings: Settings = Settings()
+    release_report: ReleaseReport | None = None  # the last check of its tickets against the status rules
 
 
 @dataclass(frozen=True)

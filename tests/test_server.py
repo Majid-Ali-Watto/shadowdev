@@ -26,7 +26,7 @@ from shadowdev.repositories.runs import RunRepository
 from shadowdev.repositories.sessions import SessionRepository
 from shadowdev.repositories.users import UserRepository
 from shadowdev.server import Server, make_handler
-from shadowdev.services import accounts, run_queue, runs
+from shadowdev.services import accounts, releases, run_queue, runs
 from shadowdev.services import projects as project_service
 from shadowdev.services.errors import UserError
 from shadowdev.services.run_queue import RunQueue
@@ -571,7 +571,8 @@ class WebTest(Env):
         self.assertIn("connect-src 'self'", self.headers["Content-Security-Policy"])
         status, _, rows = self.request("GET", "/runs")
         self.assertEqual(status, 200)
-        self.assertTrue(rows.startswith("<tr>") and f'name="run_id" value="{run_id}"' in rows and csrf in rows)
+        self.assertTrue(rows.startswith('<div class="results-bar">') and f'name="run_id" value="{run_id}"' in rows
+                        and csrf in rows)
         self.assertIn(f'href="{OFFICE.url}/browse/MAR-1"', page)
         self.assertEqual(self.request("POST", "/stop", {"csrf": csrf, "run_id": str(run_id)})[1], "/?ok=stopping")
         self.pool.stop_run.assert_called_once_with(run_id, uid)
@@ -582,6 +583,44 @@ class WebTest(Env):
         finished = self.request("GET", "/")[2]
         self.assertNotIn(f'<input type="hidden" name="run_id" value="{run_id}">', finished)  # finished: no Stop button
         self.assertIn(f'name="run_id" value="{run_id}" form="delete-runs"', finished)  # but it can be selected for deletion
+
+    def test_recent_runs_are_searched_filtered_and_paged_by_the_address(self):
+        self.sign_in()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        for n in range(1, 26):
+            self.runs.update(self.runs.add(f"MAR-{n}", uid, market.id, "marketplace"), "failed" if n == 7 else "done")
+        page = self.request("GET", "/")[2]
+        self.assertIn('id="run-filter"', page)
+        self.assertIn("1–20 of 25 runs", page)
+        self.assertIn('href="/?tab=runs&amp;page=2" rel="next" data-nav', page)
+        self.assertIn('<option value="marketplace">marketplace</option>', page)
+        # The same search on the page and in what the page fetches; values are escaped.
+        for path in ("/?tab=runs&q=MAR-7", "/runs?q=MAR-7"):
+            found = self.request("GET", path)[2]
+            self.assertIn("1–1 of 1 run<", found)
+            self.assertIn(">MAR-7<", found)
+            self.assertNotIn(">MAR-8<", found)
+        self.assertIn('value="&lt;b&gt;"', self.request("GET", "/?tab=runs&q=<b>")[2])
+        self.assertIn("No runs match this search", self.request("GET", "/runs?q=<b>")[2])
+        second = self.request("GET", "/runs?page=2")[2]
+        self.assertIn("21–25 of 25 runs", second)
+        self.assertIn('rel="prev" data-nav', second)
+        self.assertIn(">MAR-1<", second)
+        failed = self.request("GET", "/runs?status=failed&kind=issue&project=marketplace")[2]
+        self.assertIn(">MAR-7<", failed)
+        self.assertIn('data-query="tab=runs&amp;status=failed&amp;project=marketplace&amp;kind=issue"', failed)
+        self.assertIn("1–1 of 1 run<", failed)
+        self.assertIn("No runs match", self.request("GET", "/runs?kind=pr")[2])
+        # The filters sit in a popup with Apply and Clear; the ones in use show as chips that remove them.
+        self.assertIn('<details class="filter-menu" id="filter-menu">', page)
+        self.assertIn("<button>Apply</button>", page)
+        self.assertNotIn('class="chips"', page)
+        filtered = self.request("GET", "/?tab=runs&q=MAR&status=failed&kind=issue")[2]
+        self.assertIn('data-count>2</span>', filtered)
+        self.assertIn('href="/?tab=runs&amp;q=MAR" data-clear>Clear</a>', filtered)  # Clear keeps the search
+        self.assertIn('href="/?tab=runs&amp;q=MAR&amp;kind=issue" data-nav aria-label="Remove filter Status: Failed"',
+                      filtered)
 
     def test_finished_runs_are_selected_and_deleted_but_not_active_or_other_peoples(self):
         self.sign_in()
@@ -659,6 +698,47 @@ class WebTest(Env):
         self.assertEqual(self.me().limits.max_parallel_runs, 2)  # unchanged
         self.request("POST", "/limits", {**form, "csrf": "forged", "max_parallel_runs": "1"})  # needs the session's CSRF token
         self.assertEqual(self.me().limits.max_parallel_runs, 2)
+
+    def test_status_rules_switch_and_check_now(self):
+        self.sign_in()
+        csrf = self.csrf()
+        uid = self.me().id
+        add_developer(self.users, ME, user_id=uid)
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        join(self.users, uid, market, ME)
+        page = self.request("GET", "/")[2]
+        self.assertIn('<input type="checkbox" name="set:release_moves">', page)  # off by default
+        self.assertIn("Status rules · Off: only when you check now", page)
+        self.assertIn("Ready for Release -&gt; Done: root cause, fix version, parent, original estimate, logged time", page)
+        self.assertIn("Not checked yet.", page)
+
+        # The owner sets the project's rules; a bad one is named.
+        form = {"csrf": csrf, "project_id": market.id, "name": "marketplace", "jira_keys": "MAR", "github_account_id":
+                self.me().github_accounts[0].id, "repo_github": ["acme/fe"], "repo_test": ["true"]}
+        self.assertIn("Status rules: &#x27;luck&#x27; is not a check",
+                      self.request("POST", "/project/save", {**form, "status_rules": "A -> B: luck"})[2])
+        self.assertEqual(self.request("POST", "/project/save", {**form, "status_rules": "Merged -> In QA\nIn QA -> Done: parent"})[1],
+                         "/?ok=project")
+        self.assertIn("Merged -&gt; In QA\nIn QA -&gt; Done: parent", self.request("GET", f"/project?id={market.id}")[2])
+
+        # Switched on, every 4 hours.
+        join_form = {"csrf": csrf, "project_id": market.id, "jira_account_id": self.me().subscriptions[market.id].jira_account_id,
+                     "github_account_id": self.me().github_accounts[0].id, "claude_account_id": self.me().claude_accounts[0].id,
+                     "mode": "bugs", "settings": "1", "set:release_moves": "on", "set:release_hours": "4"}
+        self.assertEqual(self.request("POST", "/project/join", join_form)[1], "/?ok=joined")
+        self.assertEqual((self.me().subscriptions[market.id].settings.release_moves,
+                          self.me().subscriptions[market.id].settings.release_hours), (True, "4"))
+
+        jira = mock.Mock()
+        jira.search.return_value = [{"key": "MAR-3", "fields": {"issuetype": {"name": "Story"}, "assignee": {"accountId": ME}}}]
+        jira.status.return_value = "Merged"
+        jira.transitions.return_value = [{"id": "5", "to": {"name": "In QA"}}]
+        with mock.patch.object(releases, "jira_client", return_value=jira):
+            self.assertEqual(self.request("POST", "/project/release", {"csrf": csrf, "project_id": market.id})[1], "/?ok=released")
+        page = self.request("GET", "/")[2]
+        self.assertIn("Status rules · On, every 4 hours", page)
+        self.assertIn("<b>Moved:</b> MAR-3 to In QA", page)
+        self.assertIn("<b>Not moved:</b> MAR-3 (In QA): no parent", page)
 
     def test_pause_and_resume(self):
         self.sign_in()

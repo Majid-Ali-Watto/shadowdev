@@ -13,6 +13,7 @@ from .services.accounts import AccountService
 from .services.poller import Poller
 from .services.privacy import PrivacyReporter
 from .services.projects import ProjectService
+from .services.releases import ReleaseMover
 from .services.reviews import ReviewWatcher
 from .services.run_queue import RunQueue
 from .services.runs import RunService
@@ -34,6 +35,7 @@ class App:
     webhooks: WebhookService
     privacy: PrivacyReporter
     poller: Poller
+    releases: ReleaseMover
     reviews: ReviewRepository
     watcher: ReviewWatcher
 
@@ -59,6 +61,6 @@ def build_app(cfg: Config, oauth: AtlassianOAuth | None = None, queue: RunQueue 
         run_service=RunService(users, projects, oauth, queue, runs),
         webhooks=WebhookService(cfg, users, projects, runs, queue),
         privacy=PrivacyReporter(users, oauth, accounts),
-        poller=Poller(users, projects, oauth, queue),
+        poller=Poller(users, projects, oauth, queue), releases=ReleaseMover(users, projects, oauth),
         reviews=reviews, watcher=ReviewWatcher(cfg, users, projects, reviews, queue),
     )

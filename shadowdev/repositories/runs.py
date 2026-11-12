@@ -3,7 +3,9 @@ import json
 import sqlite3
 import time
 from contextlib import closing
+from dataclasses import replace
 
+from ..models.run import PAGE_SIZE, STATUSES, RunFilter, RunPage
 from .database import Database
 
 KEPT_RUNS = 200  # finished runs kept per developer; older ones are dropped
@@ -91,12 +93,39 @@ class RunRepository:
                          "again by itself', updated = ? WHERE status = 'queued' AND issue_key LIKE '%#%'", (time.time(),))
             return conn.execute("SELECT * FROM runs WHERE status = 'queued' ORDER BY id").fetchall()
 
-    def recent(self, user_id: int, limit: int = 20) -> list[sqlite3.Row]:
+    def recent(self, user_id: int) -> list[sqlite3.Row]:
+        """The developer's latest runs: the first page, unfiltered."""
+        return self.search(user_id, RunFilter()).rows
+
+    def search(self, user_id: int, run_filter: RunFilter) -> RunPage:
+        """The developer's runs the filter finds, newest first, one page of them. A page past the
+        last (runs were deleted meanwhile) gives the last."""
+        f = run_filter
+        where, args = ["r.user_id = ?"], [user_id]
+        if f.text:
+            like = "%" + f.text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            where.append("(r.issue_key LIKE ? ESCAPE '\\' OR r.message LIKE ? ESCAPE '\\' OR r.note LIKE ? ESCAPE '\\')")
+            args += [like] * 3
+        if f.status:
+            statuses = STATUSES[f.status][1]
+            where.append(f"r.status IN ({','.join('?' * len(statuses))})")
+            args += statuses
+        if f.project:
+            where.append("r.project = ?")
+            args.append(f.project)
+        if f.kind:
+            where.append("instr(r.issue_key, '#') " + ("> 0" if f.kind == "pr" else "= 0"))
+        sql_where = " AND ".join(where)  # only the fixed conditions above; every value is a parameter
         with closing(self.db.connect()) as conn:
-            return conn.execute(
-                "SELECT r.*, s.url AS site_url FROM runs r LEFT JOIN projects p ON p.id = r.project_id "
-                "LEFT JOIN sites s ON s.cloud_id = p.cloud_id WHERE r.user_id = ? ORDER BY r.id DESC LIMIT ?",
-                (user_id, limit)).fetchall()
+            total = conn.execute(f"SELECT COUNT(*) FROM runs r WHERE {sql_where}", args).fetchone()[0]  # noqa: S608
+            f = replace(f, page=min(f.page, max(1, -(-total // PAGE_SIZE))))
+            rows = conn.execute(
+                "SELECT r.*, s.url AS site_url FROM runs r LEFT JOIN projects p ON p.id = r.project_id "  # noqa: S608
+                f"LEFT JOIN sites s ON s.cloud_id = p.cloud_id WHERE {sql_where} ORDER BY r.id DESC LIMIT ? OFFSET ?",
+                (*args, PAGE_SIZE, (f.page - 1) * PAGE_SIZE)).fetchall()
+            projects = [row[0] for row in conn.execute(
+                "SELECT DISTINCT project FROM runs WHERE user_id = ? ORDER BY project COLLATE NOCASE", (user_id,))]
+        return RunPage(rows, total, f, projects)
 
     def first_time(self, event_id: str, at: int, forget_before: int) -> bool:
         """Record a webhook event; False if it was seen before. Events older than `forget_before`

@@ -72,6 +72,7 @@ def serve(cfg: Config) -> None:
     app.privacy.start()  # Atlassian's personal data reporting
     app.watcher.start()  # review comments on its PRs, and review requests in Slack
     app.poller.start()  # Jira, for the developers who turned polling on in Settings
+    app.releases.start()  # finished tickets moved by their projects' status rules, for those who switched it on
     log.info("Jira sites: %s", ", ".join(cfg.jira_sites))
     server = Server((cfg.host, cfg.port), make_handler(app))
     log.info("listening on http://%s:%d; developers open %s (Jira webhook at /webhook)", cfg.host, cfg.port, cfg.public_url)

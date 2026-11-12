@@ -10,7 +10,7 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-VERSION = 10  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
+VERSION = 11  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -77,6 +77,7 @@ CREATE TABLE IF NOT EXISTS projects (
     review_statuses  TEXT NOT NULL,  -- JSON list
     webhook_secret   BLOB NOT NULL,
     slack_channel    TEXT,  -- channel ID for review requests
+    status_rules     TEXT,  -- JSON list of models.release.StatusRule; NULL: the defaults
     UNIQUE (cloud_id, name)
 );
 CREATE TABLE IF NOT EXISTS project_keys (
@@ -110,6 +111,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     polled_at         REAL NOT NULL DEFAULT 0,  -- last time Jira was asked for its new assignments (Limits.jira_polling)
     slack_seen        TEXT NOT NULL DEFAULT '',  -- timestamp of the last message read in the project's Slack channel
     settings          TEXT NOT NULL DEFAULT '{}',  -- JSON models.settings.Settings: what is automated; missing = default
+    released_at       REAL NOT NULL DEFAULT 0,  -- last check of its tickets against the project's status rules
+    release_report    TEXT NOT NULL DEFAULT '',  -- JSON models.release.ReleaseReport of that check
     PRIMARY KEY (user_id, project_id)
 );
 CREATE INDEX IF NOT EXISTS subscriptions_project ON subscriptions (project_id);
@@ -185,6 +188,8 @@ ADDED_COLUMNS = (
     ("subscriptions", "settings", "TEXT NOT NULL DEFAULT '{}'"),  # 8
     ("runs", "questions", "TEXT NOT NULL DEFAULT ''"),  # 9
     ("users", "limits", "TEXT NOT NULL DEFAULT '{}'"),  # 10
+    ("projects", "status_rules", "TEXT"), ("subscriptions", "released_at", "REAL NOT NULL DEFAULT 0"),
+    ("subscriptions", "release_report", "TEXT NOT NULL DEFAULT ''"),  # 11
 )
 
 

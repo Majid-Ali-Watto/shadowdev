@@ -3,6 +3,7 @@ Every tab is in the page, so switching is instant; ?tab= picks the one shown, so
 the page after a form all land on the right one, with scripts off too."""
 from ..config import Config
 from ..models.project import Project
+from ..models.run import RunPage
 from ..models.user import User
 from .accounts import accounts_panel
 from .components import MARK, THEME_TOGGLE, alert, csrf_field, esc, page, plural, script
@@ -27,6 +28,7 @@ NOTICES = {
     "project-deleted": ("projects", "Project deleted."),
     "joined": ("projects", "Project settings saved."),
     "left": ("projects", "You left the project."),
+    "released": ("projects", "Tickets checked. What was moved, and what is missing, is under the project's status rules."),
     "queued": ("runs", "Queued. Progress shows up under Recent runs."),
     "paused": ("settings", "Automation paused. Nothing runs for you until you resume; a run in progress finishes."),
     "resumed": ("settings", "Automation resumed."),
@@ -43,7 +45,7 @@ def first_tab(user: User) -> str:
     return "runs" if user.ready_projects else "projects"
 
 
-def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], runs: list, csrf: str,
+def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], runs: RunPage, csrf: str,
               nonce: str, theme: str = "", tab: str = "", error: str = "", notice: str = "", answering=None) -> str:
     """`tab`: the one shown (a key of TABS; anything else means first_tab). `error` and `notice`
     show at the top of that tab. `answering`: a run whose questions the Runs tab's form answers."""
