@@ -1,9 +1,11 @@
 import hashlib
 import json
+import os
 import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -291,9 +293,20 @@ class MigrationTest(unittest.TestCase):
         (run,) = runs.recent(majid_id)
         self.assertEqual((run["id"], run["issue_key"], run["project_id"], run["status"]), (7, "MAR-1", market.id, "done"))
 
-        self.assertTrue(self.path.with_name("shadowdev.db.v1-backup").exists())
+        backup = self.path.with_name("shadowdev.db.v1-backup")
+        self.assertTrue(backup.exists())
         self.open()  # opening again changes nothing
         self.assertEqual(len(UserRepository(self.open()).all()), 2)
+        self.assertTrue(backup.exists())
+
+        # The copy holds everyone's data as it was: it goes once it is a week old ...
+        os.utime(backup, (time.time() - 8 * 86400,) * 2)
+        self.open()
+        self.assertFalse(backup.exists())
+        # ... and at once when a developer (or one of their accounts) is removed.
+        backup.write_text("x")
+        UserRepository(self.open()).delete(sara_id)
+        self.assertFalse(backup.exists())
 
     def test_a_bad_project_file_leaves_the_database_untouched(self):
         (self.dir / "projects" / "broken.toml").write_text('jira_projects = ["../x"]\n')
@@ -313,3 +326,65 @@ class MigrationTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KeysAndCopiesTest(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "data" / "shadowdev.db"
+        self.old = Fernet.generate_key().decode()
+
+    def developer(self, db):
+        users = UserRepository(db)
+        uid = users.save_jira_account(None, "acc-1", "Majid", "m@x", [OFFICE], Tokens("jira-access", "jira-refresh", 1.0))
+        users.save_github(uid, "office", "github-token", "majid", "Majid", "m@x")
+        users.save_slack(uid, "xoxp-slack", "U1", "acme")
+        add_project(ProjectRepository(db), uid, "market", ["MAR"])
+        return users, uid
+
+    def test_the_key_is_rotated_without_reconnecting_any_account(self):
+        users, uid = self.developer(Database(self.path, self.old))
+        Database(self.path, self.old).backup()
+        new = Fernet.generate_key().decode()
+        with self.assertRaises(RuntimeError):  # the new key alone can't read what the old one wrote
+            UserRepository(Database(self.path, new)).get(uid)
+        both = Database(self.path, f"{new}, {self.old}")
+        self.assertEqual(UserRepository(both).get(uid).github_accounts[0].token, "github-token")  # both keys read
+        self.assertEqual(both.rotate(), 5)  # the 2 Jira tokens, GitHub, Slack and the webhook secret
+        self.assertEqual(list(both.backups.iterdir()), [])  # copies under the old key are gone
+        user = UserRepository(Database(self.path, new)).get(uid)  # the new key alone now
+        self.assertEqual((user.github_accounts[0].token, user.slack.token), ("github-token", "xoxp-slack"))
+        self.assertEqual(UserRepository(Database(self.path, new)).jira_tokens(user.jira_accounts[0].id).refresh_token,
+                         "jira-refresh")
+        with self.assertRaisesRegex(SystemExit, "none of the keys"):
+            Database(self.path, Fernet.generate_key().decode()).rotate()  # the key that wrote them was dropped too soon
+
+    def test_backups_are_private_and_kept_a_week(self):
+        db = Database(self.path, self.old)
+        users, uid = self.developer(db)
+        copy = db.backup()
+        self.assertEqual((copy.parent.stat().st_mode & 0o777, copy.stat().st_mode & 0o777), (0o700, 0o600))
+        with closing(sqlite3.connect(copy)) as conn:
+            self.assertEqual(conn.execute("SELECT display_name FROM users").fetchone()[0], "Majid")
+        self.assertNotIn(b"github-token", copy.read_bytes())
+        Database(self.path, self.old)
+        self.assertTrue(copy.exists())
+        os.utime(copy, (time.time() - 8 * 86400,) * 2)
+        Database(self.path, self.old)
+        self.assertFalse(copy.exists())
+        copy = db.backup()
+        users.delete(uid)  # erasing a developer erases them from the copies too
+        self.assertFalse(copy.exists())
+
+
+class RunLogErasureTest(unittest.TestCase):
+    def test_removing_a_jira_account_deletes_the_logs_that_may_name_it(self):
+        db = Database(Path(tempfile.mkdtemp()) / "data" / "shadowdev.db", Fernet.generate_key().decode())
+        users, runs = UserRepository(db), RunRepository(db)
+        uid = add_developer(users, "acc-office")
+        add_developer(users, "acc-home", user_id=uid)
+        market = add_project(ProjectRepository(db), uid, "market", ["MAR"])
+        run_id = runs.add("MAR-1", uid, market.id, "market")
+        runs.set_record(run_id, 1, 0, 0, "MAR-1: worked on for acc-office")
+        users.remove_jira_account(uid, users.get(uid).jira_accounts[0].id)
+        self.assertIsNone(runs.log(uid, run_id))
+        self.assertEqual(runs.get(uid, run_id)["issue_key"], "MAR-1")  # the run itself stays

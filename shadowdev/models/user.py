@@ -1,12 +1,14 @@
 """A developer and the accounts they connected. One person can have several of each kind, e.g. a
 personal and an office Jira, GitHub and Claude; each project they join says which ones it uses."""
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass, field, replace
 
 from .limits import Limits
 from .release import ReleaseReport
 from .settings import Settings
 
 MODES = ("bugs", "all")  # "bugs": only Bugs; "all": Bugs, Tasks and Stories
+EXPIRES_SOON = 7 * 86400  # a GitHub token this near its end is pointed out to its developer
 
 
 @dataclass(frozen=True)
@@ -25,6 +27,7 @@ class JiraAccount:
     display_name: str
     email: str  # may be empty: Atlassian hides it under some privacy settings
     sites: tuple[Site, ...]
+    lost: bool = False  # Atlassian refused its grant (expired or revoked): the developer must sign in again
 
     def can_reach(self, cloud_id: str) -> bool:
         return any(s.cloud_id == cloud_id for s in self.sites)
@@ -35,23 +38,32 @@ class GitHubAccount:
     id: int
     label: str
     login: str
-    token: str
+    token: str = field(repr=False)  # never in a log line or an error
     git_name: str  # commit author
     git_email: str
+    expires: float = 0  # when the token expires, as GitHub said when it was saved; 0: never, or not said
+
+    def expiry_warning(self, now: float | None = None) -> str:
+        """"" unless the token has expired or does within EXPIRES_SOON."""
+        left = self.expires - (time.time() if now is None else now) if self.expires else EXPIRES_SOON + 1
+        if left <= 0:
+            return "token expired"
+        days = int(left // 86400)
+        return "" if left > EXPIRES_SOON else f"token expires in {days} day{'' if days == 1 else 's'}" if days else "token expires today"
 
 
 @dataclass(frozen=True)
 class ClaudeAccount:
     id: int
     label: str
-    token: str  # `claude setup-token` OAuth token, or an Anthropic API key
+    token: str = field(repr=False)  # `claude setup-token` OAuth token, or an Anthropic API key
     config_key: str  # its own Claude config directory, data/claude/<config_key>
 
 
 @dataclass(frozen=True)
 class SlackAccount:
     """The developer in Slack: ShadowDev posts and reads there as them, with their user token."""
-    token: str  # xoxp-…
+    token: str = field(repr=False)  # xoxp-…
     user_id: str  # Slack member ID, as in <@U012ABC> mentions
     team: str  # the workspace's name
 
@@ -81,6 +93,13 @@ class Actor:
     base_branches: dict[str, str]
     slack: SlackAccount | None = None
     settings: Settings = Settings()
+    spare_claudes: tuple[ClaudeAccount, ...] = ()  # the accounts a run may switch to at `claude`'s usage limit
+
+    def with_claude(self, config_key: str) -> "Actor":
+        """This actor working with that one of its Claude accounts, the others as its spares."""
+        accounts = (self.claude, *self.spare_claudes)
+        chosen = next((a for a in accounts if a.config_key == config_key), self.claude)
+        return replace(self, claude=chosen, spare_claudes=tuple(a for a in accounts if a is not chosen))
 
 
 @dataclass
@@ -118,8 +137,9 @@ class User:
         claude = self.claude(sub.claude_account_id) if sub else None
         if not (jira and github and claude):
             return None
+        spares = tuple(a for a in self.claude_accounts if a.id != claude.id) if sub.settings.switch_claude else ()
         return Actor(self.id, self.display_name, jira.account_id, github, claude, sub.mode, sub.base_branches, self.slack,
-                     sub.settings)
+                     sub.settings, spares)
 
     @property
     def ready_projects(self) -> list[int]:

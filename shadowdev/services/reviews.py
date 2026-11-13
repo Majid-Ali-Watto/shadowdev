@@ -46,7 +46,7 @@ RECENT_MESSAGES = 20  # the channel's last messages read each poll, with their t
 AGAIN_RE = re.compile(r"re-?review|review\s+(it\s+)?again", re.IGNORECASE)
 # A reply in a thread that mentions the developer without linking PRs asks them to review the
 # thread's PRs only with words that ask for it, and none that say not to.
-REVIEW = r"(?:re-?review|review)"
+REVIEW = r"(?:re-?review|review|approve)"
 REVIEW_ASK_RE = re.compile(
     rf"\b(?:can|could|would|will)\s+you\b[^.?!\n]*\b(?:{REVIEW}|look|check)\b"  # can you review / take a look
     rf"|\b(?:please|pls|plz|kindly)\b[^.?!\n]*\b(?:{REVIEW}|look|check)\b"  # please review / please check these
@@ -312,7 +312,13 @@ class ReviewWatcher:
             self.reviews.finish(row["id"], result.get("state", "failed"))
             self._react(row, user)
 
-        if self.queue.submit(project, [f"{row['github']}#{number}"], user.id, work=work, after=after) is None:
+        # A PR between the branches the developer approves without a review asks Claude nothing,
+        # so the Claude account's usage limits don't hold it.
+        actor, claude = user.actor(project.id), True
+        if actor.settings.approves_some_unreviewed:
+            pr = GitHub(actor.github.token).pr(repo.github, number)
+            claude = not actor.settings.approves_unreviewed(pr["head"]["ref"], pr["base"]["ref"])
+        if self.queue.submit(project, [f"{row['github']}#{number}"], user.id, work=work, after=after, claude=claude) is None:
             log.info("%s#%d: review queued for %s", row["github"], number, user.display_name)
             self._react(row, user)
 

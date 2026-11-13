@@ -79,7 +79,7 @@ _refresh_locks_guard = threading.Lock()
 
 def access_token(oauth: AtlassianOAuth, users, jira_account_id: int) -> Callable[[], str]:
     """The access token of one of a developer's Jira accounts, as a function. `users`
-    (UserRepository) keeps its tokens (jira_tokens/save_jira_tokens). An expired access token is
+    (UserRepository) keeps its tokens (jira_tokens/save_jira_tokens/mark_jira_lost). An expired access token is
     refreshed on use and the rotated refresh token saved. Each refresh token works once, so
     refreshes for one account happen one at a time (its sites share the grant)."""
     with _refresh_locks_guard:
@@ -96,6 +96,7 @@ def access_token(oauth: AtlassianOAuth, users, jira_account_id: int) -> Callable
                     tokens = oauth.refresh(tokens.refresh_token)
                 except HTTPError as e:
                     if e.status in (400, 401, 403):
+                        users.mark_jira_lost(jira_account_id)  # shown on the developer's page
                         raise JiraAccessLost("Jira access expired or was revoked: sign in to ShadowDev again") from None
                     raise
                 users.save_jira_tokens(jira_account_id, tokens)

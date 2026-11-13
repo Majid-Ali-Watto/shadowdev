@@ -18,6 +18,9 @@ class FakeUsers:
     def jira_tokens(self, account_id):
         return self.tokens
 
+    def mark_jira_lost(self, account_id):
+        self.lost = account_id
+
     def save_jira_tokens(self, account_id, tokens):
         self.tokens = tokens
         self.saved.append(tokens)

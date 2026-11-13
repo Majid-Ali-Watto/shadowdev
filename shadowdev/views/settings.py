@@ -1,4 +1,7 @@
-"""The Settings tab: the developer's timing and limits, pausing automation, and deleting the ShadowDev account."""
+"""The Settings tab: the developer's timing and limits, pausing automation, their recent activity, and
+deleting the ShadowDev account."""
+import time
+
 from ..models.limits import BOUNDS, LABELS, MINUTES, Limits, number
 from ..models.user import User
 from .components import esc
@@ -67,7 +70,21 @@ def _limits_card(user: User, hidden: str) -> str:
 </section>"""
 
 
-def settings_panel(user: User, hidden: str) -> str:
+def _activity_card(activity) -> str:
+    """What was done to the account and its projects lately: a change the developer did not make shows here."""
+    items = "".join(
+        f'<li><span>{esc(action)}{f" <span class=muted>{esc(detail)}</span>" if detail else ""}</span>'
+        f'<time class="muted" datetime="{time.strftime("%Y-%m-%dT%H:%M", time.localtime(at))}">'
+        f'{time.strftime("%d %b %H:%M", time.localtime(at))}</time></li>' for at, action, detail in activity)
+    return f"""<section class="card">
+  <div class="card-head"><h3>Recent activity</h3></div>
+  <p class="muted">Sign-ins and changes to your accounts, settings and projects. Something here you did not do?
+    Remove the tokens you saved, and revoke them where they were made.</p>
+  <ul class="items">{items or '<li class="muted">Nothing yet.</li>'}</ul>
+</section>"""
+
+
+def settings_panel(user: User, hidden: str, activity=()) -> str:
     if user.paused:
         pause_title, pause_text = "Automation paused", "Issues assigned to you are not worked on, and runs can't be started."
         pause_form = f'<form method="post" action="/resume">{hidden}<button>Resume automation</button></form>'
@@ -89,4 +106,4 @@ def settings_panel(user: User, hidden: str) -> str:
     <form method="post" action="/delete-account" data-confirm="Delete your ShadowDev account? Your queued and running runs are stopped and your stored tokens removed.">{hidden}
       <button class="danger">Delete my ShadowDev account</button></form>
   </div>
-</section>"""
+</section>""" + _activity_card(activity)

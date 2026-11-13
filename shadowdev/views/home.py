@@ -46,18 +46,22 @@ def first_tab(user: User) -> str:
 
 
 def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], runs: RunPage, csrf: str,
-              nonce: str, theme: str = "", tab: str = "", error: str = "", notice: str = "", answering=None) -> str:
+              nonce: str, theme: str = "", tab: str = "", error: str = "", notice: str = "", answering=None,
+              claude_usage: dict[int, tuple[str, bool]] | None = None,
+              activity: list[tuple[float, str, str]] = ()) -> str:
     """`tab`: the one shown (a key of TABS; anything else means first_tab). `error` and `notice`
-    show at the top of that tab. `answering`: a run whose questions the Runs tab's form answers."""
+    show at the top of that tab. `answering`: a run whose questions the Runs tab's form answers.
+    `claude_usage`: AccountService.claude_usage, per Claude account. `activity`: UserRepository.activity."""
+    claude_usage = claude_usage or {}
     hidden = csrf_field(csrf)
     if tab not in dict(TABS):
         tab = first_tab(user)
     joined = [p for p in projects if p.id in user.subscriptions]
     panels = {
         "runs": runs_panel(user.limits.max_parallel_runs, joined, runs, csrf, answering),
-        "projects": projects_panel(cfg, user, projects, secrets, hidden),
-        "accounts": accounts_panel(user, hidden),
-        "settings": settings_panel(user, hidden),
+        "projects": projects_panel(cfg, user, projects, secrets, hidden, claude_usage),
+        "accounts": accounts_panel(user, hidden, claude_usage),
+        "settings": settings_panel(user, hidden, activity),
     }
     nav = "".join(
         f'<a href="/?tab={key}" id="tab-{key}" role="tab" aria-controls="panel-{key}" data-tab="{key}"'
@@ -88,4 +92,10 @@ def _status(user: User) -> str:
         text = "Not active yet: connect GitHub and Claude, and join a project with them."
     else:
         text = f"Active in {plural(len(ready), 'project')}: issues assigned to you there are worked on automatically."
-    return f'<p class="status {"ok" if ready and not user.paused else "warn"}" role="status">{esc(text)}</p>'
+    # What stops runs sooner or later, and only the developer can mend (under Accounts).
+    problems = [f"Jira access of {a.display_name} was lost (expired or revoked): connect that account again under Accounts."
+                for a in user.jira_accounts if a.lost]
+    problems += [f"The GitHub {warning} ({g.label}): save a new token under Accounts."
+                 for g in user.github_accounts if (warning := g.expiry_warning())]
+    return (f'<p class="status {"ok" if ready and not user.paused else "warn"}" role="status">{esc(text)}</p>'
+            + "".join(f'<p class="status warn" role="status">{esc(p)}</p>' for p in problems))

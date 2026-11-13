@@ -24,7 +24,7 @@
 * { box-sizing:border-box; }
 body { margin:0; padding:32px 16px 64px; background:var(--bg); color:var(--text);
        font:15px/1.55 var(--sans); -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility; }
-main { max-width:780px; margin:0 auto; }
+main { max-width:920px; margin:0 auto; }
 h1, h2, h3 { margin:0; line-height:1.25; letter-spacing:-.01em; }
 h1 { font-size:20px; font-weight:650; }
 h3 { font-size:16px; font-weight:600; }
@@ -42,6 +42,7 @@ code { font-family:var(--mono); font-size:.86em; background:var(--code); padding
 .brand { display:flex; align-items:center; gap:12px; min-width:0; }
 .brand p { font-size:13.5px; margin:2px 0 0; overflow-wrap:anywhere; }
 .mark { width:34px; height:34px; color:var(--accent); flex:none; }
+.top + .card, .top + .alert { margin-top:20px; }
 .status { display:flex; align-items:center; gap:10px; margin:20px 0 0; padding:12px 14px; border-radius:var(--radius-sm);
           font-weight:500; font-size:14px; }
 .status::before { content:""; width:8px; height:8px; border-radius:50%; background:currentColor; flex:none; }
@@ -82,6 +83,7 @@ button.theme-toggle[hidden] { display:none; }
 .tag { font-size:12px; font-weight:600; padding:3px 9px; border-radius:999px; white-space:nowrap; }
 .tag.ok { color:var(--ok); background:var(--ok-soft); }
 .tag.off { color:var(--muted); background:var(--bg); }
+.tag.warn { color:var(--warn); background:var(--warn-soft); }
 
 /* Login */
 .login { max-width:440px; margin:12vh auto 0; padding:32px; text-align:center; }
@@ -92,7 +94,10 @@ button.theme-toggle[hidden] { display:none; }
 .login .hint { margin-top:16px; }
 
 /* Form controls */
-label { display:block; margin:10px 0; font-size:14px; font-weight:500; }
+label { display:block; margin:14px 0; font-size:14px; font-weight:500; }
+label > .sub { display:block; margin-top:2px; font-size:13px; font-weight:400; color:var(--muted); }
+.optional { margin-left:6px; font-size:11.5px; font-weight:500; color:var(--muted); padding:1px 7px;
+            border-radius:999px; background:var(--bg); border:1px solid var(--line); vertical-align:1px; }
 input[type=email], input[type=password], input[type=number], input[type=search], input:not([type]) {
   display:block; width:100%; margin-top:6px; padding:9px 12px; min-height:40px; font:15px var(--sans); font-weight:400;
   color:var(--text); background:var(--field); border:1px solid var(--line-strong); border-radius:var(--radius-sm);
@@ -109,6 +114,10 @@ input[type=checkbox], input[type=radio] { accent-color:var(--accent); width:16px
 .choice:hover { border-color:var(--muted); }
 .choice:has(input:checked) { border-color:var(--accent); background:var(--accent-soft); }
 .choice small { display:block; color:var(--muted); font-size:13px; margin-top:1px; }
+.choices.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+#run-form .setting.delay { border-bottom:0; padding:4px 0 8px; }
+#run-form:not(:has(input[name=grouping][value=sequence]:checked)) .setting.delay { display:none; }
+#run-form .actions .hint { flex:1; min-width:220px; margin:0; }
 
 /* Project picker */
 .dropdown summary { list-style:none; cursor:pointer; padding:9px 12px; min-height:40px; border:1px solid var(--line-strong);
@@ -225,6 +234,8 @@ th.pick, td.pick { width:1%; padding-right:0; }
 th.pick input, td.pick input { margin:0; vertical-align:middle; }
 td.msg { overflow-wrap:anywhere; min-width:200px; color:var(--muted); }
 td.msg small { display:block; margin-top:3px; font-size:12.5px; }
+td.msg a { font-family:var(--mono); font-size:12.5px; text-decoration:none; }
+td.msg a:hover { text-decoration:underline; }
 /* A run's details: the message's first line, opened in place for the rest, the model and the note */
 .run-details > summary { display:flex; gap:6px; align-items:baseline; list-style:none; cursor:pointer; border-radius:4px; }
 .run-details > summary::-webkit-details-marker { display:none; }
@@ -248,7 +259,8 @@ td.empty { text-align:center; padding:28px; color:var(--muted); font-family:var(
 .badge.running, .badge.queued { color:var(--accent); background:var(--accent-soft); }
 .badge.running::before { animation:pulse 1.4s ease-in-out infinite; }
 .badge.stopping, .badge.waiting, .badge.question { color:var(--warn); background:var(--warn-soft); }
-form.stop { display:inline; margin-left:8px; }
+form.stop { display:inline; margin-left:6px; }
+td.state > .button { margin-left:6px; }
 @keyframes pulse { 50% { opacity:.3; } }
 
 /* Accounts, projects, the project editor */
@@ -262,8 +274,12 @@ select:focus, textarea:focus { outline:none; border-color:var(--accent); box-sha
             border-bottom:1px solid var(--line); }
 .items li:first-child { border-top:1px solid var(--line); }
 .items form { flex:none; }
+.items small.usage { display:block; margin-top:3px; font-size:12.5px; color:var(--muted); }
+.items small.usage .tag { font-size:11px; padding:1px 7px; margin-right:4px; }
 .grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); column-gap:14px; }
 details.more { margin:10px 0; }
+.hint.active { margin:-4px 0 12px; }
+.hint.active.held { color:var(--warn); }
 details.more > summary { cursor:pointer; color:var(--accent); font-size:14px; font-weight:500; }
 /* A repo in the project editor: its fields stacked, unlike the grid of base-branch fields. */
 fieldset.settings label { font-family:var(--sans); }
@@ -278,15 +294,18 @@ fieldset.settings .choices.repos { margin:0 0 4px; }
 fieldset.how { display:block; padding:0 14px; }
 fieldset.how .setting:last-child { border-bottom:0; }
 fieldset.how .setting-text label { font-weight:500; }
-fieldset.how select { flex:none; width:220px; margin:0; }
+fieldset.how select, fieldset.how input:not([type]) { flex:none; width:220px; margin:0; }
+fieldset.how > .hint { margin:10px 0 0; padding-bottom:12px; border-bottom:1px solid var(--line); }
 .automation:has(input[name="set:release_moves"]:not(:checked)) [data-needs-release] { opacity:.5; }
+.automation:has(input[name="set:auto_start"]:not(:checked)) fieldset.start { opacity:.5; }
+fieldset.start input:not([type]) { width:320px; font-family:var(--sans); }
 .choices.repos .choice { padding:9px 12px; }
 .choice small.mono { font-family:var(--mono); font-size:12px; overflow-wrap:anywhere; }
 label > .hint { display:block; font-weight:400; margin:4px 0 0; }
 fieldset.repo { display:block; padding:6px 16px 14px; margin:8px 0 12px; }
 fieldset.repo label { font-family:var(--sans); font-size:14px; }
 fieldset.repo label .muted { font-weight:400; }
-fieldset.repo textarea { margin-top:6px; }
+fieldset.repo textarea { margin-top:6px; min-height:40px; }
 fieldset.repo details.more { margin:6px 0 2px; }
 fieldset.repo [data-remove-repo] { margin-top:12px; }
 .row.intro .button { flex:none; }
@@ -304,11 +323,15 @@ fieldset.repo [data-remove-repo] { margin-top:12px; }
   .row { flex-direction:column; align-items:stretch; gap:12px; }
   .setting { gap:14px; } .unit-input { width:112px; }
   fieldset.how .setting { flex-direction:column; align-items:stretch; gap:8px; }
-  fieldset.how select { width:100%; }
+  fieldset.how select, fieldset.how input:not([type]) { width:100%; }
   .row form button { width:100%; }
   .items li { flex-direction:column; align-items:stretch; }
+  .choices.three { grid-template-columns:1fr; }
+  #run-form .actions .hint { flex-basis:100%; }
+  .table th:nth-child(3), .table td:nth-child(3) { display:none; }  /* the project: the issue key says it */
   .login { padding:24px 20px; margin-top:6vh; }
 }
 @media (prefers-reduced-motion:reduce) { * { transition:none !important; animation:none !important; } }
 
 .asked ol { margin:4px 0; padding-left:20px; } .asked li { margin:3px 0; }
+.card > form:first-child > label:first-of-type { margin-top:0; }

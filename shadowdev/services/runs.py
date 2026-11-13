@@ -1,5 +1,7 @@
 """A developer running issues by hand, and stopping their runs."""
 
+import secrets
+
 from ..automation import rules
 from ..automation.pipeline import MAX_GROUP
 from ..clients.atlassian import AtlassianOAuth, jira_client
@@ -13,6 +15,8 @@ from .errors import UserError
 from .projects import run_all
 from .run_queue import RunQueue
 
+MAX_DELAY_MINUTES = 240  # between issues run one after another
+
 
 class RunService:
     def __init__(self, users: UserRepository, projects: ProjectRepository, oauth: AtlassianOAuth, queue: RunQueue,
@@ -23,7 +27,8 @@ class RunService:
         self.oauth = oauth
         self.queue = queue
 
-    def request(self, user: User, issue_keys: str, together: bool, project_id: str = "", note: str = "") -> None:
+    def request(self, user: User, issue_keys: str, together: bool, project_id: str = "", note: str = "",
+                change: str = "all", one_message: bool = False, sequence: bool = False, delay_minutes: str = "") -> None:
         """Queue one or more issues (`issue_keys`: separated by spaces, commas or semicolons, and
         ranges like MAR-1 to MAR-10): each on its own branch and PR (run in parallel), or all
         together on one branch with one PR per repo. Of a range, the issues that aren't the
@@ -32,7 +37,13 @@ class RunService:
         project is found among the developer's; `project_id` picks one when the same Jira key is in
         several of them (e.g. MAR at work and at home). `note`: the developer's own instructions,
         given to Claude with the issues. For issues run separately, lines starting "MAR-12:" go only
-        to that issue's run; the lines before them go to every run."""
+        to that issue's run; the lines before them go to every run. `change`: what the runs may
+        change, "fe" or "be" (the project's frontend or backend repos; when the fix needs more, the
+        developer is asked) or "all" (the repos Claude finds it needs). `one_message`: issues run
+        separately get one review request in Slack for all their PRs, per project, once the last
+        has ended; else each run asks for its own. `sequence`: issues run separately run one after
+        another, in the order given, each `delay_minutes` after the one before has ended; else in
+        parallel."""
         try:
             keys, ranged = rules.parse_keys(issue_keys)
         except ValueError as e:
@@ -46,6 +57,12 @@ class RunService:
         unknown = [k for k in parts if k not in keys]
         if unknown:
             raise UserError(f"The note has a part for {', '.join(unknown)}, which is not among the issue keys.")
+        try:
+            delay = float(delay_minutes or 0) * 60
+        except ValueError:
+            delay = -1
+        if not 0 <= delay <= MAX_DELAY_MINUTES * 60:
+            raise UserError(f"The minutes between issues must be a number from 0 to {MAX_DELAY_MINUTES}.")
         if user.paused:
             raise UserError("Your automation is paused. Resume it to run issues.")
         mine = [p for p in self.projects.on_sites(list(user.sites)) if p.id in user.subscriptions]
@@ -65,6 +82,12 @@ class RunService:
             if not user.actor(project.id):
                 raise UserError(f"{project.name}: choose the GitHub and the Claude account to run it with first.")
             projects[key] = project
+        repos = {}
+        for project in {p.id: p for p in projects.values()}.values():
+            try:
+                repos[project.id] = rules.chosen_repos([r.name for r in project.repos], change)
+            except ValueError as e:
+                raise UserError(f"{project.name} {e}: choose FE and BE.") from None
 
         def assigned_problem(key: str) -> str | None:
             project, sub = projects[key], user.subscriptions[projects[key].id]
@@ -98,12 +121,21 @@ class RunService:
         if together and len(keys) > 1:
             if len({p.id for p in projects.values()}) > 1:
                 raise UserError("Issues fixed on one branch must all be in the same project.")
-            refusal = self.queue.submit(projects[keys[0]], keys, user.id, note=note)
+            refusal = self.queue.submit(projects[keys[0]], keys, user.id, note=note, repos=repos[projects[keys[0]].id])
             if refusal:
                 raise UserError(f"Not queued: {refusal}.")
             return
-        refused = [f"{k}: {r}" for k in keys if (r := self.queue.submit(
-            projects[k], [k], user.id, note="\n".join(filter(None, [general, parts.get(k)]))))]
+        # One review request per project, for the projects with several of these issues.
+        several = {pid for pid in repos if sum(1 for k in keys if projects[k].id == pid) > 1} if one_message else set()
+        batches = {pid: secrets.randbits(53) for pid in several}
+        notes = {k: "\n".join(filter(None, [general, parts.get(k)])) for k in keys}
+        if sequence and len(keys) > 1:
+            refusals = self.queue.submit_sequence(
+                [(projects[k], [k], notes[k], repos[projects[k].id], batches.get(projects[k].id)) for k in keys], user.id, delay)
+        else:
+            refusals = [self.queue.submit(projects[k], [k], user.id, note=notes[k], repos=repos[projects[k].id],
+                                          batch=batches.get(projects[k].id)) for k in keys]
+        refused = [f"{k}: {r}" for k, r in zip(keys, refusals, strict=True) if r]
         if refused:
             queued = len(keys) - len(refused)
             raise UserError(("Queued the others. " if queued else "") + "Not queued: " + "; ".join(refused) + ".")

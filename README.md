@@ -30,8 +30,8 @@ project's repos:
    after the issue key (e.g. `MAR-123`). All of them sit in one workspace,
    `worktrees/<project id>-MAR-123/{fe,services}`, which is **deleted when the run ends**
 4. has a small Claude model (Haiku) rate the issue from its text as simple, standard or complex,
-   which picks the model for the rest of the run: Haiku, Sonnet at medium effort, or the Claude
-   account's default model. An issue that can't be rated runs with the default. When the model
+   which picks the model for the rest of the run: Haiku or Sonnet, both at high effort, or the Claude
+   account's default model at its own recommended effort. An issue that can't be rated runs with the default. When the model
    changes nothing, or its change fails the tests, the next stronger one continues the same
    conversation. Claude is given the issue's summary and description, people's latest comments,
    and its attached screenshots, logs and documents (up to 10 files of 10 MB per issue, kept
@@ -90,6 +90,16 @@ Jira webhook → verify signature (the project's secret) → project: by URL, or
           queue → a worker (the developer's Runs at the same time, 5) → pipeline, as the assignee, with that project's accounts
 ```
 
+**What starts by itself.** Webhooks and polling start only issues assigned to you that meet the
+project's *Start by itself only when* conditions (under *Automation*): in one of its statuses (by
+default *To Do, Backlog, Ready for Pickup, Reopened*; empty for any), and in an **active sprint** (started, not
+ended; on by default). An issue in no sprint, in a future sprint or in an ended one waits. Starting
+a sprint changes none of its issues, so no webhook comes for it: polling asks for the issues in open
+sprints too, and starts those never run before. With webhooks alone, an issue already in a sprint
+when the sprint starts waits for its next update or for **Run issues now**. Why an issue was not
+started is written to the server's log. **Run issues now** starts any issue of yours, whatever its
+status or sprint.
+
 New assignments are picked up three ways: the Jira **webhook** (instant, needs ShadowDev reachable
 from Jira), **polling** (**Poll Jira** on the developer's Settings tab: every 15 minutes by default, for machines
 Jira can't reach, like a laptop), and **Run issues now** on the page (always available). Polling asks Jira, as
@@ -113,8 +123,55 @@ don't hold up everyone else. Runs still waiting when the server restarts are que
 run has its own clones. Runs on the same base commit share one baseline test result. Every step is logged in the server's terminal, including what Claude reads
 and edits.
 
-**Several issues at once**, from the web page: *separately* gives each issue its own branch and
-PR, worked on in parallel. *Together* fixes them in one Claude session on one branch
+**Claude's usage limits.** A Claude subscription has a 5-hour and a weekly limit, and the `claude`
+CLI reports how much of each is used with every request. ShadowDev keeps a run from being cut off
+by them, so no work is paid for twice:
+
+- once **97% of the 5-hour limit** is used, no new run starts: runs stay **queued**, saying why and
+  when the limit resets, and start by themselves after the reset
+- once **90% of the weekly limit** is used, runs start only when the week resets within 5 hours,
+  and then only as many as fit in what is left (a run is taken to need 2% of the week, or as much
+  as the largest run seen since the server started); otherwise they stay queued until the weekly reset
+- a run **in progress** that a limit cuts off is not failed when the limit resets within 5 hours:
+  its code and its Claude conversation are kept, it waits (its line under **Recent runs** says
+  until when), and Claude then continues in the same conversation from where it stopped. A limit
+  that resets later fails the run as before, and its code is deleted
+
+**Switching Claude accounts.** With several Claude accounts connected, a project's **Switch Claude
+account at its limit** (under *Automation*, off by default) lets its runs go on with another of
+your accounts instead of waiting: a new run starts on the first of your accounts that is not at a
+limit, and a run in progress moves there at once, taking its conversation along, so Claude
+continues where it stopped. Only when all of them are at their limits does a run wait, as above.
+The project's card says which account is **active** now, and the Accounts tab shows each account's
+usage as of its last request. Off, a project only ever uses the account you chose for it: leave it
+off where the code must not go to another account (office code to a personal subscription).
+
+Queued and waiting runs can be stopped like any other. Usage is known from ShadowDev's own
+requests, so what else the account is used for shows only with the next one; it is kept in memory,
+so a run waiting in progress is lost if the server restarts (queued runs are queued again). A
+Console API key reports no limits and is never held.
+
+**What to change, and how review is asked for**, on **Run issues now**:
+
+- **Change**: *FE only* (the default), *BE only*, or *FE and BE*. FE only and BE only change just the
+  project's frontend or backend repo (told from its folder name: `fe`, `frontend`; `be`, `backend`,
+  `services`, `api`). When Claude finds the fix needs another repo too, nothing is changed: the run
+  ends as **question** and you get a Slack direct message. Run it again with *FE and BE* to change
+  them all, or as it is to keep to your choice; the PR then lists what was left out under
+  **Assumptions**. With *Ask me technical questions* off you are not asked, and it keeps to your
+  choice. *FE and BE* lets Claude decide, as do runs that start by themselves (webhook, polling).
+- **Review request in Slack**: *One message for all issues* (the default) or *A message for each
+  issue*. One message is posted once the last of the issues run separately has finished, with a
+  section per repo (**FE**, **BE**, with its reviewers) listing each issue and its PR; issues that
+  failed or wait for an answer are left out. A single issue, issues fixed together, and runs that
+  start by themselves ask for their own review, as before.
+
+**Several issues at once**, from the web page: *separately, in parallel* gives each issue its own
+branch and PR, worked on at the same time. *Separately, one after another* does the same in the
+order given: each issue starts once the one before it has ended (however it ended), after the
+**Minutes between issues** you give (0 to 240; 0 starts it at once). An issue waiting for its turn
+is listed as queued, saying what it waits for, can be stopped, and the sequence goes on after a
+server restart. *Together* fixes them in one Claude session on one branch
 (`MAR-1_MAR-2`; three or more consecutive issues as a range,
 `MAR-1-to-MAR-10`, so the name stays short and still says which issues it covers) with one PR per repo; each ticket still gets its own root cause, fix version,
 status changes and PR comment. An issue fixed in a group counts as handled afterwards.
@@ -124,19 +181,20 @@ status changes and PR comment. An issue fixed in a group counts as handled after
 ```
 ShadowDev/
 ├── shadowdev/
-│   ├── __main__.py        python -m shadowdev: the server (--reload: restarted on changes), or dry-run
+│   ├── __main__.py        python -m shadowdev: the server (--reload: restarted on changes), dry-run, backup, rotate-key
 │   ├── reload.py          --reload: the server in a child process, restarted when ShadowDev's files or .env change
 │   ├── config.py          .env settings
 │   ├── app.py             wires repositories and services together
-│   ├── server.py          HTTP server: dispatches each request to its route
+│   ├── server.py          HTTP server: dispatches each request to its route; stops gracefully on SIGTERM
+│   ├── logfiles.py        data/logs/: a private log file per day, kept 5 days
 │   ├── models/            plain dataclasses: User and its accounts and Limits, Subscription and its Settings, Actor, Project/Repo, Issue, Tokens, status rules (release.py), run search (run.py)
 │   ├── repositories/      SQLite, one class per table group
-│   │   ├── database.py    schema, connections, token encryption
+│   │   ├── database.py    schema, connections, token encryption, key rotation, backups
 │   │   ├── migrations.py  upgrading a v1 database (and its projects/*.toml) in one transaction
-│   │   ├── users.py       developers, their Jira/GitHub/Claude accounts (encrypted), subscriptions
+│   │   ├── users.py       developers, their Jira/GitHub/Claude accounts (encrypted), subscriptions, activity
 │   │   ├── projects.py    projects: Jira site and keys, repos, workflow, webhook secret
 │   │   ├── sessions.py    web sessions (hashed)
-│   │   ├── runs.py        run history shown on the page, accepted webhook events
+│   │   ├── runs.py        run history shown on the page (with each run's log and cost), accepted webhook events
 │   │   └── reviews.py     PRs in review: the ones ShadowDev opened, and the ones asked for in Slack
 │   ├── services/          business logic; raise UserError for problems shown to the developer
 │   │   ├── accounts.py    sign-in, connect/remove Jira, GitHub and Claude accounts, pause, delete
@@ -150,17 +208,18 @@ ShadowDev/
 │   │   └── reviews.py     at each developer's interval: review comments and CI on its PRs (GitHub), review requests (Slack)
 │   ├── routes/            HTTP only: parse the request, call a service, respond
 │   │   ├── request.py     Request helpers, security headers, the signed-in form guard
+│   │   ├── ratelimit.py   requests per client and minute, on the routes open to anyone
 │   │   ├── auth.py        /login/jira, /jira/connect, OAuth callback, /logout
 │   │   ├── settings.py    the developer's page and its account actions
 │   │   ├── projects.py    the project editor, joining and leaving
-│   │   └── webhook.py     /webhook
+│   │   └── webhook.py     /webhook, /health
 │   ├── views/             HTML: one module per page or tab
 │   │   ├── components.py  esc(), page(), and the pieces every page shares
 │   │   ├── home.py        the developer's page: header, status, tabs, NOTICES
 │   │   ├── runs.py        Runs tab: run issues now, Recent runs (search, filters, pages)
 │   │   ├── projects.py    Projects tab: projects to join, webhook help
 │   │   ├── accounts.py    Accounts tab: Jira, GitHub, Claude, Slack
-│   │   ├── settings.py    Settings tab: timing and limits, pause, delete account
+│   │   ├── settings.py    Settings tab: timing and limits, pause, delete account, recent activity
 │   │   ├── project_editor.py  add or edit a project
 │   │   ├── auth.py        sign in, connecting another Jira account
 │   │   └── static/        style.css and the scripts (inlined with the page's CSP nonce)
@@ -172,13 +231,17 @@ ShadowDev/
 │       ├── guidance.py    the instruction files each repo keeps for AI tools
 │       ├── verify.py      sandboxed setup/test commands, JUnit results, base-branch baselines
 │       ├── agent.py       headless Claude Code session, as the developer
+│       ├── limits.py      the Claude account's usage limits: holding runs, waiting for a reset
 │       ├── rules.py       issue types, release branches, fix versions
 │       ├── gitops.py      git as the developer: list branches, clone, commit, push
 │       ├── sandbox.py     bubblewrap sandbox for setup/test commands
 │       ├── cancel.py      stopping a run
+│       ├── runlog.py      what a run logged and what Claude reported it cost, kept with the run
 │       └── dryrun.py      python -m shadowdev dry-run: a made-up issue, no Jira or GitHub
+├── deploy/              shadowdev.service: a systemd unit
 ├── tests/
-├── data/                  database and per-developer Claude config (created; never committed)
+├── Makefile           short names for the commands: `make` lists them
+├── data/                  database, backups, logs and per-developer Claude config (created; never committed)
 └── worktrees/             workspaces of running issues, deleted when each run ends
 ```
 
@@ -294,6 +357,15 @@ in the address, so a filtered list can be bookmarked or shared.
 Tick finished runs (or the box in the header, for all) and press **Delete selected** to remove them from the list;
 queued and running ones are stopped first, and tickets and PRs are never touched.
 
+### What a run took
+
+Under **Recent runs**, a finished run's details say how long it worked, Claude's turns and the cost
+Claude reported (for a subscription, what that use would cost on the API), and link to its **Log**:
+what the server logged while it worked (what Claude read, said and changed, the commands and their
+results). The log is yours alone, and is deleted with the run. The page also warns you, above the
+tabs, when Jira access of one of your accounts was lost or a GitHub token expires within a week, and
+**Settings → Recent activity** lists sign-ins and changes to your accounts and projects.
+
 ### It is you, everywhere
 
 Everything ShadowDev writes in Jira, GitHub and Slack is posted with your accounts, in your words:
@@ -307,17 +379,19 @@ theirs. You remain the author of all of it, so you answer for it like for your o
 ### What is automated: per project, under *Automation*
 
 Each project you join has its own switches, so one server can do everything for a work project
-and, say, only reviews for a personal one. All but *Move complete tickets* are on by default.
+and, say, only reviews for a personal one. All but *Move complete tickets* and *Switch Claude account at its limit* are on by default.
 
 | | Off means |
 |---|---|
 | **Claude model** | *Chosen per issue* (Haiku, Sonnet or the account's default, by how hard it is), or always one model |
 | **After a change passes the tests** | *Open a pull request*, *a draft pull request* (no Slack review request), or *only push the branch* (you open the PR; the ticket stays In Progress and links to where to open it) |
 | Start by itself | new assignments wait for **Run issues now**: webhooks and polling ignore them |
+| Start by itself only when (statuses, in an active sprint) | see below |
 | Ask the reporter | what only the reporter could say is decided by Claude, and listed in the PR's assumptions |
 | Ask me technical questions | Claude makes the technical decisions too, and lists them in the PR's assumptions |
 | Prove bug fixes | no regression test is asked for or run without the fix |
 | Work again on reopened issues | an issue with its branch is always skipped |
+| Switch Claude account at its limit (**off** by default) | runs wait for the reset of the project's own Claude account |
 | Move the ticket | its status is never changed |
 | Comment on the ticket | no root cause or plan, PR links, failures or questions (and so no questions, and no reopening: it is found by the PR links comment) |
 | Set the fix version | the fix version is left alone |
@@ -327,6 +401,7 @@ and, say, only reviews for a personal one. All but *Move complete tickets* are o
 | Review when asked in Slack | mentions in the project's channel are not read |
 | Review PRs of these repos (one per repo) | that repo's PRs are not reviewed for you, even when you are mentioned with them |
 | Approve as me | a PR that needs no changes gets a comment saying so, and you approve it |
+| Approve without review: *From branch* and *Into branch* (**empty** by default) | every PR you are asked about is reviewed |
 
 ### The projects' own instructions for AI
 
@@ -382,6 +457,19 @@ ShadowDev from outside:
   again or writes "review again", it reviews again. Each message counts once: only the ones posted
   after the last one read are acted on, from when you connected Slack on.
 
+- **Approval only.** Some PRs carry changes that were already reviewed, e.g. a release branch going
+  into `main`. Under a project's *Automation → Approve without review*, give the PR's own branch
+  (**From branch**, e.g. `release/*, hotfix/*`) and the branch it goes into (**Into branch**, e.g.
+  `main`): names or patterns, separated by commas. A PR you are asked about (to review or to
+  approve) whose two branches both match is **approved as you without being read**: nothing is
+  said in Slack, and the message that asked gets ✅ once its PRs are approved. Everything else
+  about reviews still holds: only the project's repos you review, never your own PR or one from a
+  fork, not one already approved or being reviewed by someone else, and only with *Approve as me*
+  on. Anyone who can push a branch with a matching name gets its PR approved this way, so choose
+  branches that are protected on GitHub. Saving checks that each name or pattern matches a branch
+  of the project's repos on GitHub. These approvals ask Claude nothing, so the Claude account's
+  usage limits never hold them.
+
 Each PR gets at most 5 rounds of fixes, 3 of CI fixes and 5 of reviews. These runs show under **Recent runs**
 like any other, named after the PR (`acme/fe#12`), and can be stopped there.
 
@@ -413,7 +501,8 @@ the database is upgraded in one transaction (a copy of the old one is kept as
 `data/shadowdev.db.v1-backup`). Developers keep their accounts, tokens, settings and run history,
 sign in again once, and each `projects/*.toml` becomes a project owned by its first subscriber,
 with its own webhook secret. The old `/webhook` keeps working. After that, `projects/` can be
-deleted, and so can `data/shadowdev.db.v1-backup` once all is well.
+deleted, and so can `data/shadowdev.db.v1-backup` once all is well (ShadowDev deletes it itself after
+a week, or as soon as a developer or one of their accounts is removed).
 
 ### Server: `.env`
 
@@ -421,7 +510,8 @@ See [`.env.example`](.env.example). `JIRA_SITES`: the Jira sites developers may 
 add projects on, comma-separated, e.g. `https://office.atlassian.net,https://home.atlassian.net`
 (`JIRA_BASE_URL`, v1's single site, still works). `*` allows any site, which lets anyone with an
 Atlassian account use the server and its machine. `ATLASSIAN_CLIENT_ID`,
-`ATLASSIAN_CLIENT_SECRET`, `PUBLIC_URL`, `SHADOWDEV_SECRET_KEY` (encrypts developers' tokens),
+`ATLASSIAN_CLIENT_SECRET`, `PUBLIC_URL`, `SHADOWDEV_SECRET_KEY` (encrypts developers' tokens; see
+*Backups and the key* to change it),
 `WEBHOOK_SECRET` (optional: the shared `/webhook`; each project also has its own), `HOST`, `PORT`.
 
 Timing and limits are each developer's own, on the **Settings** tab. Times are in minutes, with
@@ -430,6 +520,37 @@ decimals for less (0.5 is 30 seconds): Poll Jira and its interval (default off, 
 wait for more (2), and the Claude and setup/test command timeouts (30 each). Counts: runs at the same
 time (5; mind the machine: parallel runs mean parallel `npm ci` and test suites, and the server runs
 at most 20 in all) and fix attempts (3).
+
+### Starting and stopping
+
+`make up` runs the server in the terminal, `make upd` in the background (`make logs` follows it).
+Stopping it (Ctrl+C, `make down`, or `systemctl stop` with the unit below) is graceful: it takes no
+new requests or runs, the runs in progress get up to 15 minutes to finish, and runs still queued
+start again with the server. Stopping it a second time (Ctrl+C again, `make down` again) stops the
+runs in progress at once, as their Stop button does. A Jira webhook sent while the server is down
+is delivered again by Jira.
+
+`GET /health` answers `{"status": "ok"}` while the server runs and can read its database, for a
+reverse proxy or a monitor. Starting a sign-in and the OAuth callback take at most 30 requests a
+minute from one client, and `/webhook` 600; more are answered `429` with `Retry-After`. Behind a
+reverse proxy or tunnel on the same machine, the client is the address the proxy puts last in
+`X-Forwarded-For`.
+
+### Backups and the key
+
+`make backup` copies the database to `data/backups/`, safe while the server runs. A backup is
+readable only by ShadowDev's user, its tokens stay encrypted with `SHADOWDEV_SECRET_KEY`, and
+ShadowDev deletes it after 7 days, and at once when a developer is erased, so nothing removed lives
+on in a copy. To keep backups longer, copy them elsewhere, together with the key.
+
+To change the key (it leaked, or a person who knew it left), without anyone connecting their
+accounts again:
+
+1. `make key` prints a new one. In `.env`, put it **first**, before the old one:
+   `SHADOWDEV_SECRET_KEY=<new>,<old>`. The server reads with either and writes with the new one.
+2. `make rotate`: every stored token and webhook secret is encrypted again with the new key, in one
+   transaction, and the backups (encrypted with the old key) are deleted.
+3. Remove the old key from `.env`, and restart the server.
 
 ### Jira sign-in app (once)
 
@@ -574,15 +695,19 @@ security:
 - [ ] `.env` readable only by that user (`chmod 600 .env`; `data/` and `worktrees/` are created
       `700`). Keep a copy of `SHADOWDEV_SECRET_KEY` in your password manager or secret store
 - [ ] HTTPS in front (a reverse proxy or a named Cloudflare tunnel), with `PUBLIC_URL` set to it
-- [ ] Run it as a service (e.g. a systemd unit with `User=shadowdev` and `Restart=on-failure`) so
-      it survives reboots; its logs then go to the journal
+- [ ] Run it as a service so it survives reboots: edit the user and paths in
+      [`deploy/shadowdev.service`](deploy/shadowdev.service), copy it to `/etc/systemd/system/` and
+      `systemctl enable --now shadowdev`. Its logs then go to the journal too
+- [ ] Point the reverse proxy's or a monitor's health check at `/health`
+- [ ] `make backup` on a schedule (e.g. a daily cron job), copied off the machine with the key kept
+      separately
 - [ ] Disk encryption, and OS updates (bubblewrap, git, the kernel)
 - [ ] On GitHub: branch protection on `release/*` requiring an approving review
 - [ ] Developers use fine-grained GitHub tokens limited to the project repos
 
 ## Requirements
 
-- Linux, Python 3.11+, and `cryptography` (`pip install -e .`, or `uv run shadowdev`)
+- Linux, Python 3.11+, and `cryptography` (installed by `make install`, see *Setup*)
 - [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`), `prlimit` (util-linux), git, and
   the [Claude Code](https://claude.com/claude-code) CLI on `PATH`. Developers bring their own Claude login
 - No clones and no GitHub access of its own: every clone, push and PR uses the developer's token
@@ -591,11 +716,44 @@ security:
 
 ## Setup
 
-```bash
-cp .env.example .env     # fill it in: JIRA_SITES, a new SHADOWDEV_SECRET_KEY, and the Jira sign-in app
-pip install -e .         # once; installs cryptography
-python3 -m shadowdev     # web page at PUBLIC_URL, Jira webhook at /webhook
-```
+After cloning, once. `make` lists every command; each is a short name for the command shown.
+
+1. **Install what it runs with** (see *Requirements*): Python 3.11+, git, `bwrap`, `prlimit`, the
+   `claude` CLI, and [uv](https://docs.astral.sh/uv/). On Debian/Ubuntu:
+   `sudo apt install git bubblewrap util-linux`. The server refuses to start while one is missing,
+   and says which.
+2. **Install ShadowDev** into `.venv`:
+
+   ```bash
+   make install             # uv sync
+   ```
+
+   Without uv: `python3 -m venv .venv && .venv/bin/pip install -e .` (add `ruff` for `make lint`).
+3. **Create the Jira sign-in app** (see *Jira sign-in app (once)*): it gives the client ID and
+   secret, and needs `PUBLIC_URL/oauth/jira/callback` as its callback URL.
+4. **Write `.env`**:
+
+   ```bash
+   cp .env.example .env && chmod 600 .env
+   make key                 # prints a new SHADOWDEV_SECRET_KEY to paste in
+   ```
+
+   Fill in `JIRA_SITES`, `ATLASSIAN_CLIENT_ID`, `ATLASSIAN_CLIENT_SECRET`, `SHADOWDEV_SECRET_KEY`
+   and, unless it is `http://localhost:8080`, `PUBLIC_URL`. Keep a copy of the key somewhere safe:
+   without it the stored tokens cannot be read, and every developer connects their accounts again.
+5. **Start it**, and open `PUBLIC_URL`:
+
+   ```bash
+   make up                  # in the terminal; Ctrl+C stops it
+   make upd                 # or detached; `make logs` follows it, `make down` stops it
+   make dev                 # or restarted whenever the code or .env changes (development)
+   ```
+
+   The first start creates `data/` (the database, Claude config folders, logs) and `worktrees/`.
+6. **On the page**, each developer signs in with Jira, connects a GitHub token and a Claude token
+   (and Slack, optionally) under *Accounts*, and adds or joins a project. `make dry S="an issue
+   title"` then tries a run without touching Jira or GitHub (see *Try it without Jira*).
+7. **Check the install**: `make check` runs the linter and the tests.
 
 To share it, expose the server, e.g. with a named Cloudflare tunnel, set `PUBLIC_URL` to its
 https address, and add `PUBLIC_URL/oauth/jira/callback` as a callback URL in the Jira sign-in app.
@@ -636,7 +794,8 @@ the command lists the changed files. The next dry run replaces it.
 ## Tests
 
 ```bash
-python3 -m unittest -v
+make test                # .venv/bin/python -m unittest
+make test T=tests.test_server.WebTest.test_stop_button   # one test
 ```
 
 - `tests/test_pipeline.py` runs the whole pipeline against real local git repos, with the commands
@@ -647,11 +806,13 @@ python3 -m unittest -v
 - `tests/test_server.py` drives the real HTTP server through Jira OAuth sign-in, connecting
   personal and office accounts, adding, joining and editing projects, and covers the state check,
   CSRF and Origin checks, webhook routing to projects, sites and developers, per-project webhook
-  secrets, the run queue (parallel runs, turns, restarts, stopping, pausing, limits), and config.
+  secrets, the run queue (parallel runs, turns, restarts, stopping, pausing, limits, graceful
+  shutdown), run logs and costs, rate limits, /health, token warnings, recent activity, and config.
 - `tests/test_atlassian.py` covers the OAuth URLs and token exchange, and refreshing (once, with
   rotation) and revoked grants.
 - `tests/test_store.py` covers the repositories: token encryption, several accounts per developer,
-  projects per site, ownership passing on, sessions, account deletion, and the v1 upgrade.
+  projects per site, ownership passing on, sessions, account deletion, the v1 upgrade, key
+  rotation, backups, and erasing run logs with a Jira account.
 - `tests/test_rules.py` covers release branches, fix versions, and issue types.
 - `tests/test_releases.py` covers the status rules: their checks (root cause on bugs only), moving
   complete tickets, the Slack message for incomplete ones, the schedule, and **Check now**.

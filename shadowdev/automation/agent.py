@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -9,18 +10,25 @@ import time
 from pathlib import Path
 
 from ..config import Config
-from ..models.user import ClaudeAccount
-from . import sandbox
+from ..models.user import Actor, ClaudeAccount
+from . import limits, runlog, sandbox
 from .cancel import NEVER, CancelToken
 
 READ_ONLY_TOOLS = "Read,Glob,Grep"
 EDIT_TOOLS = "Read,Glob,Grep,Edit,Write"
 LOG_TEXT_CHARS = 400
 
+SMALL_MODEL_EFFORT = "high"  # Haiku and Sonnet always work at high effort
 TRIAGE_MODEL = "haiku"  # rates how hard an issue is, from its text alone
-# What works on an issue of each difficulty: (--model, --effort). None: the Claude account's default.
-MODELS = {"simple": ("haiku", None), "standard": ("sonnet", "medium"), "complex": (None, None)}
+# What works on an issue of each difficulty: (--model, --effort). None: the Claude account's default
+# (the default model keeps its own recommended effort).
+MODELS = {"simple": ("haiku", SMALL_MODEL_EFFORT), "standard": ("sonnet", SMALL_MODEL_EFFORT), "complex": (None, None)}
 FIXED_MODELS = {"haiku": MODELS["simple"], "sonnet": MODELS["standard"], "default": MODELS["complex"]}  # Settings.model
+
+# A request refused by a usage limit is waited for and continued in the same conversation.
+LIMIT_ERROR_RE = re.compile(r"usage limit|session limit|weekly limit|rate.?limit|hit your limit", re.IGNORECASE)
+CONTINUE = """Your work on the last request was interrupted before you finished. Continue it from where
+you stopped, without redoing what is already done, and then give your answer."""
 
 log = logging.getLogger("shadowdev")
 
@@ -51,6 +59,16 @@ def claude_env(token: str, config_dir: Path) -> dict:
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR") if k in os.environ}
     return {**env, "CLAUDE_CONFIG_DIR": str(config_dir), variable: token}
+
+
+def claude_envs(cfg: Config, actor: Actor) -> list[dict]:
+    """The environments of a run's Claude accounts: the one it works with, then those it may
+    switch to at a usage limit (none unless the developer switched that on)."""
+    return [claude_env(a.token, claude_config_dir(cfg, a)) for a in (actor.claude, *actor.spare_claudes)]
+
+
+def config_dirs(envs: list[dict]) -> list[Path]:
+    return [Path(env["CLAUDE_CONFIG_DIR"]) for env in envs]
 
 
 def _run(cmd: list[str], prompt: str, cwd: Path, env: dict, timeout: int) -> dict:
@@ -84,16 +102,24 @@ def check_token(token: str, config_dir: Path, cfg: Config | None = None) -> None
             forget_claude_sessions(config_dir, Path(empty))
 
 
-def forget_claude_sessions(config_dir: Path, workspace: Path) -> None:
-    """Delete the transcripts of Claude sessions run in `workspace` (they contain the code
-    Claude read), from a developer's Claude config dir."""
+def session_dirs(config_dir: Path, workspace: Path) -> list[Path]:
+    """The folders of a Claude config dir that hold the transcripts of sessions run in `workspace`."""
+    found = []
     for project_dir in (config_dir / "projects").glob("*"):
         for transcript in project_dir.glob("*.jsonl"):
             with transcript.open() as lines:
                 cwd = next((e.get("cwd") for e in map(_json_object, lines) if e.get("cwd")), None)
             if cwd and (cwd == str(workspace) or cwd.startswith(f"{workspace}/")):
-                shutil.rmtree(project_dir, ignore_errors=True)
+                found.append(project_dir)
                 break
+    return found
+
+
+def forget_claude_sessions(config_dir: Path, workspace: Path) -> None:
+    """Delete the transcripts of Claude sessions run in `workspace` (they contain the code
+    Claude read), from a developer's Claude config dir."""
+    for project_dir in session_dirs(config_dir, workspace):
+        shutil.rmtree(project_dir, ignore_errors=True)
 
 
 def _json_object(line: str) -> dict:
@@ -119,12 +145,19 @@ class ClaudeSession:
 
     Claude's output is streamed: what it says, each file it reads, searches, edits or
     creates, and rejected answers are logged as they happen, prefixed with `label`.
+
+    A request that the account's usage limit refuses is not lost: the session goes on in the
+    same conversation, with one of `spares` (the environments of the developer's other Claude
+    accounts, when they switched that on) that is not at its limit, or else after waiting for
+    the reset when it comes within limits.RESETS_SOON (see limits.py).
     """
 
     def __init__(self, cwd: Path, env: dict, label: str = "claude", cfg: Config | None = None,
-                 cancel: CancelToken = NEVER, model: str | None = None, effort: str | None = None):
+                 cancel: CancelToken = NEVER, model: str | None = None, effort: str | None = None,
+                 spares: list[dict] | None = None):
         self.cwd = cwd
         self.env = env
+        self.spares = spares if spares is not None else []  # shared by the sessions of a run
         self.label = label
         self.cfg = cfg  # set: run in the sandbox
         self.cancel = cancel
@@ -159,7 +192,46 @@ class ClaudeSession:
                 log.warning("%s: claude's step was rejected: %s", self.label,
                             _one_line(text if isinstance(text, str) else json.dumps(text), 300))
 
+    def _switch_account(self) -> bool:
+        """Go on with a spare Claude account that is not at its limit, taking this run's
+        conversations along. False when there is none."""
+        now = time.time()
+        for n, env in enumerate(self.spares):
+            if limits.USAGE.held(env["CLAUDE_CONFIG_DIR"], now):
+                continue
+            old, new = Path(self.env["CLAUDE_CONFIG_DIR"]), Path(env["CLAUDE_CONFIG_DIR"])
+            for folder in session_dirs(old, self.cwd):
+                shutil.copytree(folder, new / "projects" / folder.name, dirs_exist_ok=True)
+            self.spares[n], self.env = self.env, env  # the one left is skipped while it is at its limit
+            message = "its Claude account reached its limit; going on with another of your Claude accounts"
+            log.info("%s: %s", self.label, message)
+            limits.tell(message)
+            return True
+        return False
+
     def ask(self, prompt: str, tools: str, schema: dict) -> dict:
+        resume = self.session_id
+        while True:
+            account = self.env.get("CLAUDE_CONFIG_DIR", "")
+            result, working, error = self._request(prompt, tools, schema, resume, account)
+            if not error:
+                break
+            until = limits.USAGE.refused(account, time.time(), bool(LIMIT_ERROR_RE.search(error)))
+            if until is None:
+                raise RuntimeError(error)
+            if not self._switch_account():
+                if until - time.time() > limits.RESETS_SOON:
+                    raise RuntimeError(error)
+                limits.wait_for_reset(until, self.cancel, self.label)
+            if working:  # Claude had begun: it continues that conversation instead of starting over
+                prompt, resume = CONTINUE, working
+        self.session_id = result["session_id"]
+        return result["structured_output"]
+
+    def _request(self, prompt: str, tools: str, schema: dict, resume: str | None, account: str
+                 ) -> tuple[dict | None, str | None, str | None]:
+        """One call of claude. Returns (its result, the session Claude was working in when it
+        failed, the error): a result without an error, or an error."""
         cmd = [
             "claude", "-p",
             "--output-format", "stream-json", "--verbose",
@@ -172,13 +244,13 @@ class ClaudeSession:
             cmd += ["--model", self.model]
         if self.effort:
             cmd += ["--effort", self.effort]
-        if self.session_id:
-            cmd += ["--resume", self.session_id]
+        if resume:
+            cmd += ["--resume", resume]
         cmd = in_sandbox(cmd, self.cfg, self.cwd, Path(self.env["CLAUDE_CONFIG_DIR"])) if self.cfg else cmd
         self.cancel.check()
         started = time.monotonic()
         timeout = self.cfg.claude_timeout_seconds if self.cfg else Config.claude_timeout_seconds
-        result = None
+        result, working = None, None
         with tempfile.TemporaryFile("w+") as stderr:
             proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, text=True,
                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr)
@@ -197,7 +269,11 @@ class ClaudeSession:
                             continue
                         if event.get("type") == "result":
                             result = event
+                        elif event.get("type") == "rate_limit_event":
+                            limits.USAGE.record(account, event.get("rate_limit_info") or {})
                         else:
+                            if event.get("type") == "assistant":
+                                working = event.get("session_id") or working
                             self._log_event(event)
                     proc.wait()
                 except BrokenPipeError:
@@ -213,11 +289,11 @@ class ClaudeSession:
                 if time.monotonic() - started >= timeout:
                     raise RuntimeError(f"claude timed out after {timeout}s")
                 stderr.seek(0)
-                raise RuntimeError(f"claude exited {proc.returncode} without a result: {stderr.read()[-2000:]}")
+                return None, working, f"claude exited {proc.returncode} without a result: {stderr.read()[-2000:]}"
+        runlog.add_usage(result.get("total_cost_usd"), result.get("num_turns"))
         if result.get("is_error"):
-            raise RuntimeError(f"claude failed: {str(result.get('result'))[:2000]}")
+            return None, working, f"claude failed: {str(result.get('result'))[:2000]}"
         if "structured_output" not in result:
             raise RuntimeError(f"claude returned no structured output: {str(result.get('result'))[:2000]}")
-        self.session_id = result["session_id"]
         log.info("%s: claude done in %.0fs (%s turns)", self.label, time.monotonic() - started, result.get("num_turns", "?"))
-        return result["structured_output"]
+        return result, None, None

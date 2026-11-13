@@ -23,6 +23,12 @@ class ReviewRepository:
                          "slack_channel, slack_ts) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                          (user_id, project_id, repo, github, number, branch, *(slack or (None, None))))
 
+    def set_pr_slack(self, user_id: int, github: str, number: int, slack: tuple[str, str]) -> None:
+        """The message that asked for the review of a PR already tracked: (channel, timestamp)."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE pull_requests SET slack_channel = ?, slack_ts = ? WHERE user_id = ? AND github = ? "
+                         "AND number = ?", (*slack, user_id, github, number))
+
     def tracked_prs(self) -> list[sqlite3.Row]:
         with closing(self.db.connect()) as conn:
             return conn.execute("SELECT * FROM pull_requests ORDER BY id").fetchall()

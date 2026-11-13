@@ -30,6 +30,11 @@ class CancelToken:
         if self._event.is_set():
             raise Cancelled("the run was stopped")
 
+    def wait(self, seconds: float) -> None:
+        """Sleep, unless the run is stopped meanwhile."""
+        if self._event.wait(seconds):
+            raise Cancelled("the run was stopped")
+
     @contextmanager
     def tracking(self, proc: subprocess.Popen):
         """Kill `proc` if the run is stopped while it runs (or already was)."""

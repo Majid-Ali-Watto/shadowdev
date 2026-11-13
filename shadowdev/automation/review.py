@@ -26,7 +26,7 @@ from ..config import Config
 from ..models.project import Project, Repo
 from ..models.user import Actor
 from . import gitops, guidance
-from .agent import EDIT_TOOLS, MODELS, READ_ONLY_TOOLS, ClaudeSession, claude_config_dir, claude_env
+from .agent import EDIT_TOOLS, MODELS, READ_ONLY_TOOLS, ClaudeSession, claude_envs, config_dirs
 from .cancel import NEVER, CancelToken
 from .pipeline import ask_for_review, escalating, heal, model_name, run_folders
 from .prompts import (
@@ -55,6 +55,13 @@ MAX_LOG_BYTES = 20 * 1024**2  # a GitHub Actions job log bigger than this is not
 MAX_LOG_CHARS = 12_000  # the end of each failed job's log, where the error is
 MAX_CI_CHARS = 40_000  # all failed checks together
 LOG_NOISE_RE = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z |\x1b\[[0-9;]*[A-Za-z]", re.MULTILINE)  # timestamps, colours
+
+
+def cut_diff(diff: str) -> str:
+    """A diff short enough for a prompt; a cut one says so, so Claude reads the rest in the files."""
+    if len(diff) <= MAX_DIFF_CHARS:
+        return diff
+    return diff[:MAX_DIFF_CHARS] + "\n… (the diff is cut here: read the rest in the files)"
 
 
 def waiting_threads(threads: list[dict], login: str) -> list[dict]:
@@ -99,16 +106,16 @@ def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] 
             outcome = "skipped"
             return outcome, f"{url} is approved: its review comments are left as they are"
         log.info("%s: %d review thread(s) to address for %s", label, len(threads), actor.display_name)
-        claude_dir = claude_config_dir(cfg, actor.claude)
+        envs = claude_envs(cfg, actor)
         token = actor.github.token
-        with run_folders(cfg, project, f"fix-{repo.name}-{number}", claude_dir) as (workspace, scratch):
+        with run_folders(cfg, project, f"fix-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
             worktree = workspace / repo.name
             with timings.step(f"clone {repo.name}"):
                 commit = gitops.clone(repo.github, branch, worktree, token)
             checkout = Checkout(label, repo, branch, commit, worktree, cancel=cancel)
             model, effort = MODELS["standard"]
-            claude = ClaudeSession(workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg, cancel=cancel,
-                                   model=model, effort=effort)
+            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
+                                   spares=envs[1:])
             stronger = escalating(claude, on_model, label)
             with timings.step("Claude change"):
                 result = ask_usable(claude, fix_prompt(repo, number, threads, guidance.find(worktree, repo.name)), EDIT_TOOLS,
@@ -199,13 +206,13 @@ def fix_ci(repo: Repo, number: int, branch: str, sha: str, project: Project, act
         with timings.step("CI output and diff"):
             failures = "\n\n".join(ci_output(github, repo.github, c, label) for c in checks)[-MAX_CI_CHARS:]
             try:
-                diff = github.pr_diff(repo.github, number)[:MAX_DIFF_CHARS]
+                diff = cut_diff(github.pr_diff(repo.github, number))
             except HTTPError as e:
                 if e.status != 413:
                     raise
                 diff = "(too large to show: read the changed files)"
-        claude_dir = claude_config_dir(cfg, actor.claude)
-        with run_folders(cfg, project, f"ci-{repo.name}-{number}", claude_dir) as (workspace, scratch):
+        envs = claude_envs(cfg, actor)
+        with run_folders(cfg, project, f"ci-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
             worktree = workspace / repo.name
             with timings.step(f"clone {repo.name}"):
                 commit = gitops.clone(repo.github, branch, worktree, actor.github.token)
@@ -214,8 +221,8 @@ def fix_ci(repo: Repo, number: int, branch: str, sha: str, project: Project, act
                 return outcome, f"new commits were pushed to {url} since its CI failed; their CI is checked in turn"
             checkout = Checkout(label, repo, branch, commit, worktree, cancel=cancel)
             model, effort = MODELS["standard"]
-            claude = ClaudeSession(workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg, cancel=cancel,
-                                   model=model, effort=effort)
+            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
+                                   spares=envs[1:])
             stronger = escalating(claude, on_model, label)
             with timings.step("Claude change"):
                 summary = ask_usable(claude, ci_prompt(repo, pr, diff, [failures], guidance.find(worktree, repo.name)),
@@ -271,14 +278,21 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
         if refusal:
             outcome = "skipped"
             return outcome, f"{url} was not reviewed: {refusal}", "closed"
+        head, base = pr["head"]["ref"], pr["base"]["ref"]
+        if actor.settings.approves_unreviewed(head, base):
+            # Between branches the developer chose: approval only. Nothing is said in Slack; the
+            # message that asked gets its tick (services/reviews).
+            cancel.check()
+            github.create_review(repo.github, number, "APPROVE", "")
+            outcome = "done"
+            log.info("%s: approved for %s without a review (%s into %s)", label, actor.display_name, head, base)
+            return outcome, f"approved {url} without a review: {head} into {base} needs approval only", "approved"
         say(f"Reviewing {link(url, f'PR {number}')}")
         log.info("%s: reviewing for %s", label, actor.display_name)
         with timings.step("diff"):
-            diff = github.pr_diff(repo.github, number)
-            if len(diff) > MAX_DIFF_CHARS:
-                diff = diff[:MAX_DIFF_CHARS] + "\n… (the diff is cut here: read the rest in the files)"
-        claude_dir = claude_config_dir(cfg, actor.claude)
-        with run_folders(cfg, project, f"review-{repo.name}-{number}", claude_dir) as (workspace, scratch):
+            diff = cut_diff(github.pr_diff(repo.github, number))
+        envs = claude_envs(cfg, actor)
+        with run_folders(cfg, project, f"review-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
             with timings.step(f"clone {repo.name}"):
                 gitops.clone(repo.github, pr["head"]["ref"], workspace / repo.name, actor.github.token)
             with timings.step("instructions from the base branch"):
@@ -289,7 +303,7 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
                 gitops.clone(repo.github, pr["base"]["ref"], base, actor.github.token)
                 guides = guidance.find(base, f"{guidance.COPY_DIR}/{repo.name}")
                 guidance.copy_into(guides, base, workspace)
-            claude = ClaudeSession(workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg, cancel=cancel)
+            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, spares=envs[1:])
             on_model(model_name(None, None))
             with timings.step("Claude review"):
                 result = ask_usable(claude, review_prompt(repo, pr, diff, threads, guides), READ_ONLY_TOOLS, REVIEW_SCHEMA,

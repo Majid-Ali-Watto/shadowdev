@@ -4,6 +4,7 @@ import hmac
 import html
 import http.client
 import json
+import logging
 import re
 import sqlite3
 import tempfile
@@ -15,30 +16,42 @@ from unittest import mock
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from shadowdev.app import build_app, database
+from shadowdev.automation import limits, runlog
+from shadowdev.automation.agent import claude_config_dir
+from shadowdev.clients.github import expiry as github_expiry
 from shadowdev.clients.rest import HTTPError
 from shadowdev.config import Config
 from shadowdev.models.limits import Limits
+from shadowdev.models.run import RunFilter
 from shadowdev.models.settings import Settings
 from shadowdev.models.tokens import Tokens
-from shadowdev.models.user import Site
+from shadowdev.models.user import GitHubAccount, Site
 from shadowdev.repositories.projects import ProjectRepository
 from shadowdev.repositories.runs import RunRepository
 from shadowdev.repositories.sessions import SessionRepository
 from shadowdev.repositories.users import UserRepository
+from shadowdev.routes.ratelimit import RateLimiter
 from shadowdev.server import Server, make_handler
 from shadowdev.services import accounts, releases, run_queue, runs
 from shadowdev.services import projects as project_service
 from shadowdev.services.errors import UserError
 from shadowdev.services.run_queue import RunQueue
 from shadowdev.services.webhook import matching_issue, verify_signature
+from shadowdev.views.home import home_page
 from tests.helpers import HOME, OFFICE, add_developer, add_project, join, make_cfg, repo
 
 ME = "acc-majid"
 ME_HOME = "acc-majid-home"  # the same person's personal Atlassian account
 
 
-def payload(event="jira:issue_created", key="MAR-12", type_="Bug", assignee=ME, site=OFFICE):
-    issue = {"key": key, "fields": {"issuetype": {"name": type_}, "assignee": {"accountId": assignee}}}
+ACTIVE_SPRINT = [{"id": 7, "name": "Sprint 7", "state": "active", "boardId": 1}]
+
+
+def payload(event="jira:issue_created", key="MAR-12", type_="Bug", assignee=ME, site=OFFICE, status="To Do",
+            sprint=ACTIVE_SPRINT):
+    """A Jira event about an issue that starts by itself by default: To Do, in an active sprint."""
+    issue = {"key": key, "fields": {"issuetype": {"name": type_}, "assignee": {"accountId": assignee},
+                                    "status": {"name": status}, "customfield_10020": sprint}}
     if site:
         issue["self"] = f"{site.url}/rest/api/2/issue/10001"
     return {"webhookEvent": event, "issue": issue}
@@ -86,6 +99,21 @@ class WebhookTest(Env):
         self.assertEqual(match(key="MARS-3", assignee="acc-sara"), ("MARS-3", self.market, sara))
         self.assertEqual(match(key="BIL-7", type_="Story"), ("BIL-7", billing, me))
         self.assertEqual(match(event="jira:issue_updated", type_="bug")[0], "MAR-12")
+        # Only an issue in a status that starts by itself, and in a sprint that has started.
+        future = [{**ACTIVE_SPRINT[0], "state": "future"}]
+        with self.assertLogs("shadowdev", "INFO") as logs:
+            for kw in ({"status": "In Progress"}, {"sprint": None}, {"sprint": future},
+                       {"sprint": [{**ACTIVE_SPRINT[0], "state": "closed"}]}):
+                self.assertIsNone(match(**kw), kw)
+        self.assertIn("MAR-12: not started by itself for", logs.output[0])
+        self.assertIn("its status In Progress is not one that starts by itself", logs.output[0])
+        self.assertIn("it is in no sprint", logs.output[1])
+        self.assertIn("its sprint has not started, or has ended", logs.output[2])
+        self.assertEqual(match(status="ready for pickup", sprint=[*future, *ACTIVE_SPRINT])[0], "MAR-12")
+        uid = self.users.owner_of(ME)
+        sub = self.users.get(uid).subscriptions[self.market.id]
+        self.users.subscribe(uid, dataclasses.replace(sub, settings=Settings(auto_statuses="", auto_sprint=False)))
+        self.assertEqual(match(status="In QA", sprint=None)[0], "MAR-12")  # conditions off: any status, no sprint
         # MAR-12 at home is the personal project's, for the personal Jira account only.
         self.assertEqual(match(site=HOME, assignee=ME_HOME), ("MAR-12", side, me))
         self.assertIsNone(match(site=HOME, assignee=ME))
@@ -113,9 +141,18 @@ class WebTest(Env):
 
     def setUp(self):
         super().setUp()
-        self.queued = []
-        self.pool = mock.Mock(submit=lambda project, keys, uid, note="", **kw: self.queued.append(
-            (project.name, keys, uid, *([note] if note else []))))
+        self.queued, self.options = [], []  # options: each queued run's other arguments (repos, batch)
+
+        def submit(project, keys, uid, note="", **kw):
+            self.queued.append((project.name, keys, uid, *([note] if note else [])))
+            self.options.append(kw)
+
+        def submit_sequence(items, uid, delay):
+            self.sequences.append((delay, [keys[0] for _, keys, *_ in items]))
+            return [submit(project, keys, uid, note, repos=repos, batch=batch) for project, keys, note, repos, batch in items]
+
+        self.sequences = []  # (seconds between, the issues in order) of each sequence queued
+        self.pool = mock.Mock(submit=submit, submit_sequence=submit_sequence)
         self.oauth = mock.Mock()
         self.oauth.authorize_url.side_effect = lambda state: f"https://auth.atlassian.com/authorize?state={state}"
         self.oauth.exchange.return_value = Tokens("access-1", "refresh-1", time.time() + 3600)
@@ -134,6 +171,7 @@ class WebTest(Env):
         self.jira.get_issue.side_effect = lambda key: {"fields": {"assignee": {"accountId": "acc-sara" if key.endswith("-9") else ME}}}
         self.github = mock.Mock()
         self.github.user.return_value = {"login": "majid", "id": 7, "name": "Majid Ali", "email": None}
+        self.github.user_and_expiry.side_effect = lambda: (self.github.user(), 0)  # a token that never expires
         self.github.can_push.return_value = True
         self.github.repo.side_effect = lambda owner_repo: {"description": f"{owner_repo} on GitHub", "permissions": {"push": True}}
         patches = [mock.patch.object(accounts, "GitHub", return_value=self.github),
@@ -342,6 +380,21 @@ class WebTest(Env):
         self.assertEqual(self.me().actor(market.id).settings, Settings())  # the other project keeps its own
         self.assertIn("is not a choice", self.request("POST", "/project/join", {
             **join_form(side, gh["personal"], cl["personal"]), **chosen, "set:publish": "force-push"})[2])
+        # The branches approved without a review must exist on GitHub: a typo would never match.
+        unreviewed = lambda source, into: self.request("POST", "/project/join", {
+            **join_form(side, gh["personal"], cl["personal"]), **chosen, "set:review_approve": "on",
+            "set:approve_from": source, "set:approve_into": into})
+        with mock.patch.object(project_service.gitops, "remote_branches", return_value=["main", "release/14", "release/15"]):
+            page = unreviewed("release/*, hotfix/*", "mian")[2]
+            self.assertIn("Approve without review: no branch of ", page)
+            self.assertIn(" matches hotfix/*, mian.", page)
+            self.assertEqual(self.me().actor(side.id).settings.approve_from, "")  # nothing saved
+            self.assertEqual(unreviewed("release/*", "main")[1], "/?ok=joined")
+        mine = self.me().actor(side.id).settings
+        self.assertEqual((mine.approve_from, mine.approve_into), ("release/*", "main"))
+        self.assertIn('name="set:approve_from" value="release/*"', self.request("GET", "/")[2])
+        self.assertIn("branch names", unreviewed("release/* main", "main")[2])
+        page = self.request("GET", "/")[2]
         for secret in ("gh-office", "gh-home", "sk-ant-oat01-abcdef"):
             self.assertNotIn(secret, page)  # tokens are never shown back
         self.assertIn(f"/webhook?project={market.id}", page)  # the owner sees each project's webhook
@@ -367,6 +420,29 @@ class WebTest(Env):
         self.queued.clear()
         self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "grouping": "together", "note": note})
         self.assertEqual(self.queued, [("marketplace", ["MARS-1", "MARS-2"], me.id, note)])  # one run: all of it
+        # What to change, and one review request for all: as chosen on the form.
+        page = self.request("GET", "/")[2]
+        self.assertIn('<option value="fe" selected>FE only</option>', page)
+        self.assertIn('<option value="one" selected>One message for all issues</option>', page)
+        self.options.clear()
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "change": "fe", "message": "one"})
+        first, second = self.options
+        self.assertEqual((first["repos"], second["repos"]), (("fe",), ("fe",)))
+        self.assertTrue(first["batch"] and first["batch"] == second["batch"])  # one request for the two
+        self.options.clear()
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "change": "be", "message": "each"})
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1", "change": "all", "message": "one"})
+        self.assertEqual([(o["repos"], o["batch"]) for o in self.options],
+                         [(("services",), None), (("services",), None), ((), None)])  # one issue: its own request
+        self.assertIn("Enter one or more", self.request("POST", "/run", {"csrf": csrf, "issue_keys": "", "change": "fe"})[2])
+        # One after another, with minutes between them; in parallel otherwise.
+        self.assertEqual(self.sequences, [])
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-2 MARS-1", "grouping": "sequence", "delay": "10"})
+        self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1", "grouping": "sequence", "delay": "10"})
+        self.assertEqual(self.sequences, [(600.0, ["MARS-2", "MARS-1"])])  # in the order typed; one issue is no sequence
+        for bad in ("-1", "241", "soon"):
+            self.assertIn("minutes between issues must be a number from 0 to 240", self.request(
+                "POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1 MARS-2", "grouping": "sequence", "delay": bad})[2])
         self.queued.clear()
         self.assertIn("a part for MARS-7, which is not among the issue keys",
                       self.request("POST", "/run", {"csrf": csrf, "issue_keys": "MARS-1", "note": "MARS-7: x"})[2])
@@ -934,6 +1010,210 @@ class RunQueueTest(QueueEnv):
         self.assertIn("GitHub or Claude account was removed", self.runs.recent(me)[0]["message"])
 
 
+class ClaudeLimitTest(QueueEnv):
+    def setUp(self):
+        super().setUp()
+        limits.USAGE.clear()
+        self.addCleanup(limits.USAGE.clear)
+        patcher = mock.patch.object(limits, "POLL", 0.02)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def nearly_used(self, me, resets_in: float, label: str | None = None):
+        """The developer's Claude account `label` (default: the project's own) is at 98% of its 5-hour limit."""
+        user = self.users.get(me)
+        claude = next((c for c in user.claude_accounts if c.label == label), user.actor(self.market.id).claude)
+        limits.USAGE.record(str(claude_config_dir(self.cfg, claude)), {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": 0.98, "resetsAt": time.time() + resets_in}}})
+
+    def second_account(self, me, switch: bool):
+        """A personal Claude account besides the office one the project runs with, and the switch."""
+        self.users.save_claude(me, "personal", "sk-ant-oat01-y", "key-personal")
+        sub = self.users.get(me).subscriptions[self.market.id]
+        self.users.subscribe(me, dataclasses.replace(sub, settings=Settings(switch_claude=switch)))
+
+    def worked_with(self, me) -> list[str]:
+        """The label of the Claude account each run worked with, once the developer's runs are done."""
+        labels = []
+
+        def fake_process(keys, project, actor, cfg, jira, github, **kw):
+            labels.append(actor.claude.label)
+            return "done", "ok"
+
+        pool = self.pool(fake_process)
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        return labels
+
+    def test_with_switching_on_a_run_starts_on_another_claude_account_and_the_page_says_which_is_active(self):
+        me = self.developer()
+        self.second_account(me, switch=True)
+        self.nearly_used(me, 3600)
+        labels = self.worked_with(me)
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+        self.assertEqual(labels, ["personal"])
+        user = self.users.get(me)
+        usage = accounts.AccountService(self.cfg, self.users, mock.Mock(), mock.Mock()).claude_usage(user)
+        page = home_page(self.cfg, user, [self.market], {}, self.runs.search(me, RunFilter()), "csrf", "nonce",
+                         claude_usage=usage)
+        self.assertIn(f"Active Claude account: <b>personal</b>. {ME} is at its limit: 98% of the 5-hour Claude limit is used",
+                      page)
+        self.assertIn('<small class="usage"><span class="tag warn">at its limit</span> 98% of the 5-hour Claude limit is used',
+                      page)  # on the Accounts tab
+
+    def test_with_switching_off_the_run_waits_for_its_own_claude_account(self):
+        me = self.developer()
+        self.second_account(me, switch=False)
+        self.nearly_used(me, 0.5)
+        labels = self.worked_with(me)
+        self.wait_for(lambda: "not started yet" in self.runs.recent(me)[0]["message"])
+        self.assertEqual(labels, [])
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+        self.assertEqual(labels, [ME])  # its own account, after the reset
+
+    def test_with_every_claude_account_at_its_limit_the_run_waits_and_takes_the_first_to_reset(self):
+        me = self.developer()
+        self.second_account(me, switch=True)
+        self.nearly_used(me, 3600)
+        self.nearly_used(me, 0.5, "personal")
+        labels = self.worked_with(me)
+        self.wait_for(lambda: "your other Claude accounts are at their limits too" in self.runs.recent(me)[0]["message"])
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+        self.assertEqual(labels, ["personal"])
+
+    def test_a_run_waits_queued_while_the_claude_limit_is_nearly_used_and_starts_after_the_reset(self):
+        me, started = self.developer(), []
+        self.nearly_used(me, 0.5)
+        pool = self.pool(fake_process_factory(started))
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.wait_for(lambda: "98% of the 5-hour Claude limit is used" in self.runs.recent(me)[0]["message"])
+        self.assertEqual((self.runs.recent(me)[0]["status"], started), ("queued", []))  # nothing cloned, nothing asked
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+        self.assertEqual(len(started), 1)
+
+    def test_work_that_asks_claude_nothing_is_not_held(self):
+        me = self.developer()
+        self.nearly_used(me, 3600)
+        pool = self.pool(fake_process_factory())
+        self.assertIsNone(pool.submit(self.market, ["acme/fe#1"], me, work=lambda *a, **kw: ("done", "approved"),
+                                      claude=False))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+
+    def test_a_run_held_by_the_claude_limit_can_be_stopped(self):
+        me, started = self.developer(), []
+        self.nearly_used(me, 3600)
+        pool = self.pool(fake_process_factory(started))
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me))
+        self.wait_for(lambda: "not started yet" in self.runs.recent(me)[0]["message"])
+        self.assertTrue(pool.stop_run(self.runs.recent(me)[0]["id"], me))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "stopped")
+        self.assertEqual(started, [])
+
+
+class BatchTest(QueueEnv):
+    def opening(self, prs: dict[str, list[str]], seen: list):
+        """A pipeline that opens the given PRs (repo names) per issue key, and hands them over."""
+        def fake_process(keys, project, actor, cfg, jira, github, only=(), announce=None, **kw):
+            seen.append((keys[0], only, bool(announce)))
+            opened = [(project.repo(name), f"https://github.com/{project.repo(name).github}/pull/{keys[0][-1]}")
+                      for name in prs.get(keys[0], [])]
+            if opened and announce:
+                announce(f"{keys[0]}: a bug", opened, keys[0])
+            return ("done", "ok") if opened else ("failed", "Claude made no changes")
+        return fake_process
+
+    def test_runs_started_together_get_one_review_request_once_the_last_has_ended(self):
+        me, seen = self.developer(), []
+        pool = self.pool(self.opening({"MAR-1": ["fe"], "MAR-2": ["fe", "services"]}, seen), start=False)
+        for key in ("MAR-1", "MAR-2", "MAR-3"):
+            self.assertIsNone(pool.submit(self.market, [key], me, repos=("fe", "gone"), batch=7))
+        with mock.patch.object(run_queue, "ask_for_reviews", return_value=("C0REVIEWS1", "9.9")) as ask, \
+             mock.patch.object(run_queue, "ask_for_review") as ask_one:
+            pool.start()
+            self.wait_for(lambda: ask.called)
+        ask.assert_called_once()  # MAR-3 failed: it is left out
+        ask_one.assert_not_called()
+        self.assertEqual([(title, repo.name, url.rsplit("/", 3)[1:]) for title, repo, url in ask.call_args.args[2]],
+                         [("MAR-1: a bug", "fe", ["fe", "pull", "1"]), ("MAR-2: a bug", "fe", ["fe", "pull", "2"]),
+                          ("MAR-2: a bug", "services", ["services", "pull", "2"])])
+        self.assertEqual(sorted(seen), [(f"MAR-{n}", ("fe",), True) for n in (1, 2, 3)])  # only the project's own repos
+        self.assertEqual(self.runs.batches(), [])  # asked once
+
+    def test_a_batch_with_one_run_that_opened_prs_asks_as_for_a_run_by_itself(self):
+        me, seen = self.developer(), []
+        pool = self.pool(self.opening({"MAR-2": ["fe"]}, seen), start=False)
+        for key in ("MAR-1", "MAR-2"):
+            self.assertIsNone(pool.submit(self.market, [key], me, batch=8))
+        with mock.patch.object(run_queue, "ask_for_reviews") as ask, mock.patch.object(run_queue, "ask_for_review") as ask_one:
+            pool.start()
+            self.wait_for(lambda: ask_one.called)
+        ask.assert_not_called()
+        self.assertEqual(ask_one.call_args.args[2], "MAR-2: a bug")
+        self.assertEqual(sorted(seen), [("MAR-1", (), True), ("MAR-2", (), True)])
+
+
+class NeverRunTest(QueueEnv):
+    def test_work_found_only_by_its_sprint_starts_only_if_never_run_before(self):
+        me = self.developer()
+        pool = self.pool(fake_process_factory([]))
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me, automatic=True, never_run=True))
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done")
+        self.assertEqual(pool.submit(self.market, ["MAR-1"], me, automatic=True, never_run=True), "already run before")
+        self.assertIsNone(pool.submit(self.market, ["MAR-1"], me, automatic=True))  # updated since: new work
+        self.wait_for(lambda: all(r["status"] == "done" for r in self.runs.recent(me)))
+
+
+class SequenceTest(QueueEnv):
+    def test_issues_run_one_after_another_each_after_the_delay(self):
+        me, events, release = self.developer(), [], threading.Event()
+
+        def fake_process(keys, project, actor, cfg, jira, github, **kw):
+            events.append(("start", keys[0], time.monotonic()))
+            if keys[0] == "MAR-1":
+                release.wait(5)
+            events.append(("end", keys[0], time.monotonic()))
+            if keys[0] == "MAR-2":
+                raise RuntimeError("tests still failing")  # a failed one does not stop the sequence
+            return "done", "ok"
+
+        pool = self.pool(fake_process)
+        items = [(self.market, [f"MAR-{n}"], "", (), None) for n in (1, 2, 3)]
+        self.assertEqual(pool.submit_sequence(items, me, 0.3), [None, None, None])
+        self.wait_for(lambda: events)
+        waiting = {r["issue_key"]: (r["status"], r["message"]) for r in self.runs.recent(me)}
+        self.assertEqual(waiting["MAR-2"], ("queued", "starts after the issue before it, 0.3s later"))
+        self.assertEqual([e[:2] for e in events], [("start", "MAR-1")])  # the others wait for it
+        release.set()
+        self.wait_for(lambda: all(r["status"] in ("done", "failed") for r in self.runs.recent(me)))
+        self.assertEqual([e[:2] for e in events], [(what, f"MAR-{n}") for n in (1, 2, 3) for what in ("start", "end")])
+        times = {e[:2]: e[2] for e in events}
+        for before, after in (("MAR-1", "MAR-2"), ("MAR-2", "MAR-3")):
+            self.assertGreaterEqual(times["start", after] - times["end", before], 0.3)
+        self.assertEqual(sorted(r["status"] for r in self.runs.recent(me)), ["done", "done", "failed"])
+
+    def test_an_issue_waiting_for_its_turn_can_be_stopped_and_the_next_still_runs(self):
+        me, started, release = self.developer(), [], threading.Event()
+        pool = self.pool(fake_process_factory(started, block=release))
+        items = [(self.market, [f"MAR-{n}"], "", (), None) for n in (1, 2, 3)]
+        self.assertEqual(pool.submit_sequence(items, me, 0), [None, None, None])
+        self.wait_for(lambda: started)
+        second = next(r["id"] for r in self.runs.recent(me) if r["issue_key"] == "MAR-2")
+        self.assertTrue(pool.stop_run(second, me))
+        self.wait_for(lambda: next(r for r in self.runs.recent(me) if r["id"] == second)["status"] == "stopped")
+        release.set()
+        self.wait_for(lambda: all(r["status"] in ("done", "stopped") for r in self.runs.recent(me)))
+        self.assertEqual([keys for _, keys in started], [("MAR-1",), ("MAR-3",)])
+
+    def test_a_sequence_goes_on_after_a_restart(self):
+        me = self.developer()
+        first = self.runs.add("MAR-1", me, self.market.id, "marketplace")
+        self.runs.add("MAR-2", me, self.market.id, "marketplace", follows=first, delay=0.2)
+        started = []
+        pool = self.pool(fake_process_factory(started))  # start() queues again what was waiting
+        self.wait_for(lambda: all(r["status"] == "done" for r in self.runs.recent(me)))
+        self.assertEqual([keys for _, keys in started], [("MAR-1",), ("MAR-2",)])
+        self.assertIsNotNone(pool)
+
+
 class StopAndPauseTest(QueueEnv):
     def test_stop_runs_stops_a_run_in_progress(self):
         me = self.developer()
@@ -972,7 +1252,7 @@ class StopAndPauseTest(QueueEnv):
         seen = []
 
         def asking(keys, project, actor, cfg, jira, github, cancel=None, note="", on_model=None, on_pr=None, asked=None,
-                   on_questions=None):
+                   on_questions=None, **kw):
             seen.append((note, asked))
             if not note:
                 on_questions({"MAR-1": ["Keep the old API?"]})
@@ -1112,3 +1392,153 @@ class SlackMembersTest(unittest.TestCase):
             slack_members("U012ABC3DE @majid.ali", "fe: reviewers")
         with self.assertRaisesRegex(UserError, "6 people; at most 5"):
             slack_members(" ".join(f"U00000000{n}" for n in range(6)), "fe: reviewers")
+
+
+class OperationsWebTest(WebTest):
+    """The run log, health check, rate limits, token warnings and activity, through the real server."""
+
+    def test_a_run_keeps_its_log_and_cost_for_its_developer_only(self):
+        self.sign_in()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        run_id = self.runs.add("MAR-1", uid, market.id, "marketplace")
+        self.runs.update(run_id, "done", "ok")
+        self.runs.set_record(run_id, 125, 0.4321, 12, "10:00:00 MAR-1: Claude analysing\n10:01:00 <b>tests</b> pass")
+        page = self.request("GET", "/")[2]
+        self.assertIn(f"Took: 2m05s · 12 Claude turns · $0.43 as Claude counts it · "
+                      f'<a href="/runs/log?run={run_id}"', page)
+        status, _, text = self.request("GET", f"/runs/log?run={run_id}")
+        self.assertEqual((status, self.headers["Content-Type"], self.headers["X-Content-Type-Options"]),
+                         (200, "text/plain; charset=utf-8", "nosniff"))
+        self.assertEqual(text, "10:00:00 MAR-1: Claude analysing\n10:01:00 <b>tests</b> pass")
+        sara = add_developer(self.users, "acc-sara")
+        theirs = self.runs.add("MAR-2", sara, market.id, "marketplace")
+        self.runs.set_record(theirs, 1, 0, 0, "secret of sara")
+        for path in (f"/runs/log?run={theirs}", "/runs/log?run=x", "/runs/log"):
+            self.assertEqual(self.request("GET", path)[0], 404)
+        self.runs.delete_finished(uid, [run_id])  # its log goes with it
+        self.assertEqual(self.request("GET", f"/runs/log?run={run_id}")[0], 404)
+        self.cookies.clear()
+        self.assertEqual(self.request("GET", f"/runs/log?run={theirs}")[0], 404)  # signed out
+
+    def test_health_says_only_ok(self):
+        self.assertEqual(self.request("GET", "/health"), (200, None, '{"status": "ok"}'))
+
+    def test_sign_in_and_webhook_are_rate_limited_per_client(self):
+        for _ in range(30):
+            self.assertEqual(self.request("GET", "/login/jira")[0], 303)
+        status, _, body = self.request("GET", "/login/jira")
+        self.assertEqual((status, body), (429, '{"status": "too many requests"}'))
+        self.assertTrue(1 <= int(self.headers["Retry-After"]) <= 60)
+        # Behind a proxy on this machine, each client is counted by the address the proxy gives.
+        self.assertEqual(self.request("GET", "/login/jira", headers={"X-Forwarded-For": "203.0.113.9"})[0], 303)
+        self.assertEqual(self.request("GET", "/health")[0], 200)  # other routes are not limited
+
+    def test_lost_jira_access_and_expiring_github_tokens_are_pointed_out(self):
+        self.sign_in()
+        me = self.me()
+        self.users.mark_jira_lost(me.jira_accounts[0].id)
+        self.github.user_and_expiry.side_effect = lambda: (self.github.user(), time.time() + 3 * 86400 + 60)
+        self.request("POST", "/github", {"csrf": self.csrf(), "github_token": "ghp_x"})
+        page = self.request("GET", "/")[2]
+        self.assertIn("Jira access of Majid was lost (expired or revoked): connect that account again under Accounts.", page)
+        self.assertIn("The GitHub token expires in 3 days (majid): save a new token under Accounts.", page)
+        self.assertIn('<span class="tag warn">access lost: connect it again</span>', page)
+        self.oauth_round_trip(self.connect())  # connecting it again mends it
+        self.assertFalse(self.me().jira_accounts[0].lost)
+
+    def test_what_is_done_to_the_account_is_listed_without_secrets(self):
+        self.sign_in()
+        csrf = self.csrf()
+        self.request("POST", "/github", {"csrf": csrf, "github_token": "ghp_secret", "github_label": "office"})
+        self.request("POST", "/pause", {"csrf": csrf})
+        activity = [what for _, what, _ in self.users.activity(self.me().id)]
+        self.assertEqual(activity, ["Paused automation", "Saved a GitHub token", "Signed in"])
+        page = self.request("GET", "/?tab=settings")[2]
+        self.assertIn("Saved a GitHub token <span class=muted>majid</span>", page)
+        self.assertNotIn("ghp_secret", page)
+
+
+class ShutdownTest(QueueEnv):
+    def test_stopping_lets_runs_finish_and_leaves_the_queued_ones_for_the_next_start(self):
+        me = self.developer()
+        started, release = threading.Event(), threading.Event()
+
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, **kw):
+            started.set()
+            release.wait(5)
+            return "done", "ok"
+
+        pool = self.pool(fake_process, workers=1)
+        pool.submit(self.market, ["MAR-1"], me)
+        started.wait(5)
+        pool.submit(self.market, ["MAR-2"], me)
+        threading.Timer(0.3, release.set).start()
+        self.assertEqual(pool.drain(30, threading.Event()), 0)  # MAR-1 finished by itself
+        statuses = {r["issue_key"]: r["status"] for r in self.runs.recent(me)}
+        self.assertEqual(statuses, {"MAR-1": "done", "MAR-2": "queued"})  # resumed at the next start
+        self.assertEqual([r["issue_key"] for r in self.runs.resume_after_restart()], ["MAR-2"])
+
+    def test_runs_still_working_when_time_is_up_are_stopped(self):
+        me = self.developer()
+        started = threading.Event()
+
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, **kw):
+            started.set()
+            while True:
+                cancel.wait(0.05)
+
+        pool = self.pool(fake_process, workers=1)
+        pool.submit(self.market, ["MAR-1"], me)
+        started.wait(5)
+        hurry = threading.Event()
+        hurry.set()  # stopped a second time: no waiting
+        self.assertEqual(pool.drain(600, hurry), 1)
+        self.assertEqual(self.runs.recent(me)[0]["status"], "stopped")
+
+    def test_a_run_records_what_it_logged_and_what_claude_reported(self):
+        me = self.developer()
+        logger = logging.getLogger("shadowdev")  # at INFO, as the server sets it up
+        self.addCleanup(logger.setLevel, logger.level)
+        logger.setLevel(logging.INFO)
+
+        def fake_process(keys, project, actor, cfg, jira, github, cancel=None, **kw):
+            logging.getLogger("shadowdev").info("%s: Claude analysing", keys[0])
+            runlog.add_usage(0.25, 4)
+            runlog.add_usage(0.5, 6)
+            return "done", "ok"
+
+        self.pool(fake_process).submit(self.market, ["MAR-1"], me)
+        self.wait_for(lambda: self.runs.recent(me)[0]["status"] == "done" and self.runs.recent(me)[0]["has_log"])
+        run = self.runs.recent(me)[0]
+        self.assertEqual((run["cost"], run["turns"]), (0.75, 10))
+        self.assertGreater(run["seconds"], 0)
+        self.assertRegex(self.runs.log(me, run["id"]), r"\d\d:\d\d:\d\d MAR-1: Claude analysing")
+        self.assertIsNone(self.runs.log(me + 1, run["id"]))
+
+
+class RateLimiterTest(unittest.TestCase):
+    def test_counts_per_client_route_and_minute(self):
+        limiter = RateLimiter({"/x": 2})
+        self.assertEqual([limiter.retry_after("a", "/x", 120.0) for _ in range(3)], [0, 0, 60])
+        self.assertEqual(limiter.retry_after("b", "/x", 130.0), 0)  # another client
+        self.assertEqual(limiter.retry_after("a", "/y", 130.0), 0)  # a route without a limit
+        self.assertEqual(limiter.retry_after("a", "/x", 175.0), 5)  # still that minute
+        self.assertEqual(limiter.retry_after("a", "/x", 180.0), 0)  # the next one
+
+
+class GitHubExpiryTest(unittest.TestCase):
+    def test_reads_githubs_expiration_header(self):
+        self.assertEqual(github_expiry("2030-01-02 03:04:05 UTC"), 1893553445.0)
+        self.assertEqual(github_expiry("2030-01-01 20:04:05 -0700"), 1893553445.0)
+        self.assertEqual((github_expiry(None), github_expiry("soon")), (0, 0))
+
+    def test_warns_a_week_ahead(self):
+        account = lambda expires: GitHubAccount(1, "office", "majid", "t", "M", "m@x", expires)
+        now = 1_000_000.0
+        self.assertEqual(account(0).expiry_warning(now), "")  # never expires
+        self.assertEqual(account(now + 30 * 86400).expiry_warning(now), "")
+        self.assertEqual(account(now + 86400 + 5).expiry_warning(now), "token expires in 1 day")
+        self.assertEqual(account(now + 3600).expiry_warning(now), "token expires today")
+        self.assertEqual(account(now - 1).expiry_warning(now), "token expired")
+        self.assertNotIn("'t'", repr(account(0)))  # the token is never in its repr

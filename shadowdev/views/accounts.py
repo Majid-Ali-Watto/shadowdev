@@ -3,13 +3,13 @@ from ..models.user import User
 from .components import card_head, esc, plural, remove_form, tag
 
 
-def accounts_panel(user: User, hidden: str) -> str:
+def accounts_panel(user: User, hidden: str, claude_usage: dict[int, tuple[str, bool]]) -> str:
     return f"""
 <p class="muted intro">Connect each account you work with, e.g. a personal and an office one of each. Every
   project you join says which ones it runs with.</p>
 {_jira_card(user, hidden)}
 {_github_card(user, hidden)}
-{_claude_card(user, hidden)}
+{_claude_card(user, hidden, claude_usage)}
 {_slack_card(user, hidden)}"""
 
 
@@ -17,10 +17,15 @@ def _count_tag(count: int) -> str:
     return tag(plural(count, "account") if count else "not connected", bool(count))
 
 
+def _warning(text: str) -> str:
+    return f' <span class="tag warn">{esc(text)}</span>' if text else ""
+
+
 def _jira_card(user: User, hidden: str) -> str:
     removable = len(user.jira_accounts) > 1  # the account signed in with can't leave the developer without one
     items = "".join(
         f'<li><span>{esc(a.display_name)}{f" <span class=muted>({esc(a.email)})</span>" if a.email else ""}'
+        f'{_warning("access lost: connect it again") if a.lost else ""}'
         f'<br><span class="muted">{esc(", ".join(s.name for s in a.sites) or "no Jira site")}</span></span>'
         f'{remove_form("/jira/remove", "jira_account_id", a.id, hidden, a.display_name) if removable else ""}</li>'
         for a in user.jira_accounts)
@@ -35,7 +40,8 @@ def _jira_card(user: User, hidden: str) -> str:
 
 def _github_card(user: User, hidden: str) -> str:
     items = "".join(
-        f'<li><span>{esc(g.label)} <span class="muted">@{esc(g.login)} · commits as {esc(g.git_name)}</span></span>'
+        f'<li><span>{esc(g.label)} <span class="muted">@{esc(g.login)} · commits as {esc(g.git_name)}</span>'
+        f'{_warning(g.expiry_warning())}</span>'
         f'{remove_form("/github/remove", "github_account_id", g.id, hidden, g.label)}</li>' for g in user.github_accounts)
     count = len(user.github_accounts)
     return f"""<section class="card">
@@ -56,9 +62,18 @@ def _github_card(user: User, hidden: str) -> str:
 </section>"""
 
 
-def _claude_card(user: User, hidden: str) -> str:
+def _claude_card(user: User, hidden: str, usage: dict[int, tuple[str, bool]]) -> str:
+    """Each account with what is known of its usage limits (from its last request)."""
+    def used(account_id: int) -> str:
+        text, held = usage.get(account_id, ("", False))
+        if not text:
+            return ""
+        flag = '<span class="tag warn">at its limit</span> ' if held else ""
+        return f'<small class="usage">{flag}{esc(text)}</small>'
+
     items = "".join(
-        f'<li><span>{esc(c.label)}</span>{remove_form("/claude/remove", "claude_account_id", c.id, hidden, c.label)}</li>'
+        f'<li><span>{esc(c.label)}{used(c.id)}</span>'
+        f'{remove_form("/claude/remove", "claude_account_id", c.id, hidden, c.label)}</li>'
         for c in user.claude_accounts)
     count = len(user.claude_accounts)
     return f"""<section class="card">

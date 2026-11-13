@@ -17,7 +17,8 @@ def render(req: Request, user: User, csrf: str, tab: str = "", error: str = "", 
     projects = req.app.project_service.visible(user)
     hooks = {p.id: req.app.project_service.webhook_secret(user, p) for p in projects if p.owner_id == user.id}
     page = home_page(req.app.cfg, user, projects, hooks, req.app.runs.search(user.id, run_filter or RunFilter()), csrf, nonce,
-                     theme=req.theme(), tab=tab, error=error, notice=notice, answering=answering)
+                     theme=req.theme(), tab=tab, error=error, notice=notice, answering=answering,
+                     claude_usage=req.app.accounts.claude_usage(user), activity=req.app.users.activity(user.id))
     req.html(page, nonce, status=status, cookies=cookies)
 
 
@@ -43,6 +44,16 @@ def runs(req: Request) -> None:
     if not session:
         return req.json(401, "signed out")
     req.html(run_results(req.app.runs.search(session[1], _run_filter(req)), session[2]))
+
+
+def run_log(req: Request) -> None:
+    """What was logged while one of the developer's own runs worked, as plain text."""
+    session = req.session()
+    run = req.arg("run")
+    log = req.app.runs.log(session[1], int(run)) if session and run.isdigit() else None
+    if log is None:
+        return req.json(404, "not found")  # also another developer's run, so IDs can't be probed
+    req.text(log)
 
 
 def _run_filter(req: Request) -> RunFilter:
@@ -71,6 +82,7 @@ def delete_account(req: Request, post: FormPost) -> None:
 ROUTES = {
     ("GET", "/"): show,
     ("GET", "/runs"): runs,
+    ("GET", "/runs/log"): run_log,
     ("POST", "/jira/remove"): action("jira-removed", lambda req, p: req.app.accounts.remove_jira(
         p.user, p.form.get("jira_account_id", ""))),
     ("POST", "/github"): action("github", lambda req, p: req.app.accounts.connect_github(
@@ -85,7 +97,9 @@ ROUTES = {
     ("POST", "/slack/remove"): action("slack-removed", lambda req, p: req.app.accounts.remove_slack(p.user)),
     ("POST", "/run"): action("queued", lambda req, p: req.app.run_service.request(
         p.user, p.form.get("issue_keys", ""), together=p.form.get("grouping") == "together",
-        project_id=p.form.get("project_id", ""), note=p.form.get("note", ""))),
+        project_id=p.form.get("project_id", ""), note=p.form.get("note", ""), change=p.form.get("change", "all"),
+        one_message=p.form.get("message") == "one", sequence=p.form.get("grouping") == "sequence",
+        delay_minutes=p.form.get("delay", ""))),
     ("POST", "/runs/delete"): action("runs-deleted", lambda req, p: req.app.run_service.delete(
         p.user, p.lists.get("run_id", []))),
     ("POST", "/stop"): action("stopping", lambda req, p: req.app.run_service.stop(p.user, p.form.get("run_id", ""))),

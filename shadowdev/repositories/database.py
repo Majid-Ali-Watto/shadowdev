@@ -1,16 +1,23 @@
 """The SQLite database: schema, migrations, connections, and encryption of stored secrets.
 
-Developers' Jira (OAuth), GitHub and Claude tokens and the projects' webhook secrets are
+Developers' Jira (OAuth), GitHub, Claude and Slack tokens and the projects' webhook secrets are
 encrypted with SHADOWDEV_SECRET_KEY (Fernet), so a copy of the database alone does not reveal
-them. A new connection per call keeps it safe to use from the web threads and the run workers.
+them. The key can be replaced: SHADOWDEV_SECRET_KEY then lists the new key and the old one
+("new,old"), the first encrypts and both decrypt, and `rotate` re-encrypts what is stored.
+A new connection per call keeps it safe to use from the web threads and the run workers.
 """
 import sqlite3
+import time
 from contextlib import closing
 from pathlib import Path
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
-VERSION = 11  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
+COPY_DAYS = 7  # how long copies of the database are kept: backups, and the one of an upgraded v1 database
+# Every column encrypted with the key: (table, column).
+ENCRYPTED = (("jira_accounts", "access_token"), ("jira_accounts", "refresh_token"), ("github_accounts", "token"),
+             ("claude_accounts", "token"), ("slack_accounts", "token"), ("projects", "webhook_secret"))
+VERSION = 15  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -35,7 +42,8 @@ CREATE TABLE IF NOT EXISTS jira_accounts (
     refresh_token BLOB NOT NULL,
     expires       REAL NOT NULL,
     profile_at    REAL NOT NULL DEFAULT 0,  -- when display_name/email were fetched from Atlassian
-    reported_at   REAL NOT NULL DEFAULT 0   -- last sent to Atlassian's personal data reporting
+    reported_at   REAL NOT NULL DEFAULT 0,  -- last sent to Atlassian's personal data reporting
+    lost          INTEGER NOT NULL DEFAULT 0  -- 1: Atlassian refused its grant; the developer must sign in again
 );
 CREATE INDEX IF NOT EXISTS jira_accounts_user ON jira_accounts (user_id);
 CREATE TABLE IF NOT EXISTS jira_account_sites (
@@ -51,6 +59,7 @@ CREATE TABLE IF NOT EXISTS github_accounts (
     token     BLOB NOT NULL,
     git_name  TEXT NOT NULL,
     git_email TEXT NOT NULL,
+    expires   REAL NOT NULL DEFAULT 0,  -- when GitHub said the token expires; 0: never, or not said
     UNIQUE (user_id, login)
 );
 CREATE TABLE IF NOT EXISTS claude_accounts (
@@ -133,12 +142,32 @@ CREATE TABLE IF NOT EXISTS runs (
     status     TEXT NOT NULL,  -- queued, running, stopping, stopped, done, skipped, failed
     message    TEXT NOT NULL DEFAULT '',
     note       TEXT NOT NULL DEFAULT '',  -- the developer's instructions for a run started by hand
-    model      TEXT NOT NULL DEFAULT '',  -- the Claude model(s) that worked on it, e.g. "haiku → sonnet (medium)"
+    model      TEXT NOT NULL DEFAULT '',  -- the Claude model(s) that worked on it, e.g. "haiku (high) → sonnet (high)"
     questions  TEXT NOT NULL DEFAULT '',  -- JSON {issue key: [questions]} it asked the developer (status "question")
+    repos      TEXT NOT NULL DEFAULT '',  -- the repos the developer chose to change, "fe,services"; '': Claude decides
+    batch      INTEGER,                   -- runs started together whose PRs get one review request, until it is posted
+    prs        TEXT NOT NULL DEFAULT '',  -- JSON [{title, repo, url, branch}]: its PRs waiting for that request
+    follows    INTEGER,                   -- the run it starts after (issues run one after another)
+    delay      REAL NOT NULL DEFAULT 0,   -- seconds between that run's end and its start
+    seconds    REAL NOT NULL DEFAULT 0,   -- how long it worked, once it has ended
+    cost       REAL NOT NULL DEFAULT 0,   -- US dollars, as Claude reported for its requests
+    turns      INTEGER NOT NULL DEFAULT 0,  -- Claude's turns in them
     updated    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_user ON runs (user_id, id);
 CREATE INDEX IF NOT EXISTS runs_status ON runs (status);
+CREATE TABLE IF NOT EXISTS run_logs (  -- what the server logged while a run worked, shown to its developer
+    run_id INTEGER PRIMARY KEY REFERENCES runs ON DELETE CASCADE,
+    log    TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS activity (  -- what a developer did to their account and projects: when and what, never a secret
+    id      INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    at      REAL NOT NULL,
+    action  TEXT NOT NULL,
+    detail  TEXT NOT NULL DEFAULT ''  -- a label, login or project name; nothing about a Jira account
+);
+CREATE INDEX IF NOT EXISTS activity_user ON activity (user_id, id);
 CREATE TABLE IF NOT EXISTS pull_requests (  -- PRs ShadowDev opened, watched for review comments and failing CI until they close
     id            INTEGER PRIMARY KEY,
     user_id       INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
@@ -190,6 +219,12 @@ ADDED_COLUMNS = (
     ("users", "limits", "TEXT NOT NULL DEFAULT '{}'"),  # 10
     ("projects", "status_rules", "TEXT"), ("subscriptions", "released_at", "REAL NOT NULL DEFAULT 0"),
     ("subscriptions", "release_report", "TEXT NOT NULL DEFAULT ''"),  # 11
+    ("runs", "repos", "TEXT NOT NULL DEFAULT ''"), ("runs", "batch", "INTEGER"), ("runs", "prs", "TEXT NOT NULL DEFAULT ''"),  # 12
+    ("runs", "follows", "INTEGER"), ("runs", "delay", "REAL NOT NULL DEFAULT 0"),  # 13
+    # 14: nothing added (a column added then was dropped again; databases that have it ignore it)
+    ("jira_accounts", "lost", "INTEGER NOT NULL DEFAULT 0"), ("github_accounts", "expires", "REAL NOT NULL DEFAULT 0"),  # 15
+    ("runs", "seconds", "REAL NOT NULL DEFAULT 0"), ("runs", "cost", "REAL NOT NULL DEFAULT 0"),
+    ("runs", "turns", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -198,7 +233,8 @@ class Database:
                  legacy_site_url: str | None = None):
         """`legacy_*`: where a v1 database's project files and Jira site were, to carry them over."""
         try:
-            self._fernet = Fernet(secret_key)
+            keys = [Fernet(key.strip()) for key in secret_key.split(",") if key.strip()]
+            self._fernet = MultiFernet(keys)  # the first key encrypts; every key decrypts
         except ValueError:
             raise SystemExit("SHADOWDEV_SECRET_KEY is not a valid key; see .env.example to generate one") from None
         self.path = path
@@ -224,12 +260,72 @@ class Database:
                             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     db.execute(f"PRAGMA user_version = {VERSION}")
         path.chmod(0o600)
+        self.forget_copies(older_than=time.time() - COPY_DAYS * 86400)
+
+    @property
+    def v1_backup(self) -> Path:
+        """The copy of the v1 database that `migrations.upgrade_from_v1` keeps."""
+        return self.path.with_name(self.path.name + ".v1-backup")
+
+    @property
+    def backups(self) -> Path:
+        """The folder of the copies `backup` makes."""
+        return self.path.with_name("backups")
+
+    def backup(self) -> Path:
+        """A copy of the database as it is now, safe to take while the server runs: data/backups/
+        shadowdev-<date>-<time>.db. Like the database, readable only by the user running ShadowDev,
+        and its tokens are as encrypted."""
+        self.backups.mkdir(exist_ok=True)
+        self.backups.chmod(0o700)
+        target = self.backups / f"shadowdev-{time.strftime('%Y%m%d-%H%M%S')}.db"
+        with closing(self.connect()) as conn, closing(sqlite3.connect(target)) as copy:
+            conn.backup(copy)
+        target.chmod(0o600)
+        return target
+
+    def forget_copies(self, older_than: float | None = None) -> None:
+        """Delete the copies of the database: the backups and the v1 one, with SQLite's files next to
+        them. They hold the developers' personal data and tokens as they were, so they all go when a
+        developer or a Jira account is erased and when the key is rotated, and each (`older_than`: a
+        time) once it is COPY_DAYS old, at startup."""
+        copies = [self.v1_backup, *self.backups.glob("shadowdev-*.db")]
+        for path in copies:
+            if path.exists() and (older_than is None or path.stat().st_mtime < older_than):
+                for suffix in ("", "-wal", "-shm"):
+                    path.with_name(path.name + suffix).unlink(missing_ok=True)
+
+    def rotate(self) -> int:
+        """Encrypt every stored secret again with the first key of SHADOWDEV_SECRET_KEY, in one
+        transaction, so the older keys can be removed from it. Copies of the database still open
+        with the old key, so they are deleted. Returns how many values were re-encrypted."""
+        count = 0
+        with closing(self.connect()) as conn:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")  # nothing is saved (a refreshed Jira token) between reading and writing
+            try:
+                for table, column in ENCRYPTED:  # fixed names, above
+                    for rowid, value in conn.execute(f"SELECT rowid, {column} FROM {table}").fetchall():  # noqa: S608
+                        try:
+                            fresh = self._fernet.rotate(value)
+                        except InvalidToken:
+                            raise SystemExit(f"a value in {table}.{column} opens with none of the keys in "
+                                             "SHADOWDEV_SECRET_KEY: is the old key still listed, after the new one?") from None
+                        conn.execute(f"UPDATE {table} SET {column} = ? WHERE rowid = ?", (fresh, rowid))  # noqa: S608
+                        count += 1
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        self.forget_copies()
+        return count
 
     def connect(self) -> sqlite3.Connection:
         """A new connection; use as `with closing(db.connect()) as conn, conn:` to commit."""
         conn = sqlite3.connect(self.path, timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA secure_delete=ON")  # deleted rows (names, emails, tokens) are overwritten, not left in free pages
         conn.execute("PRAGMA synchronous=NORMAL")  # safe with WAL; a crash loses at most the last commits
         return conn
 

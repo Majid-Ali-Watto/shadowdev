@@ -12,6 +12,8 @@ from ..models.tokens import Tokens
 from ..models.user import MODES, ClaudeAccount, GitHubAccount, JiraAccount, Site, SlackAccount, Subscription, User
 from .database import Database
 
+KEPT_ACTIVITY = 200  # entries of a developer's activity; older ones are dropped
+
 
 class AccountInUse(Exception):
     """The Jira account is already connected to another developer."""
@@ -39,7 +41,8 @@ class UserRepository:
             if row:
                 jira_id = row["id"]
                 conn.execute("UPDATE jira_accounts SET display_name = ?, email = ?, access_token = ?, refresh_token = ?, "
-                             "expires = ?, profile_at = ? WHERE id = ?", (display_name, email, *secret, time.time(), jira_id))
+                             "expires = ?, profile_at = ?, lost = 0 WHERE id = ?",
+                             (display_name, email, *secret, time.time(), jira_id))
             else:
                 jira_id = conn.execute(
                     "INSERT INTO jira_accounts (user_id, account_id, display_name, email, access_token, refresh_token, "
@@ -57,14 +60,17 @@ class UserRepository:
 
     def remove_jira_account(self, user_id: int, jira_account_id: int) -> None:
         """Also removes the subscriptions that used it (ON DELETE CASCADE). A developer named after
-        it is renamed after their next Jira account, so none of its personal data is left."""
+        it is renamed after their next Jira account, and their runs' logs (which name them) are
+        deleted, so none of its personal data is left."""
         with closing(self.db.connect()) as conn, conn:
             gone = conn.execute("DELETE FROM jira_accounts WHERE id = ? AND user_id = ? RETURNING display_name, email",
                                 (jira_account_id, user_id)).fetchone()
             if gone:
+                conn.execute("DELETE FROM run_logs WHERE run_id IN (SELECT id FROM runs WHERE user_id = ?)", (user_id,))
                 conn.execute("UPDATE users SET (display_name, email) = (SELECT display_name, email FROM jira_accounts "
                              "WHERE user_id = users.id ORDER BY id LIMIT 1) WHERE id = ? AND display_name = ? AND email = ? "
                              "AND EXISTS (SELECT 1 FROM jira_accounts WHERE user_id = users.id)", (user_id, *gone))
+        self.db.forget_copies()
 
     def update_jira_profile(self, jira_account_id: int, display_name: str, email: str) -> None:
         """The account's name and email as Atlassian has them now; the developer too, if named after it."""
@@ -106,9 +112,14 @@ class UserRepository:
 
     def save_jira_tokens(self, jira_account_id: int, tokens: Tokens) -> None:
         with closing(self.db.connect()) as conn, conn:
-            conn.execute("UPDATE jira_accounts SET access_token = ?, refresh_token = ?, expires = ? WHERE id = ?",
+            conn.execute("UPDATE jira_accounts SET access_token = ?, refresh_token = ?, expires = ?, lost = 0 WHERE id = ?",
                          (self.db.encrypt(tokens.access_token), self.db.encrypt(tokens.refresh_token), tokens.expires_at,
                           jira_account_id))
+
+    def mark_jira_lost(self, jira_account_id: int) -> None:
+        """Atlassian refused the account's grant: its developer is told to sign in again, on their page."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE jira_accounts SET lost = 1 WHERE id = ?", (jira_account_id,))
 
     def owner_of(self, account_id: str) -> int | None:
         """The developer an Atlassian account belongs to."""
@@ -118,14 +129,17 @@ class UserRepository:
 
     # GitHub and Claude accounts
 
-    def save_github(self, user_id: int, label: str, token: str, login: str, git_name: str, git_email: str) -> int:
-        """Add the account, or replace the token of the developer's account with this login."""
+    def save_github(self, user_id: int, label: str, token: str, login: str, git_name: str, git_email: str,
+                    expires: float = 0) -> int:
+        """Add the account, or replace the token of the developer's account with this login.
+        `expires`: when GitHub said the token expires (0: never, or it did not say)."""
         with closing(self.db.connect()) as conn, conn:
             return conn.execute(
-                "INSERT INTO github_accounts (user_id, label, login, token, git_name, git_email) VALUES (?, ?, ?, ?, ?, ?) "
+                "INSERT INTO github_accounts (user_id, label, login, token, git_name, git_email, expires) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (user_id, login) DO UPDATE SET label = excluded.label, token = excluded.token, "
-                "git_name = excluded.git_name, git_email = excluded.git_email RETURNING id",
-                (user_id, label, login, self.db.encrypt(token), git_name, git_email)).fetchone()[0]
+                "git_name = excluded.git_name, git_email = excluded.git_email, expires = excluded.expires RETURNING id",
+                (user_id, label, login, self.db.encrypt(token), git_name, git_email, expires)).fetchone()[0]
 
     def save_claude(self, user_id: int, label: str, token: str, config_key: str) -> int:
         """Add the account, or replace the token of the developer's account with this label (its
@@ -188,9 +202,11 @@ class UserRepository:
         for s in conn.execute("SELECT j.id, s.* FROM jira_accounts j JOIN jira_account_sites a ON a.jira_account_id = j.id "
                               "JOIN sites s ON s.cloud_id = a.cloud_id WHERE j.user_id = ? ORDER BY s.name", (uid,)):
             sites.setdefault(s["id"], []).append(Site(s["cloud_id"], s["url"], s["name"]))
-        jira = tuple(JiraAccount(j["id"], j["account_id"], j["display_name"], j["email"], tuple(sites.get(j["id"], ())))
+        jira = tuple(JiraAccount(j["id"], j["account_id"], j["display_name"], j["email"], tuple(sites.get(j["id"], ())),
+                                 bool(j["lost"]))
                      for j in conn.execute("SELECT * FROM jira_accounts WHERE user_id = ? ORDER BY id", (uid,)))
-        github = tuple(GitHubAccount(g["id"], g["label"], g["login"], self.db.decrypt(g["token"]), g["git_name"], g["git_email"])
+        github = tuple(GitHubAccount(g["id"], g["label"], g["login"], self.db.decrypt(g["token"]), g["git_name"], g["git_email"],
+                                     g["expires"])
                        for g in conn.execute("SELECT * FROM github_accounts WHERE user_id = ? ORDER BY id", (uid,)))
         claude = tuple(ClaudeAccount(c["id"], c["label"], self.db.decrypt(c["token"]), c["config_key"])
                        for c in conn.execute("SELECT * FROM claude_accounts WHERE user_id = ? ORDER BY id", (uid,)))
@@ -257,6 +273,23 @@ class UserRepository:
             row = conn.execute("SELECT limits FROM users WHERE id = ?", (user_id,)).fetchone()
         return Limits.from_json(row[0] if row else None)
 
+    # What the developer did (services record it; shown on their Settings tab)
+
+    def record(self, user_id: int, action: str, detail: str = "") -> None:
+        """`detail`: a label, login or project name. Never a secret, and nothing about a Jira account,
+        so removing one leaves none of its data here. The latest KEPT_ACTIVITY are kept."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("INSERT INTO activity (user_id, at, action, detail) VALUES (?, ?, ?, ?)",
+                         (user_id, time.time(), action, detail[:100]))
+            conn.execute("DELETE FROM activity WHERE user_id = ? AND id NOT IN "
+                         "(SELECT id FROM activity WHERE user_id = ? ORDER BY id DESC LIMIT ?)", (user_id, user_id, KEPT_ACTIVITY))
+
+    def activity(self, user_id: int, limit: int = 30) -> list[tuple[float, str, str]]:
+        """(when, what, detail) of what the developer did last, newest first."""
+        with closing(self.db.connect()) as conn:
+            return [tuple(r) for r in conn.execute(
+                "SELECT at, action, detail FROM activity WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))]
+
     def delete(self, user_id: int) -> list[str]:
         """Removes the developer with their accounts, sessions, subscriptions and runs. Each project
         they own passes to its longest-standing other member; one without other members is deleted.
@@ -267,4 +300,5 @@ class UserRepository:
                          "AND s.user_id != ? ORDER BY s.joined LIMIT 1) WHERE owner_id = ? AND EXISTS (SELECT 1 FROM "
                          "subscriptions s WHERE s.project_id = projects.id AND s.user_id != ?)", (user_id, user_id, user_id))
             conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        self.db.forget_copies()
         return keys
