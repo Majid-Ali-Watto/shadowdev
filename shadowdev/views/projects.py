@@ -4,7 +4,7 @@ import time
 from ..config import Config
 from ..models.project import Project
 from ..models.release import ReleaseReport
-from ..models.settings import Settings
+from ..models.settings import MAX_BRANCH_PATTERNS, Settings
 from ..models.user import Subscription, User
 from .components import esc, options, tag
 
@@ -20,6 +20,8 @@ SWITCHES = (
                                                          "and the PR says what it assumed"),
         ("regression_tests", "Prove bug fixes", "Bugs get a regression test, which must fail without the fix"),
         ("continue_reopened", "Work again on reopened issues", "Sent back with a comment: continue on its branch and PR (needs Comment on the ticket, to find its PRs)"),
+        ("switch_claude", "Switch Claude account at its limit", "When this project's Claude account reaches its usage limit, "
+                                                                "go on with another of your Claude accounts. Off: wait for the reset"),
     )),
     ("Jira", (
         ("jira_status", "Move the ticket", "In Progress, In Review, and back when a run fails"),
@@ -44,8 +46,9 @@ RELEASE_HOURS_LABELS = (("4", "Every 4 hours"), ("8", "Every 8 hours"), ("12", "
 PUBLISH_LABELS = (("pr", "Open a pull request"), ("draft", "Open a draft PR"), ("branch", "Only push the branch"))
 
 
-def projects_panel(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], hidden: str) -> str:
-    cards = "".join(project_card(user, p, hidden, secrets.get(p.id), cfg) for p in projects) or \
+def projects_panel(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], hidden: str,
+                   claude_usage: dict[int, tuple[str, bool]]) -> str:
+    cards = "".join(project_card(user, p, hidden, secrets.get(p.id), cfg, claude_usage) for p in projects) or \
         '<section class="card"><p class="muted">No projects on your Jira sites yet. Add the first one.</p></section>'
     return f"""
 <div class="row intro"><p class="muted">The projects on your Jira sites. Join one with the accounts it should use:
@@ -54,7 +57,8 @@ def projects_panel(cfg: Config, user: User, projects: list[Project], secrets: di
 {cards}"""
 
 
-def project_card(user: User, project: Project, hidden: str, secret: str | None, cfg: Config) -> str:
+def project_card(user: User, project: Project, hidden: str, secret: str | None, cfg: Config,
+                 claude_usage: dict[int, tuple[str, bool]]) -> str:
     sub = user.subscriptions.get(project.id)
     site = user.sites[project.cloud_id].name
     if not sub:
@@ -72,12 +76,31 @@ def project_card(user: User, project: Project, hidden: str, secret: str | None, 
   <div class="card-head"><h3>{esc(project.name)}</h3>{state}</div>
   <p class="muted">Jira {esc(", ".join(sorted(project.jira_projects)))} on {esc(site)} · repos {esc(repos)}</p>
   {owner}
-  {_subscription_form(user, project, sub, hidden)}
+  {_subscription_form(user, project, sub, hidden, _active_claude(user, sub, claude_usage))}
   {_release_checks(project, sub, hidden, bool(user.slack)) if sub else ""}
 </section>"""
 
 
-def _subscription_form(user: User, project: Project, sub: Subscription | None, hidden: str) -> str:
+def _active_claude(user: User, sub: Subscription | None, usage: dict[int, tuple[str, bool]]) -> str:
+    """Which Claude account the project's runs work with now: its own, or, while that is at its
+    usage limit and switching is on, the next of the developer's that is not."""
+    own = user.claude(sub.claude_account_id) if sub else None
+    if not own or len(user.claude_accounts) < 2:
+        return ""
+    held = lambda account: usage.get(account.id, ("", False))[1]
+    if not held(own):
+        return f'<p class="hint active">Active Claude account: <b>{esc(own.label)}</b>.</p>'
+    other = next((a for a in user.claude_accounts if a.id != own.id and not held(a)), None) if sub.settings.switch_claude else None
+    if other:
+        return (f'<p class="hint active">Active Claude account: <b>{esc(other.label)}</b>. {esc(own.label)} is at its limit: '
+                f'{esc(usage[own.id][0])}.</p>')
+    why = "your other Claude accounts are too" if sub.settings.switch_claude else "switching accounts is off"
+    return (f'<p class="hint active held">Active Claude account: none. <b>{esc(own.label)}</b> is at its limit: {esc(usage[own.id][0])}, '
+            f'and {why}. Runs wait for the reset.</p>')
+
+
+def _subscription_form(user: User, project: Project, sub: Subscription | None, hidden: str, active: str = "") -> str:
+    """`active`: which Claude account its runs work with now (_active_claude), shown under the accounts."""
     jira = [(a.id, f"{a.display_name} ({a.email})" if a.email else a.display_name)
             for a in user.jira_accounts if a.can_reach(project.cloud_id)]
     jira_field = (f'<input type="hidden" name="jira_account_id" value="{esc(jira[0][0])}">' if len(jira) == 1 else
@@ -102,6 +125,7 @@ def _subscription_form(user: User, project: Project, sub: Subscription | None, h
   <label>GitHub account <select name="github_account_id" required>{options(github, sub.github_account_id if sub else one(github), "Choose…")}</select></label>
   <label>Claude account <select name="claude_account_id" required>{options(claude, sub.claude_account_id if sub else one(claude), "Choose…")}</select></label>
 </div>
+{active}
 <div class="field"><span class="label">Automate</span><div class="choices">{modes}</div></div>
 <details class="more"><summary>Base branches</summary>
   <fieldset><legend>Work is branched from here and the PR goes into it</legend>{branches}</fieldset></details>
@@ -138,9 +162,35 @@ def _settings_fields(settings: Settings, project: Project) -> str:
            + choice("release_hours", "Check for complete tickets", "How often Move complete tickets (under Jira) "
                     "checks your tickets. Check now under Status rules runs it any time.", RELEASE_HOURS_LABELS,
                     " data-needs-release"))
+    def branches(name: str, label: str, hint: str, example: str) -> str:
+        field = f"set-{project.id}-{name}"
+        return f"""<div class="setting">
+      <div class="setting-text"><label for="{field}">{esc(label)}</label>
+        <p class="hint" id="{field}-hint">{esc(hint)}</p></div>
+      <input id="{field}" name="set:{name}" value="{esc(getattr(settings, name))}" placeholder="{esc(example)}"
+        maxlength="{MAX_BRANCH_PATTERNS}" spellcheck="false" autocomplete="off" aria-describedby="{field}-hint">
+    </div>"""
+
+    start = (branches("auto_statuses", "In one of these statuses", "Jira statuses, separated by commas. Empty: any.",
+                      "To Do, Backlog, Ready for Pickup, Reopened")
+             + f"""<div class="setting">
+      <div class="setting-text"><label for="set-{project.id}-auto_sprint">In an active sprint</label>
+        <p class="hint">Started and not ended. An issue in no sprint, or a future one, waits.</p></div>
+      <input type="checkbox" class="switch" role="switch" id="set-{project.id}-auto_sprint" name="set:auto_sprint"
+        {" checked" if settings.auto_sprint else ""}>
+    </div>""")
+    unreviewed = (branches("approve_from", "From branch", "The branch the PR comes from.", "release/*")
+                  + branches("approve_into", "Into branch", "The branch the PR is merged into.", "main, develop"))
     return f"""<details class="more automation"><summary>Automation</summary><input type="hidden" name="settings" value="1">
   <fieldset class="settings how"><legend>How</legend>{how}</fieldset>
-  {groups}</details>"""
+  {groups}
+  <fieldset class="settings how start"><legend>Start by itself only when</legend>
+    <p class="hint">For issues assigned to you that start by themselves (webhook, polling), with Start by itself on.
+      Run issues now starts any issue of yours.</p>{start}</fieldset>
+  <fieldset class="settings how"><legend>Approve without review</legend>
+    <p class="hint">A PR between these two branches is approved as you without being read, for changes that were
+      already reviewed (a release branch going into main). Branch names or patterns, separated by commas; both must
+      match. Leave them empty to review every PR.</p>{unreviewed}</fieldset></details>"""
 
 
 def _release_checks(project: Project, sub: Subscription, hidden: str, slack: bool) -> str:

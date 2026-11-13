@@ -35,6 +35,32 @@ class SettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a choice"):
             settings.from_form({"publish": "force-push"})
 
+    def test_the_conditions_for_starting_by_itself(self):
+        self.assertEqual((Settings().auto_statuses, Settings().auto_sprint), ("To Do, Backlog, Ready for Pickup, Reopened", True))
+        picked = settings.from_form({"auto_start": "on", "auto_statuses": " To Do ,  QA (ready) "})
+        self.assertEqual((picked.auto_statuses, picked.auto_sprint), ("To Do , QA (ready)", False))
+        for bad in ("To Do; DROP", "<b>", "x" * 201):
+            with self.assertRaisesRegex(ValueError, "not a list of Jira statuses"):
+                settings.from_form({"auto_statuses": bad})
+        active = {"customfield_10020": [{"state": "active", "boardId": 1}], "status": {"name": "to do"}}
+        self.assertIsNone(Settings().start_problem(active))
+        self.assertIsNone(picked.start_problem({**active, "status": {"name": "QA (ready)"}, "customfield_10020": None}))
+        self.assertEqual(Settings().start_problem({"status": {"name": "Done"}}), "its status Done is not one that starts by itself")
+
+    def test_branches_approved_without_a_review(self):
+        self.assertFalse(Settings().approves_unreviewed("release/15", "main"))  # none chosen: off
+        picked = settings.from_form({"review_approve": "on", "approve_from": " release/*,  hotfix/* ", "approve_into": "main"})
+        self.assertEqual((picked.approve_from, picked.approve_into), ("release/*, hotfix/*", "main"))
+        self.assertTrue(picked.approves_unreviewed("release/15", "main"))
+        self.assertTrue(picked.approves_unreviewed("hotfix/login", "main"))
+        self.assertFalse(picked.approves_unreviewed("feature/x", "main"))
+        self.assertFalse(picked.approves_unreviewed("release/15", "Main"))  # branch names are case-sensitive
+        self.assertEqual(Settings.from_json(picked.to_json()), picked)
+        self.assertEqual(Settings.from_json('{"approve_from": "a b; rm"}').approve_from, "")
+        for bad in ("release/* main", "<script>", "x" * 201):
+            with self.assertRaisesRegex(ValueError, "branch names"):
+                settings.from_form({"approve_from": bad})
+
 
 class ReloadTest(unittest.TestCase):
     def setUp(self):

@@ -26,6 +26,15 @@ class RulesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, error):
                 rules.parse_keys(bad)
 
+    def test_the_repos_a_run_may_change(self):
+        repos = ["fe", "market-place-services", "docs"]
+        self.assertEqual(rules.chosen_repos(repos, "all"), ())  # Claude decides
+        self.assertEqual(rules.chosen_repos(repos, "fe"), ("fe",))
+        self.assertEqual(rules.chosen_repos(repos, "be"), ("market-place-services",))
+        for change, names in (("be", ["web", "docs"]), ("everything", repos)):
+            with self.assertRaisesRegex(ValueError, "has no .* repo among"):
+                rules.chosen_repos(names, change)
+
     def test_issues_left_out_of_a_range(self):
         ten = [f"MAR-{n}" for n in range(1, 11)]
         without = lambda *gone: [k for k in ten if k not in gone]

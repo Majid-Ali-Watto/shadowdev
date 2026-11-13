@@ -149,6 +149,20 @@ FRONTEND_WORDS = {"fe", "frontend"}
 BACKEND_WORDS = {"be", "backend", "service", "services", "api"}
 
 
+CHANGES = ("fe", "be", "all")  # what a run started by hand may change: the FE repos, the BE repos, or any
+
+
+def chosen_repos(repo_names: list[str], change: str) -> tuple[str, ...]:
+    """The repos of `repo_names` a run may change: () when any (Claude decides). Raises ValueError
+    when the project has no such repo."""
+    if change == "all":
+        return ()
+    found = tuple(n for n in repo_names if repo_label(n) == change.upper())
+    if change not in CHANGES or not found:
+        raise ValueError(f"has no {change.upper()} repo among {', '.join(repo_names)}")
+    return found
+
+
 def repo_label(name: str) -> str:
     """How a repo is named on a ticket: FE or BE for a frontend or backend repo (fe, market-place-fe,
     services, backend…), else its own name."""

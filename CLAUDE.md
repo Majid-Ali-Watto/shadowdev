@@ -10,6 +10,9 @@ This file covers what to know before editing.
 
 ## Commands
 
+The Makefile has short names for these (`make` lists them): `make up`/`upd`/`down`, `dev`, `test`, `lint`,
+`check`, `dry`, `backup`, `rotate`.
+
 ```bash
 .venv/bin/python -m unittest            # all tests (~25 s); needs git, bwrap, prlimit on PATH
 .venv/bin/python -m unittest tests.test_server.WebTest.test_stop_button   # one test
@@ -45,7 +48,8 @@ app.py builds everything (build_app); server.py dispatches to routes.ROUTES[(met
   `RunPage` for searching Recent runs.
 - **automation/**: `pipeline.py` orders the steps, `prompts.py` is what Claude is asked and checks
   that its answers are usable, `verify.py` runs setup/test commands and compares them with the
-  base-branch baseline, `agent.py` runs the `claude` CLI, `sandbox.py` builds the bwrap command,
+  base-branch baseline, `agent.py` runs the `claude` CLI, `limits.py` holds runs the Claude account's usage limits would
+  cut off and waits for their reset, `sandbox.py` builds the bwrap command,
   `gitops.py` runs git.
 
 Keep to these boundaries when adding code; README "Adding things" lists where each kind of change goes.
@@ -67,17 +71,30 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
   - A branch is deleted only when its PR was merged and nothing was pushed since (`pipeline.earlier_work`).
   - PR review comments are instructions only from people with access to the repo
     (`review.REVIEWERS`), and only for the PR's own code. A PR is reviewed, and approved, only when
-    it is in a repo of the project whose Slack channel asked, and never the developer's own.
+    it is in a repo of the project whose Slack channel asked, and never the developer's own. A PR is
+    approved unread only between the branches the developer chose (`Settings.approves_unreviewed`),
+    after the same checks as a review.
   - Secrets from `.env` live only in `Config`, never in `os.environ`, so child processes can't
     inherit them. Child environments are allowlists (`sandbox.env`, `gitops._env`).
   - Git ignores hooks, fsmonitor and global config (`gitops.SAFE`). The GitHub token reaches git
     only through the credential helper's environment, never in a URL, argv or config.
-  - Tokens are stored encrypted (`db.encrypt`), and sessions are stored only as hashes.
+  - Tokens are stored encrypted (`db.encrypt`), and sessions are stored only as hashes. Token fields of
+    models are `field(repr=False)`, and log files are private (`logfiles.py`: `700`/`600`). A new
+    encrypted column is added to `database.ENCRYPTED`, or `rotate` would leave it under the old key.
+  - Copies of the database (`Database.backup`, the v1 one) are deleted by `forget_copies` whenever a
+    developer or a Jira account is removed, and when the key is rotated.
+  - A run's log and the activity list are shown only to their own developer. Activity never holds a
+    secret or Jira account data; run logs are deleted when one of the developer's Jira accounts goes.
+  - Routes anyone can call without signing in are rate limited (`routes/ratelimit.LIMITS`).
   - Every HTML value goes through `views.components.esc`. Notices are fixed strings looked up by key.
   - Pages run no script but `views/static/*.js` inlined by `components.script` with the CSP nonce: no inline
     handlers (`onclick=`), no other script sources.
   - Webhooks need a valid HMAC signature and a fresh timestamp, and are accepted only once.
   - A run's code is deleted when it ends (`pipeline.remove_code`); only a dry run keeps its change.
+    A run waiting for a Claude limit to reset has not ended; it waits at most `limits.RESETS_SOON`.
+    Its transcript is deleted from every Claude config dir it may have used (`agent.config_dirs`).
+  - A run uses another Claude account than its subscription's only with `Settings.switch_claude`
+    on (`Actor.spare_claudes`), and only the same developer's.
   - A developer can only act on issues assigned to them (to the Jira account of their
     subscription), re-checked against Jira before running.
   - Only a project's owner edits it, and only while their GitHub account can push to all its repos;
@@ -92,15 +109,20 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
   (pipeline, review, services.reviews, webhook, poller) through `actor.settings`. A new automation
   gets a switch, a line in `views/projects.SWITCHES`, and a test with it off.
 - Nothing posted to Jira, GitHub or Slack names ShadowDev, Claude, AI or a tool: it is the developer's
-  own, in the first person (prompts end with `VOICE`). A run's Jira comments start with one of
+  own, in the first person (prompts end with `VOICE`, `BRIEF` and `COMMENTS`: short answers and short code comments). A run's Jira comments start with one of
   `models/issue.RUN_COMMENT_STARTS` and are recognised by that and their author; a new kind of comment
   gets its start there. `test_nothing_posted_anywhere_names_a_tool` guards this.
 - Nothing project-specific in prompts or rules: a project's conventions come from its own files
   (`automation/guidance.py`), its commands, branches and statuses from the project's settings.
 - Issue keys become branch and directory names, so validate them with `rules.ISSUE_KEY_RE`.
+- A run started by hand changes only the repos its developer chose (`process_issues(only=)`): the
+  others are never tested or committed, whatever Claude edits there.
 - Schema changes bump `database.VERSION` and upgrade the previous version in `Database.__init__`,
   in one transaction, like `migrations.upgrade_from_v1` (DDL included: it uses an explicit `BEGIN`).
-- Log through `logging.getLogger("shadowdev")`. Every pipeline step is logged with the run's label.
+- Log through `logging.getLogger("shadowdev")`. Every pipeline step is logged with the run's label. What
+  is logged on a run's thread is also kept as its log (`automation/runlog.py`), so never log a secret.
+- Stopping the server is graceful (`RunQueue.drain`): a new background thread that starts work must
+  not leave it half-done when the process exits.
 
 ## Tests
 
@@ -114,7 +136,8 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
   `services.privacy.{report_accounts, access_token}`, `services.poller.jira_client`, `services.releases.{jira_client, Slack}`,
   `automation.pipeline.{ClaudeSession, Slack}`, `automation.review.{ClaudeSession, Slack}`,
   `services.reviews.{GitHub, Slack, address_review, fix_ci, review_pr}`.
-- `verify.BASELINES` caches baseline results across runs; tests clear it in `setUp`.
+- `verify.BASELINES` caches baseline results across runs; tests clear it in `setUp`. Tests that
+  record Claude usage clear `limits.USAGE` the same way.
 - `tests/__init__.py` points `tempfile` at one folder that is deleted when the tests end; keep using
   `tempfile.mkdtemp()` in tests, never a fixed path.
 - Don't name a module under `shadowdev/` `test*.py`: unittest discovery would import it as a test.

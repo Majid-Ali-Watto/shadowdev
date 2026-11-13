@@ -15,20 +15,72 @@ class RunRepository:
     def __init__(self, db: Database):
         self.db = db
 
-    def add(self, issue_key: str, user_id: int, project_id: int, project: str, note: str = "") -> int:
+    def add(self, issue_key: str, user_id: int, project_id: int, project: str, note: str = "", repos: str = "",
+            batch: int | None = None, follows: int | None = None, delay: float = 0) -> int:
+        """`repos`: the repos the developer chose to change, separated by commas; `batch`: the runs
+        whose PRs get one review request; `follows`: the run it starts `delay` seconds after."""
         with closing(self.db.connect()) as conn, conn:
             conn.execute("DELETE FROM runs WHERE user_id = ? AND status NOT IN ('queued', 'running', 'stopping') AND id NOT IN "
                          "(SELECT id FROM runs WHERE user_id = ? ORDER BY id DESC LIMIT ?)", (user_id, user_id, KEPT_RUNS - 1))
             return conn.execute(
-                "INSERT INTO runs (issue_key, user_id, project_id, project, note, status, updated) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', ?)",
-                (issue_key, user_id, project_id, project, note, time.time()),
+                "INSERT INTO runs (issue_key, user_id, project_id, project, note, repos, batch, follows, delay, status, "
+                "updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (issue_key, user_id, project_id, project, note, repos, batch, follows, delay, time.time()),
             ).lastrowid
 
     def update(self, run_id: int, status: str, message: str = "") -> None:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE runs SET status = ?, message = ?, updated = ? WHERE id = ?",
                          (status, message[:2000], time.time(), run_id))
+
+    def set_record(self, run_id: int, seconds: float, cost: float, turns: int, log: str) -> None:
+        """What a run that has ended took (see automation/runlog.py), and what was logged while it
+        worked: kept with the run, and deleted with it."""
+        with closing(self.db.connect()) as conn, conn:
+            if conn.execute("UPDATE runs SET seconds = ?, cost = ?, turns = ? WHERE id = ?",
+                            (seconds, cost, turns, run_id)).rowcount and log:
+                conn.execute("INSERT OR REPLACE INTO run_logs (run_id, log) VALUES (?, ?)", (run_id, log))
+
+    def log(self, user_id: int, run_id: int) -> str | None:
+        """What was logged while one of the developer's runs worked; None for another's, or without one."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT l.log FROM run_logs l JOIN runs r ON r.id = l.run_id WHERE r.id = ? AND r.user_id = ?",
+                               (run_id, user_id)).fetchone()
+        return row[0] if row else None
+
+    def ended_at(self, run_id: int) -> float:
+        """When the run ended; 0 when it is gone, or has not ended."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT updated FROM runs WHERE id = ? AND status NOT IN ('queued', 'running', 'stopping')",
+                               (run_id,)).fetchone()
+        return row["updated"] if row else 0
+
+    def set_prs(self, run_id: int, prs: list[dict]) -> None:
+        """The PRs the run opened, kept for the one review request of its batch."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE runs SET prs = ? WHERE id = ?", (json.dumps(prs), run_id))
+
+    def batches(self) -> list[int]:
+        with closing(self.db.connect()) as conn:
+            return [row[0] for row in conn.execute("SELECT DISTINCT batch FROM runs WHERE batch IS NOT NULL")]
+
+    def take_batch(self, batch: int) -> list[sqlite3.Row]:
+        """Once no run of the batch is queued or running: its runs that opened PRs, each returned
+        once (the batch is then over). Before that, and after, nothing."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM runs WHERE batch = ? AND status IN ('queued', 'running', 'stopping')",
+                            (batch,)).fetchone():
+                return []
+            rows = conn.execute("SELECT * FROM runs WHERE batch = ? AND prs != '' ORDER BY id", (batch,)).fetchall()
+            conn.execute("UPDATE runs SET batch = NULL, prs = '' WHERE batch = ?", (batch,))
+            return rows
+
+    def set_message(self, run_id: int, message: str) -> None:
+        """What a queued or running run waits for; "" when it no longer waits."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE runs SET message = ?, updated = ? WHERE id = ? AND status IN ('queued', 'running')",
+                         (message[:2000], time.time(), run_id))
 
     def delete_finished(self, user_id: int, run_ids: list[int]) -> int:
         """Remove the developer's own finished runs from their history; how many were removed. Runs that are
@@ -120,7 +172,8 @@ class RunRepository:
             total = conn.execute(f"SELECT COUNT(*) FROM runs r WHERE {sql_where}", args).fetchone()[0]  # noqa: S608
             f = replace(f, page=min(f.page, max(1, -(-total // PAGE_SIZE))))
             rows = conn.execute(
-                "SELECT r.*, s.url AS site_url FROM runs r LEFT JOIN projects p ON p.id = r.project_id "  # noqa: S608
+                "SELECT r.*, s.url AS site_url, EXISTS (SELECT 1 FROM run_logs l WHERE l.run_id = r.id) AS has_log "  # noqa: S608
+                "FROM runs r LEFT JOIN projects p ON p.id = r.project_id "
                 f"LEFT JOIN sites s ON s.cloud_id = p.cloud_id WHERE {sql_where} ORDER BY r.id DESC LIMIT ? OFFSET ?",
                 (*args, PAGE_SIZE, (f.page - 1) * PAGE_SIZE)).fetchall()
             projects = [row[0] for row in conn.execute(

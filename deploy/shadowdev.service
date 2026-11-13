@@ -1,0 +1,25 @@
+# ShadowDev as a systemd service. Install (as root), after editing User= and the paths:
+#   cp deploy/shadowdev.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now shadowdev
+# Then: systemctl status shadowdev, journalctl -u shadowdev -f, systemctl stop shadowdev.
+[Unit]
+Description=ShadowDev
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# A dedicated user, in none of the docker, sudo, lxd or adm groups (see README, Deployment checklist).
+User=shadowdev
+WorkingDirectory=/home/shadowdev/ShadowDev
+ExecStart=/home/shadowdev/ShadowDev/.venv/bin/python -m shadowdev
+# The user's toolchains (claude, node, uv) must be on PATH; add theirs here.
+Environment=PATH=/home/shadowdev/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=10
+# Stopping: SIGTERM to the server only, which lets runs in progress finish (up to 15 minutes) and
+# stops what they started itself; whatever is left after that is killed.
+KillMode=mixed
+TimeoutStopSec=16min
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

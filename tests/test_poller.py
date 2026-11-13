@@ -17,8 +17,14 @@ from tests.helpers import add_developer, add_project, join, make_cfg
 ME, SARA = "acc-majid", "acc-sara"
 
 
-def issue(key, type_="Bug", assignee=ME):
-    return {"key": key, "fields": {"issuetype": {"name": type_}, "assignee": {"accountId": assignee}}}
+ACTIVE = [{"id": 7, "name": "Sprint 7", "state": "active", "boardId": 1}]
+JUST_NOW = time.strftime("%Y-%m-%dT%H:%M:%S.000+0000", time.gmtime())
+
+
+def issue(key, type_="Bug", assignee=ME, status="To Do", sprint=ACTIVE, updated=JUST_NOW):
+    """An issue that starts by itself by default: To Do, in an active sprint, just updated."""
+    return {"key": key, "fields": {"issuetype": {"name": type_}, "assignee": {"accountId": assignee},
+                                   "status": {"name": status}, "customfield_10020": sprint, "updated": updated}}
 
 
 class PollerTest(unittest.TestCase):
@@ -58,11 +64,29 @@ class PollerTest(unittest.TestCase):
         # Asked as each developer's own Jira account, for its unresolved issues in the project.
         self.assertEqual(sorted(a for a, _ in self.jqls), [ME, SARA])
         self.assertEqual(self.jqls[0][1], 'project in (MAR, MARS) AND assignee = currentUser() AND statusCategory != Done '
-                                          'AND updated >= "-15m" ORDER BY updated ASC')
+                                          'AND (updated >= "-15m" OR sprint in openSprints()) ORDER BY updated ASC')
         # The next poll looks back to the last one, with a little overlap.
         self.jqls.clear()
         self.app.poller.poll(now + 30 * 60)
         self.assertIn('updated >= "-32m"', self.jqls[0][1])
+
+    def test_only_issues_meeting_the_start_conditions_start(self):
+        self.found[ME] = [issue("MAR-1"), issue("MAR-2", status="In Progress"), issue("MAR-3", sprint=None),
+                          issue("MAR-4", sprint=[{**ACTIVE[0], "state": "future"}]), issue("MAR-5", status="Backlog")]
+        with self.assertLogs("shadowdev", "INFO") as logs:
+            self.assertEqual(self.app.poller.poll(), 2)
+        self.assertEqual(sorted(k for _, (k,), uid in self.queued if uid == self.me), ["MAR-1", "MAR-5"])
+        self.assertTrue(any("MAR-4: not started by itself" in line and "has not started" in line for line in logs.output))
+
+    def test_an_issue_found_only_by_its_sprint_starting_starts_once(self):
+        # A sprint that starts changes none of its issues: they are found by being in it, and start
+        # only if never run before; one updated since the last poll is new work, as without a sprint.
+        long_ago = "2026-01-01T09:00:00.000+0000"
+        self.found[ME] = [issue("MAR-1", updated=long_ago), issue("MAR-2")]
+        calls = []
+        self.app.poller.queue = mock.Mock(submit=lambda project, keys, uid, **kw: calls.append((keys[0], kw["never_run"])))
+        self.app.poller.poll()
+        self.assertEqual(sorted(c for c in calls), [("MAR-1", True), ("MAR-2", False)])
 
     def test_paused_developers_and_failing_projects(self):
         self.app.users.set_paused(self.me, True)

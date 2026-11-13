@@ -3,7 +3,9 @@ and Claude accounts (e.g. personal and office), pause, and delete. Every token i
 against Jira, GitHub or Claude before it is saved."""
 import secrets
 import shutil
+import time
 
+from ..automation import limits as claude_limits
 from ..automation.agent import check_token, claude_config_dir, token_variable
 from ..clients.atlassian import AtlassianOAuth, access_token, jira_api_base
 from ..clients.github import GitHub, commit_identity
@@ -64,9 +66,11 @@ class AccountService:
                 and not any(a.account_id == me["accountId"] for a in user.jira_accounts):
             raise UserError(f"You can connect at most {MAX_ACCOUNTS} Jira accounts.")
         try:
-            return self.users.save_jira_account(user.id if user else None, me["accountId"],
-                                                me.get("displayName") or me["accountId"], me.get("emailAddress") or "",
-                                                sites, tokens)
+            user_id = self.users.save_jira_account(user.id if user else None, me["accountId"],
+                                                   me.get("displayName") or me["accountId"], me.get("emailAddress") or "",
+                                                   sites, tokens)
+            self.users.record(user_id, "Connected a Jira account" if user else "Signed in")
+            return user_id
         except AccountInUse:
             raise UserError("That Jira account is already connected to another ShadowDev account. To move it here, "
                             "sign in with it and delete that ShadowDev account first.") from None
@@ -80,13 +84,14 @@ class AccountService:
                             "To leave ShadowDev, delete your account.")
         self.queue.stop_runs(user.id, {p for p, s in user.subscriptions.items() if s.jira_account_id == account.id})
         self.users.remove_jira_account(user.id, account.id)
+        self.users.record(user.id, "Removed a Jira account")
 
     def connect_github(self, user: User, token: str, label: str = "") -> None:
         token = without_whitespace(token)
         if not token:
             raise UserError("Paste a GitHub personal access token.")
         try:
-            gh_user = GitHub(token).user()
+            gh_user, expires = GitHub(token).user_and_expiry()
         except HTTPError as e:
             raise UserError("GitHub did not accept this token." if e.status in (401, 403)
                             else f"Could not reach GitHub ({e.status}).") from None
@@ -94,7 +99,8 @@ class AccountService:
         if not known and len(user.github_accounts) >= MAX_ACCOUNTS:
             raise UserError(f"You can connect at most {MAX_ACCOUNTS} GitHub accounts.")
         name, email = commit_identity(gh_user)
-        self.users.save_github(user.id, clean_label(label, gh_user["login"]), token, gh_user["login"], name, email)
+        self.users.save_github(user.id, clean_label(label, gh_user["login"]), token, gh_user["login"], name, email, expires)
+        self.users.record(user.id, "Saved a GitHub token", gh_user["login"])
 
     def remove_github(self, user: User, github_account_id: str) -> None:
         account = user.github(form_id(github_account_id))
@@ -102,6 +108,7 @@ class AccountService:
             raise UserError("That GitHub account is not connected.")
         self.queue.stop_runs(user.id, {p for p, s in user.subscriptions.items() if s.github_account_id == account.id})
         self.users.remove_github(user.id, account.id)
+        self.users.record(user.id, "Removed a GitHub account", account.login)
 
     def connect_claude(self, user: User, token: str, label: str = "") -> None:
         """A token under a label the developer already has replaces that account's token."""
@@ -121,6 +128,13 @@ class AccountService:
                 shutil.rmtree(claude_config_dir(self.cfg, key), ignore_errors=True)
             raise UserError(f"Claude did not accept this token: {e}") from None
         self.users.save_claude(user.id, label, token, key)
+        self.users.record(user.id, "Saved a Claude token", label)
+
+    def claude_usage(self, user: User) -> dict[int, tuple[str, bool]]:
+        """Per Claude account of the developer: (its usage limits in words, "" when not known yet;
+        whether it is at a limit, so no run starts on it)."""
+        now = time.time()
+        return {c.id: claude_limits.USAGE.state(str(claude_config_dir(self.cfg, c)), now) for c in user.claude_accounts}
 
     def remove_claude(self, user: User, claude_account_id: str) -> None:
         account = user.claude(form_id(claude_account_id))
@@ -129,6 +143,7 @@ class AccountService:
         self.queue.stop_runs(user.id, {p for p, s in user.subscriptions.items() if s.claude_account_id == account.id})
         if self.users.remove_claude(user.id, account.id):
             shutil.rmtree(claude_config_dir(self.cfg, account), ignore_errors=True)
+        self.users.record(user.id, "Removed a Claude account", account.label)
 
     def connect_slack(self, user: User, token: str) -> None:
         """The developer's own Slack user token: review requests are posted, and mentions of them
@@ -141,14 +156,17 @@ class AccountService:
         except HTTPError as e:
             raise UserError(f"Slack did not accept this token ({e}). It needs the scopes {', '.join(SCOPES)}.") from None
         self.users.save_slack(user.id, token, me["user_id"], me.get("team") or "Slack")
+        self.users.record(user.id, "Saved a Slack token", me.get("team") or "Slack")
 
     def remove_slack(self, user: User) -> None:
         self.users.remove_slack(user.id)
+        self.users.record(user.id, "Removed the Slack account")
 
     def set_paused(self, user: User, paused: bool) -> None:
         """Paused: nothing runs for the developer (webhooks are ignored, queued runs are
         skipped, runs can't be started); a run in progress finishes. Settings are kept."""
         self.users.set_paused(user.id, paused)
+        self.users.record(user.id, "Paused automation" if paused else "Resumed automation")
 
     def set_limits(self, user: User, values: dict[str, str]) -> None:
         """The developer's timing and limits, as sent by the Settings form (see models.limits.from_form).
@@ -158,6 +176,7 @@ class AccountService:
         except ValueError as e:
             raise UserError(str(e)) from None
         self.queue.limits_changed()
+        self.users.record(user.id, "Changed timing and limits")
 
     def delete_account(self, user: User) -> None:
         """Stops the developer's runs in progress, then removes everything ShadowDev holds for
@@ -181,6 +200,7 @@ class AccountService:
             return self.delete_account(user)
         self.queue.stop_runs(user.id, {p for p, s in user.subscriptions.items() if s.jira_account_id == account.id})
         self.users.remove_jira_account(user.id, account.id)
+        self.users.record(user.id, "A Jira account was removed: it was closed at Atlassian")
 
     def refresh_jira_profile(self, account_id: str) -> None:
         """The account's name or email changed at Atlassian: fetch them again, as the account."""

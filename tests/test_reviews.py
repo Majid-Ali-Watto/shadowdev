@@ -34,8 +34,13 @@ def thread(author="sara", association="MEMBER", seconds_ago=600, resolved=False)
 class WatcherTest(unittest.TestCase):
     def setUp(self):
         self.jobs = []  # (project name, keys, developer, work, after)
-        queue = mock.Mock(submit=lambda project, keys, uid, work=None, after=None: self.jobs.append(
-            (project.name, keys, uid, work, after)))
+        self.asks_claude = []  # per job: whether the Claude account's usage limits may hold it
+
+        def submit(project, keys, uid, work=None, after=None, claude=True):
+            self.jobs.append((project.name, keys, uid, work, after))
+            self.asks_claude.append(claude)
+
+        queue = mock.Mock(submit=submit)
         self.app = build_app(make_cfg(Path(tempfile.mkdtemp())), mock.Mock(), queue)
         users, projects = self.app.users, self.app.projects
         self.me = add_developer(users, ME)
@@ -335,6 +340,18 @@ class WatcherTest(unittest.TestCase):
             work(self.market, user.actor(self.market.id), self.app.cfg, self.github, None, None)
             review_pr.assert_called_once()
 
+    def test_a_pr_approved_without_a_review_is_not_held_by_the_claude_limit(self):
+        self.poll()  # the first look
+        fe = "https://github.com/acme/fe/pull"
+        self.slack.history.return_value = [{"user": "U0000SARA0", "ts": "1800000010.000100", "text":
+                                            f"<@{MY_SLACK}> {fe}/1 {fe}/2"}]
+        join(self.app.users, self.me, self.market, ME, settings=Settings(approve_from="release/*", approve_into="main"))
+        branches = {1: ("release/15", "main"), 2: ("MAR-7", "release/15")}
+        self.github.pr.side_effect = lambda repo, number: {"head": {"ref": branches[number][0]},
+                                                           "base": {"ref": branches[number][1]}}
+        self.assertEqual(self.poll(), [("marketplace", ["acme/fe#1"]), ("marketplace", ["acme/fe#2"])])
+        self.assertEqual(self.asks_claude, [False, True])  # release/15 into main: approval only
+
     def test_only_the_chosen_repos_are_reviewed_and_the_asking_message_gets_reactions(self):
         self.poll()  # the first look
         fe, services = "https://github.com/acme/fe/pull", "https://github.com/acme/services/pull"
@@ -423,6 +440,15 @@ class ClientsTest(unittest.TestCase):
             github.create_review("acme/fe", 7, "COMMENT", "summary", [{"path": "a.py", "line": 3, "body": "b"}])
             self.assertEqual(calls[-1], ("POST", "https://api.github.com/repos/acme/fe/pulls/7/reviews", {
                 "event": "COMMENT", "body": "summary", "comments": [{"path": "a.py", "line": 3, "side": "RIGHT", "body": "b"}]}))
+
+
+class AskingWordsTest(unittest.TestCase):
+    def test_a_reply_asks_for_a_review_or_an_approval_in_words(self):
+        me, parent = "U0000ME000", "<@U0000SARA0> https://github.com/acme/app/pull/7"
+        for text in ("can you approve this?", "kindly approve", "approve these", "please review", "PTAL"):
+            self.assertEqual(reviews.asked_in_reply(f"<@{me}> {text}", parent, me), [("acme/app", 7)], text)
+        for text in ("no need to approve", "thanks", "it was approved yesterday"):
+            self.assertEqual(reviews.asked_in_reply(f"<@{me}> {text}", parent, me), [], text)
 
 
 if __name__ == "__main__":

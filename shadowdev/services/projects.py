@@ -207,6 +207,7 @@ class ProjectService:
         if not existing:
             claude = user.claude_accounts[0].id if len(user.claude_accounts) == 1 else None
             self.users.subscribe(user.id, Subscription(pid, jira_account.id, github_account.id, claude, "bugs", {}))
+        self.users.record(user.id, "Edited a project" if existing else "Added a project", name)
         return pid
 
     @staticmethod
@@ -225,6 +226,7 @@ class ProjectService:
         project = self.owned_project(user, project_id)
         self.queue.stop_runs(project_ids={project.id})
         self.projects.delete(project.id)
+        self.users.record(user.id, "Deleted a project", project.name)
 
     def webhook_secret(self, user: User, project: Project) -> str | None:
         """Shown to the owner, who sets up the Jira webhook."""
@@ -267,16 +269,27 @@ class ProjectService:
                 return f"{repo.name}: branch {branch!r} does not exist on {repo.github}."
             return None
 
+        def approval_problem() -> str | None:
+            """The branches approved without a review are ones that exist: a typo would never match."""
+            if not (chosen.approve_from or chosen.approve_into):
+                return None
+            existing = {b for r in project.repos for b in gitops.remote_branches(r.github, token)}
+            missing = automation.missing_branches(chosen, existing)
+            return (f"Approve without review: no branch of {', '.join(r.github for r in project.repos)} matches "
+                    f"{', '.join(missing)}.") if missing else None
+
         problems = [p for p in run_all(
             [lambda k=k: self._jira_problem(jira, k, site) for k in sorted(project.jira_projects)]
             + [lambda r=r: self._push_problem(github, github_account.login, r.github) for r in project.repos]
-            + [lambda r=r: branch_problem(r) for r in project.repos]) if p]
+            + [lambda r=r: branch_problem(r) for r in project.repos] + [approval_problem]) if p]
         if problems:
             raise UserError("Not saved:\n" + "\n".join(problems))
         self.users.subscribe(user.id, Subscription(project.id, jira_account.id, github_account.id, claude_account.id,
                                                    mode, bases, chosen))
+        self.users.record(user.id, "Saved the settings of a project", project.name)
 
     def leave(self, user: User, project_id: str) -> None:
         project = self.visible_project(user, project_id)
         self.queue.stop_runs(user.id, {project.id})
         self.users.unsubscribe(user.id, project.id)
+        self.users.record(user.id, "Left a project", project.name)

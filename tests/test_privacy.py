@@ -10,7 +10,7 @@ from unittest import mock
 from shadowdev.app import build_app
 from shadowdev.clients import atlassian
 from shadowdev.clients.rest import HTTPError
-from shadowdev.repositories.database import Database
+from shadowdev.repositories.database import VERSION, Database
 from shadowdev.services import accounts, privacy
 from tests.helpers import HOME, add_developer, add_project, join, make_cfg
 
@@ -150,7 +150,7 @@ class PrivacyReporterTest(unittest.TestCase):
             self.assertIn("questions", {r[1] for r in db.execute("PRAGMA table_info(runs)")})  # 9
             self.assertIn("status_rules", {r[1] for r in db.execute("PRAGMA table_info(projects)")})  # 11
             self.assertTrue({"released_at", "release_report"} <= {r[1] for r in db.execute("PRAGMA table_info(subscriptions)")})
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], VERSION)
 
 
 if __name__ == "__main__":

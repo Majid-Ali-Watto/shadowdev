@@ -38,7 +38,7 @@ def project_page(cfg: Config, user: User, form: dict, project: Project | None, s
 <span class="label">Repos</span>
 <div id="repos">{repos}</div>
 <button type="button" class="secondary" id="add-repo">Add another repo</button>
-<label>Slack channel for reviews <span class="muted">(optional: its ID)</span>
+<label>Slack channel for reviews <span class="optional">optional</span><span class="sub">The channel's ID</span>
   <input name="slack_channel" value="{v('slack_channel')}" placeholder="C012ABC3DE" spellcheck="false" autocomplete="off"></label>
 <p class="hint">Members who connected Slack ask there for review of the PRs ShadowDev opens, mentioning each repo's
   reviewers; and when one of them is mentioned there with a PR of this project, ShadowDev reviews it for them.</p>
@@ -46,7 +46,7 @@ def project_page(cfg: Config, user: User, form: dict, project: Project | None, s
   <label>Statuses to move an issue through when work starts <input name="start_statuses" value="{v('start_statuses')}" placeholder="In Progress"></label>
   <label>Statuses once the PR is open <input name="review_statuses" value="{v('review_statuses')}" placeholder="In Review"></label>
   <label>Root cause field <input name="root_cause_field" value="{v('root_cause_field')}" placeholder="customfield_10201 (empty: post it as a comment)" spellcheck="false"></label>
-  <label>Status rules <span class="muted">(members who switch on "Move complete tickets" get them)</span>
+  <label>Status rules<span class="sub">For members who switch on Move complete tickets</span>
     <textarea name="status_rules" spellcheck="false" placeholder="{esc(rules_text(DEFAULT_RULES))}">{v('status_rules')}</textarea></label>
   <p class="hint">One per line: <code>From status -&gt; To status: checks</code>. A ticket assigned to the member moves
     only once it passes the checks: {esc(", ".join(LABELS.values()))}. Root cause is checked on bugs only (the root cause
@@ -79,11 +79,11 @@ def _repo_fields(repo: dict) -> str:
     <label>Description for Claude <input name="repo_description" value="{v('description')}" placeholder="default: the GitHub description"></label>
     <label>Release branch prefix <input name="repo_release_prefix" value="{v('release_prefix')}" placeholder="release/" spellcheck="false"></label>
   </details>
-  <label>Setup command <span class="muted">(optional, once per run, e.g. npm ci)</span>
-    <textarea name="repo_setup" spellcheck="false">{v('setup')}</textarea></label>
-  <label>Test command <span class="muted">(optional; writes JUnit XML to $SHADOWDEV_REPORT_DIR)</span>
-    <textarea name="repo_test" spellcheck="false" placeholder="pytest --junitxml=&quot;$SHADOWDEV_REPORT_DIR/tests.xml&quot;">{v('test')}</textarea></label>
-  <label>Reviewers in Slack <span class="muted">(optional: member IDs mentioned when a PR of this repo needs review)</span>
+  <label>Setup command <span class="optional">optional</span><span class="sub">Run once per run, before the tests</span>
+    <textarea name="repo_setup" rows="1" spellcheck="false" placeholder="npm ci">{v('setup')}</textarea></label>
+  <label>Test command <span class="optional">optional</span><span class="sub">Writes JUnit XML to <code>$SHADOWDEV_REPORT_DIR</code></span>
+    <textarea name="repo_test" rows="1" spellcheck="false" placeholder="pytest --junitxml=&quot;$SHADOWDEV_REPORT_DIR/tests.xml&quot;">{v('test')}</textarea></label>
+  <label>Reviewers in Slack <span class="optional">optional</span><span class="sub">Member IDs, mentioned when a PR of this repo needs review</span>
     <input name="repo_reviewers" value="{v('reviewers')}" placeholder="U012ABC3DE, U045FGH6IJ" spellcheck="false" autocomplete="off"></label>
   <button type="button" class="secondary small" data-remove-repo>Remove repo</button>
 </fieldset>"""

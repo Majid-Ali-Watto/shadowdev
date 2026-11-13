@@ -89,6 +89,7 @@ class FakeClaude:
     new_test = NEW_TEST  # the test each change writes
     questions = []  # for the reporter, when the analysis may ask
     developer_questions = []  # for the developer, when it may ask them
+    repos = ["app"]  # the repos it finds the fix needs
     assumptions = []  # what it decided that the issue left open
 
     def ask(self, prompt, tools, schema):
@@ -99,7 +100,7 @@ class FakeClaude:
             assert (self.cwd / "app" / "calc.py").exists() and (self.cwd / "docs" / "README").exists()
             item = schema["properties"]["issues"]["items"]["properties"]
             asked = {name: getattr(self, name) for name in ("questions", "developer_questions") if name in item}
-            return {"repos": ["app"], "files": ["app/calc.py"], "assumptions": self.assumptions,
+            return {"repos": self.repos, "files": ["app/calc.py"], "assumptions": self.assumptions,
                     "issues": [{"key": k, "analysis": f"add() subtracts instead of adding ({k})", **asked}
                                for k in issue_keys(schema)]}
         (self.cwd / "app" / "calc.py").write_text(self.fixes.pop(0))
@@ -148,10 +149,10 @@ class PipelineTest(unittest.TestCase):
         self.github.create_pr.return_value = "https://github.com/o/r/pull/1"
         FakeClaude.instances = []
         FakeClaude.regression_tests, FakeClaude.new_test, FakeClaude.questions = ["app/test_add.py"], NEW_TEST, []
-        FakeClaude.developer_questions, FakeClaude.assumptions = [], []
+        FakeClaude.developer_questions, FakeClaude.assumptions, FakeClaude.repos = [], [], ["app"]
         # The model is chosen by a rating of the issue; here it is rated "standard" unless a test says otherwise.
         self.choose_model = pipeline.choose_model
-        patcher = mock.patch.object(pipeline, "choose_model", lambda session, issues, note, label: ("sonnet", "medium"))
+        patcher = mock.patch.object(pipeline, "choose_model", lambda session, issues, note, label: ("sonnet", "high"))
         patcher.start()
         self.addCleanup(patcher.stop)
         verify.BASELINES.clear()  # keyed by repo name and commit, which repeat across tests
@@ -280,20 +281,20 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("Totals are wrong", prompt)
         self.assertIn(note, prompt)
         claude = FakeClaude.instances[0]
-        self.assertEqual((claude.model, claude.effort), ("haiku", None))  # a simple issue: the small model
+        self.assertEqual((claude.model, claude.effort), ("haiku", "high"))  # a simple issue: the small model
         self.assertIn(f"<developer_note>\n{note}\n</developer_note>", claude.prompts[0][0])
         for text in (self.jira.comment.call_args_list[0].args[1], self.github.create_pr.call_args.kwargs["body"]):
             self.assertNotIn("leave sub() alone", text)  # the note is for Claude only
 
     def test_an_issue_that_cannot_be_rated_runs_with_the_default_model(self):
-        def session(model=None):
+        def session(model=None, effort=None):
             return mock.Mock(ask=mock.Mock(side_effect=RuntimeError("claude failed: model not available")))
 
         with self.assertLogs("shadowdev", "WARNING"):
             self.assertEqual(self.choose_model(session, [], "", "PROJ-1"), (None, None))
-        answers = {"complex": (None, None), "standard": ("sonnet", "medium"), "nonsense": (None, None)}
+        answers = {"complex": (None, None), "standard": ("sonnet", "high"), "nonsense": (None, None)}
         for rating, expected in answers.items():
-            def session(model=None, rating=rating):
+            def session(model=None, effort=None, rating=rating):
                 return mock.Mock(ask=lambda *a: {"complexity": rating})
             self.assertEqual(self.choose_model(session, [], "", "PROJ-1"), expected)
 
@@ -352,11 +353,11 @@ class PipelineTest(unittest.TestCase):
             return real_ask(self, prompt, tools, schema)
 
         models = []
-        with mock.patch.object(pipeline, "choose_model", lambda *a: ("haiku", None)), mock.patch.object(FakeClaude, "ask", ask):
+        with mock.patch.object(pipeline, "choose_model", lambda *a: ("haiku", "high")), mock.patch.object(FakeClaude, "ask", ask):
             status, _ = self.run_pipeline([WRONG_FIX, RIGHT_FIX], on_model=models.append)
         self.assertEqual(status, "done")
         self.assertEqual(idle, ["haiku"])
-        self.assertEqual(models, ["haiku", "haiku → sonnet (medium)", "haiku → sonnet (medium) → default"])
+        self.assertEqual(models, ["haiku (high)", "haiku (high) → sonnet (high)", "haiku (high) → sonnet (high) → default"])
         claude = FakeClaude.instances[0]  # one conversation throughout
         self.assertEqual((claude.model, claude.effort, len(FakeClaude.instances)), (None, None, 1))
 
@@ -505,7 +506,7 @@ class PipelineTest(unittest.TestCase):
         slack.post.assert_called_once_with(
             "C0REVIEWS1", "Review comments addressed. Kindly review this PR again.\n"
                           "• app: <https://github.com/acme/app/pull/1> <@U0000AAA1> <@U0000BBB2>\nThanks", "111.222")
-        self.assertEqual((self.fixer.model, self.fixer.effort), ("sonnet", "medium"))
+        self.assertEqual((self.fixer.model, self.fixer.effort), ("sonnet", "high"))
         self.assertEqual(self.code_left_on_server(), [])
 
     def test_review_fixes_that_fail_the_tests_are_not_pushed(self):
@@ -563,11 +564,11 @@ class PipelineTest(unittest.TestCase):
         self.assertIsNone(review.reviewed_by_others(pr, [], said("Sara"), "Majid"))  # the author answering
         self.assertIsNone(review.reviewed_by_others(pr, [], said("ci-bot", "NONE"), "Majid"))  # no access: a bot, a passer-by
 
-    def review(self, answer, author="sara"):
+    def review(self, answer, author="sara", head="PROJ-1", base="release/1.10"):
         self.github.pr.return_value = {
             "number": 1, "state": "open", "user": {"login": author}, "title": "PROJ-1: totals", "body": "Fixes add().",
-            "html_url": "https://github.com/acme/app/pull/1", "head": {"ref": "PROJ-1", "repo": {"full_name": "acme/app"}},
-            "base": {"ref": "release/1.10"}}
+            "html_url": "https://github.com/acme/app/pull/1", "head": {"ref": head, "repo": {"full_name": "acme/app"}},
+            "base": {"ref": base}}
         self.github.pr_diff.return_value = "--- a/calc.py\n+++ b/calc.py\n-    return a - b\n+    return a + b\n"
         self.github.review_threads.return_value = ("OPEN", self.THREADS[1:2])
         test = self
@@ -588,6 +589,39 @@ class PipelineTest(unittest.TestCase):
         with mock.patch.object(review, "ClaudeSession", Reviewer), self.local_github():
             return review.review_pr(self.project.repos[0], 1, ("C0REVIEWS1", "333.444"), self.project, self.actor,
                                     self.cfg, self.github)
+
+    def test_a_pr_between_the_chosen_branches_is_approved_without_a_review_or_a_word_in_slack(self):
+        slack = self.with_slack()
+        self.run_pipeline([RIGHT_FIX])
+        slack.post.reset_mock()
+        self.with_settings(approve_from="release/*, hotfix/*", approve_into="main")
+        with mock.patch.object(review, "ClaudeSession", side_effect=AssertionError("not reviewed")):
+            status, message, state = self.review({}, head="release/1.10", base="main")
+        self.assertEqual((status, state), ("done", "approved"))
+        self.assertEqual(message, "approved https://github.com/acme/app/pull/1 without a review: release/1.10 into main "
+                                  "needs approval only")
+        self.github.create_review.assert_called_once_with("acme/app", 1, "APPROVE", "")
+        slack.post.assert_not_called()  # the message that asked only gets its tick
+
+        # The rules of every review still hold: never the developer's own, nor one already approved.
+        self.github.create_review.reset_mock()
+        self.assertEqual(self.review({}, author="MAJID", head="release/1.10", base="main")[2], "closed")
+        self.github.latest_reviews.return_value = [{"author": "Sara", "association": "MEMBER", "state": "APPROVED"}]
+        self.assertEqual(self.review({}, head="release/1.10", base="main")[2], "closed")
+        self.github.latest_reviews.return_value = []
+        self.github.create_review.assert_not_called()
+
+        # Other branches are reviewed as ever: both must match.
+        commented = {"verdict": "comment", "comments": [{"path": "calc.py", "line": 2, "body": "Handle None."}],
+                     "summary": "Fixes the sign in add(); one case is not handled yet."}
+        self.assertEqual(self.review(commented, base="main")[2], "commented")  # from PROJ-1: not a release branch
+        self.with_settings(approve_from="PROJ-*", approve_into="main")
+        self.assertEqual(self.review(commented)[2], "commented")  # into release/1.10: not main
+        # Switched off (Approve as me off, or a branch not chosen), a PR between them is reviewed too.
+        self.with_settings(approve_from="PROJ-*", approve_into="release/*", review_approve=False)
+        self.assertEqual(self.review(commented)[2], "commented")
+        self.with_settings(approve_from="PROJ-*")
+        self.assertEqual(self.review(commented)[2], "commented")
 
     def test_a_pr_that_needs_nothing_is_not_approved_when_the_developer_approves_themselves(self):
         slack = self.with_slack()
@@ -670,6 +704,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(self.run_pipeline([RIGHT_FIX, RIGHT_FIX])[0], "done")
         prompts = [p for p, _ in FakeClaude.instances[0].prompts]
         self.assertEqual(len(prompts), 5)  # analyse, change, which tests, change the tests, which tests
+        self.assertIn("Add a regression test that reproduces it", prompts[1])
         self.assertIn("(app/test_add.py) also pass on the code without your fix", prompts[3])
         self.assertIn("**Regression test:** `app/test_add.py` passes without the fix too, so it does not prove the fix",
                       self.github.create_pr.call_args.kwargs["body"])
@@ -719,6 +754,73 @@ class PipelineTest(unittest.TestCase):
         analysis = FakeClaude.instances[-1].prompts[0][0]
         self.assertIn(f"- Majid (questions asked earlier): {asked}", analysis)
         self.assertIn("- Sara: The invoice total.", analysis)
+
+    def test_a_fix_that_needs_more_than_the_chosen_repos_asks_the_developer_once(self):
+        slack = self.with_slack()
+        FakeClaude.repos = ["app", "docs"]
+        reported = []
+        status, message = self.run_pipeline([RIGHT_FIX], only=("app",), on_questions=reported.append)
+        self.assertEqual(status, "question")
+        question = ("The fix needs changes in docs too, but you chose to change only app. Run it again with Change set "
+                    "to FE and BE to change them all, or as it is to keep to app.")
+        self.assertEqual(reported, [{"PROJ-1": [question]}])
+        self.assertEqual(slack.post.call_args.args[0], "U0000MEME0")  # the developer's own direct messages
+        self.assertIn("goes on:\n<https://office.atlassian.net/browse/PROJ-1|PROJ-1>: The fix needs changes in docs too",
+                      slack.post.call_args.args[1])
+        self.github.create_pr.assert_not_called()
+        analysis = FakeClaude.instances[0].prompts[0][0]
+        self.assertIn("The developer chose to change only app/ for this work. Still report in\n`repos` every repository",
+                      analysis)
+        self.assertEqual(len(FakeClaude.instances[0].prompts), 1)  # nothing was changed
+        # Run again as it is: their answer. It keeps to app, and the PR says what was left out.
+        status, _ = self.run_pipeline([RIGHT_FIX], only=("app",), asked={"PROJ-1": [question]}, on_questions=reported.append)
+        self.assertEqual((status, len(reported)), ("done", 1))
+        self.assertIn("The developer chose to change only app/: leave docs/ as it is", FakeClaude.instances[-1].prompts[1][0])
+        self.github.create_pr.assert_called_once()
+        self.assertEqual(self.github.create_pr.call_args.args[0], "acme/app")
+        self.assertIn("- Only app was changed, as chosen; the fix also needs changes in docs.",
+                      self.github.create_pr.call_args.kwargs["body"])
+
+    def test_a_fix_within_the_chosen_repos_or_with_asking_off_goes_on(self):
+        self.assertEqual(self.run_pipeline([RIGHT_FIX], only=("app",))[0], "done")  # Claude needs app only
+        self.assertNotIn("Assumptions", self.github.create_pr.call_args.kwargs["body"])
+        self.github.create_pr.reset_mock()
+        FakeClaude.repos = ["app", "docs"]
+        self.with_settings(ask_developer=False)
+        self.assertEqual(self.run_pipeline([RIGHT_FIX], keys=("PROJ-2",), only=("app",))[0], "done")
+        self.assertIn("Only app was changed, as chosen", self.github.create_pr.call_args.kwargs["body"])
+
+    def test_what_claude_changes_outside_the_chosen_repos_is_never_committed(self):
+        self.with_settings(ask_developer=False)  # not asked: it keeps to docs, though the fix is in app
+        self.assertEqual(self.run_pipeline([RIGHT_FIX] * 3, only=("docs",)), ("failed", "Claude made no changes"))  # it changed app/
+        self.github.create_pr.assert_not_called()
+
+    def test_a_run_of_a_batch_hands_its_prs_over_and_one_message_lists_them_by_repo(self):
+        slack = self.with_slack()
+        handed = []
+        self.assertEqual(self.run_pipeline([RIGHT_FIX], announce=lambda *pr: handed.append(pr))[0], "done")
+        slack.post.assert_not_called()  # asked for once, for all the runs started together
+        (title, ((repo, url),), branch), = handed
+        self.assertEqual((title, repo.name, url, branch),
+                         ("PROJ-1: Totals are wrong", "app", "https://github.com/o/r/pull/1", "PROJ-1"))
+        app, docs = self.project.repos
+        prs = [(title, app, "https://github.com/acme/app/pull/1"), ("PROJ-2: Docs say minus", docs, "https://github.com/acme/docs/pull/4"),
+               ("PROJ-2: Docs say minus", app, "https://github.com/acme/app/pull/2")]
+        self.assertEqual(pipeline.ask_for_reviews(self.actor, self.project, prs, "batch"), ("C0REVIEWS1", "111.222"))
+        browse = "https://office.atlassian.net/browse"
+        self.assertEqual(slack.post.call_args.args, ("C0REVIEWS1", f"""Kindly review these PRs:
+
+*app* <@U0000AAA1> <@U0000BBB2>
+• <{browse}/PROJ-1|PROJ-1>: Totals are wrong
+   <https://github.com/acme/app/pull/1>
+• <{browse}/PROJ-2|PROJ-2>: Docs say minus
+   <https://github.com/acme/app/pull/2>
+
+*docs*
+• <{browse}/PROJ-2|PROJ-2>: Docs say minus
+   <https://github.com/acme/docs/pull/4>
+
+Thanks"""))
 
     def test_a_technical_question_goes_to_the_developer_not_the_ticket(self):
         fields = self.jira.get_issue.return_value["fields"]
@@ -950,8 +1052,9 @@ class PipelineTest(unittest.TestCase):
         with mock.patch.object(pipeline, "choose_model", side_effect=AssertionError("not rated")):
             self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
         claude = FakeClaude.instances[0]
-        self.assertEqual((claude.model, claude.effort), ("haiku", None))
+        self.assertEqual((claude.model, claude.effort), ("haiku", "high"))
         self.assertEqual(len(claude.prompts), 2)  # analyse and change: no regression question
+        self.assertNotIn("regression test", claude.prompts[1][0])  # and none asked for
         self.assertNotIn("`questions`, for its reporter", claude.prompts[0][0])
         self.assertNotIn("Regression test", self.github.create_pr.call_args.kwargs["body"])
 

@@ -8,6 +8,7 @@ import math
 import random
 import threading
 import time
+from datetime import datetime
 
 from ..automation import rules
 from ..clients.atlassian import AtlassianOAuth, jira_client
@@ -22,6 +23,14 @@ log = logging.getLogger("shadowdev")
 OVERLAP_MINUTES = 2  # each poll looks a little further back than the last one, so nothing slips between
 MAX_ISSUES = 50  # per project and poll
 TICK_SECONDS = 60  # how often it looks for developers' projects due a poll
+
+
+def _updated(fields: dict) -> float:
+    """When Jira last changed the issue; 0 when it does not say."""
+    try:
+        return datetime.strptime(str(fields.get("updated")), "%Y-%m-%dT%H:%M:%S.%f%z").timestamp()
+    except ValueError:
+        return 0
 
 
 class Poller:
@@ -67,17 +76,28 @@ class Poller:
         # A project never polled before: the issues updated in the last interval (whole minutes, for the JQL).
         minutes = math.ceil(interval) if not last else int((now - last) / 60) + OVERLAP_MINUTES
         keys = ", ".join(sorted(project.jira_projects))  # validated: letters, digits and _
+        # Starting a sprint changes none of its issues: with an active sprint required, its issues
+        # are asked for too, and those not updated since the last poll start only if never run before.
+        sprint = " OR sprint in openSprints()" if actor.settings.auto_sprint else ""
         jql = (f'project in ({keys}) AND assignee = currentUser() AND statusCategory != Done '
-               f'AND updated >= "-{minutes}m" ORDER BY updated ASC')
+               f'AND (updated >= "-{minutes}m"{sprint}) ORDER BY updated ASC')
         jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
-        issues = jira.search(jql, ["issuetype", "assignee"], MAX_ISSUES)
+        issues = jira.search(jql, ["*navigable"], MAX_ISSUES)  # its sprint field's ID differs per site
         queued = 0
         for issue in issues:
             key, fields = issue.get("key") or "", issue.get("fields") or {}
-            if (rules.ISSUE_KEY_RE.match(key) and project.handles(key) and rules.assignee(fields) == actor.jira_account_id
-                    and rules.wanted(rules.issue_kind(fields), actor.mode)
-                    and self.queue.submit(project, [key], user.id, automatic=True) is None):
+            if not (rules.ISSUE_KEY_RE.match(key) and project.handles(key) and rules.assignee(fields) == actor.jira_account_id
+                    and rules.wanted(rules.issue_kind(fields), actor.mode)):
+                continue
+            problem = actor.settings.start_problem(fields)
+            if problem:
+                log.info("%s: not started by itself for %s: %s", key, user.display_name, problem)
+                continue
+            if self.queue.submit(project, [key], user.id, automatic=True,
+                                 never_run=_updated(fields) < now - minutes * 60) is None:
                 log.info("%s: queued for %s by polling", key, project.name)
                 queued += 1
+        log.info("polled Jira for %s in %s: %d issue(s) found, %d started", user.display_name, project.name,
+                 len(issues), queued)
         self.users.mark_polled(user.id, project.id, now)
         return queued

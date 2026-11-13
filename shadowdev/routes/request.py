@@ -33,6 +33,14 @@ class Request:
     def arg(self, name: str) -> str:
         return (self.query.get(name) or [""])[0]
 
+    def client(self) -> str:
+        """The address the request came from. Behind a reverse proxy or tunnel on this machine,
+        the one it added last to X-Forwarded-For; a client reaching the server directly can't
+        make up its own."""
+        peer = self.handler.client_address[0]
+        forwarded = (self.headers.get("X-Forwarded-For") or "").rsplit(",", 1)[-1].strip()
+        return forwarded if forwarded and peer in ("127.0.0.1", "::1") else peer
+
     # Reading
 
     def cookie(self, name: str) -> str | None:
@@ -98,8 +106,12 @@ class Request:
         h.end_headers()
         h.wfile.write(body)
 
-    def json(self, status: int, message: str) -> None:
-        self.send(status, json.dumps({"status": message}).encode(), "application/json")
+    def json(self, status: int, message: str, headers: list[tuple[str, str]] = ()) -> None:
+        self.send(status, json.dumps({"status": message}).encode(), "application/json", headers)
+
+    def text(self, text: str) -> None:
+        """Plain text, never read as anything else (nosniff), and not kept by the browser."""
+        self.send(200, text.encode(), "text/plain; charset=utf-8", [("Cache-Control", "no-store")])
 
     def html(self, html: str, nonce: str = "", status: int = 200, cookies: tuple[str, ...] = ()) -> None:
         headers = [

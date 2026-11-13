@@ -48,10 +48,11 @@ from .agent import (
     FIXED_MODELS,
     MODELS,
     READ_ONLY_TOOLS,
+    SMALL_MODEL_EFFORT,
     TRIAGE_MODEL,
     ClaudeSession,
-    claude_config_dir,
-    claude_env,
+    claude_envs,
+    config_dirs,
     forget_claude_sessions,
 )
 from .cancel import NEVER, Cancelled, CancelToken
@@ -176,6 +177,32 @@ def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tupl
     return thread or (channel, ts)
 
 
+def ask_for_reviews(actor: Actor, project: Project, entries: list[tuple[str, Repo, str]], label: str
+                    ) -> tuple[str, str] | None:
+    """One request, as the developer, for the PRs of several runs started together. `entries`:
+    (the run's title, the repo, its PR). A section per repo, headed by its name on tickets (FE, BE)
+    and its reviewers, with each PR under its issue. Returns (channel, timestamp) of the message;
+    None without Slack, or when it could not be posted."""
+    if not (actor.slack and project.slack_channel and entries):
+        return None
+    sections = []
+    for repo in project.repos:
+        prs = [(title, url) for title, r, url in entries if r.name == repo.name]
+        if not prs:
+            continue
+        head = f"*{rules.repo_label(repo.name)}* {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip()
+        lines = [f"• {link_issues(slack_escape(title), project.site_url, rules.ISSUE_KEYS_RE.findall(title.partition(': ')[0]))}"
+                 f"\n   {link(url)}" for title, url in prs]
+        sections.append("\n".join([head, *lines]))
+    try:
+        ts = Slack(actor.slack.token).post(project.slack_channel, "\n\n".join(["Kindly review these PRs:", *sections, "Thanks"]))
+    except HTTPError as e:
+        log.warning("%s: could not ask for review in Slack: %s", label, e)
+        return None
+    log.info("%s: review asked for in Slack, for %d PR(s)", label, len(entries))
+    return project.slack_channel, ts
+
+
 def notify_developer(actor: Actor, text: str, label: str, site_url: str = "", keys=()) -> None:
     """Tell the developer, in Slack, in their own direct messages (if they connected Slack), with
     the issue `keys` in it linked to their issues on `site_url`. Not fatal: the run's message on
@@ -219,21 +246,23 @@ def delete_tree(path: Path) -> None:
         log.error("%s could not be deleted completely; remove it by hand", path)
 
 
-def remove_code(workspace: Path, scratch: Path, claude_dir: Path) -> None:
+def remove_code(workspace: Path, scratch: Path, claude_dirs: list[Path]) -> None:
     delete_tree(workspace)
     delete_tree(scratch)
-    forget_claude_sessions(claude_dir, workspace)
+    for claude_dir in claude_dirs:
+        forget_claude_sessions(claude_dir, workspace)
 
 
 @contextmanager
-def run_folders(cfg: Config, project: Project, name: str, claude_dir: Path, keep_change: bool = False):
+def run_folders(cfg: Config, project: Project, name: str, claude_dirs: list[Path], keep_change: bool = False):
     """The folders of one run, as (workspace, scratch). The run's code lives only in the workspace
     (Claude's) and scratch (baselines, reports), side by side so Claude can't see scratch and
-    `git add -A` never picks it up. Both, and Claude's transcript, are deleted when the run ends,
-    however it ends; `keep_change` (a dry run) keeps only the workspace, for inspection."""
+    `git add -A` never picks it up. Both, and Claude's transcript (in `claude_dirs`: the config
+    dirs of the Claude accounts the run may work with), are deleted when the run ends, however it
+    ends; `keep_change` (a dry run) keeps only the workspace, for inspection."""
     workspace = cfg.worktree_root / workspace_name(project, name)
     scratch = cfg.worktree_root / f"{workspace.name}.shadowdev"
-    remove_code(workspace, scratch, claude_dir)  # left by a crashed earlier run
+    remove_code(workspace, scratch, claude_dirs)  # left by a crashed earlier run
     cfg.worktree_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     cfg.worktree_root.chmod(0o700)  # other local users must not read or write live code
     workspace.mkdir(mode=0o700)
@@ -242,9 +271,10 @@ def run_folders(cfg: Config, project: Project, name: str, claude_dir: Path, keep
     finally:
         if keep_change:
             delete_tree(scratch)
-            forget_claude_sessions(claude_dir, workspace)
+            for claude_dir in claude_dirs:
+                forget_claude_sessions(claude_dir, workspace)
         else:
-            remove_code(workspace, scratch, claude_dir)
+            remove_code(workspace, scratch, claude_dirs)
             log.info("%s: code removed from the server", name)
 
 
@@ -364,7 +394,8 @@ def choose_model(session, issues: list[Issue], note: str, label: str) -> tuple[s
     session of the run. A rating that fails is not fatal: the run then uses the Claude account's
     default model, as for a complex issue."""
     try:
-        complexity = session(model=TRIAGE_MODEL).ask(triage_prompt(issues, note), "", TRIAGE_SCHEMA).get("complexity")
+        complexity = session(model=TRIAGE_MODEL, effort=SMALL_MODEL_EFFORT).ask(
+            triage_prompt(issues, note), "", TRIAGE_SCHEMA).get("complexity")
     except RuntimeError as e:
         log.warning("%s: could not rate the issue, so the default model works on it: %s", label, e)
         complexity = None
@@ -443,12 +474,17 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
                    publish: bool = True, cancel: CancelToken = NEVER, note: str = "",
                    on_model: Callable[[str], None] = lambda models: None,
                    on_pr: Callable[..., None] = lambda *pr: None, asked: dict[str, list[str]] | None = None,
-                   on_questions: Callable[[dict[str, list[str]]], None] = lambda questions: None) -> tuple[str, str]:
+                   on_questions: Callable[[dict[str, list[str]]], None] = lambda questions: None,
+                   only: tuple[str, ...] = (), announce: Callable[..., None] | None = None) -> tuple[str, str]:
     """Work on the issues together, on one branch. `note`: the developer's own instructions for
     this run, given to Claude with the issues; `asked`: the questions an earlier run asked the
     developer, by issue key, which the note answers. `on_questions` is told the questions this run
-    asks the developer, when it stops for them. `on_model` is told which model(s) work on it,
-    e.g. "haiku → sonnet (medium)"; `on_pr` of each PR opened: (repo, its number, the branch, and
+    asks the developer, when it stops for them. `only`: the repos the developer chose to change
+    (none: the ones Claude finds the fix needs); when the fix needs another, they are asked once.
+    `announce(title, [(repo, PR)], branch)`: given, it is told the PRs to ask review for, and no
+    request is posted here (one is posted for all the runs started with this one).
+    `on_model` is told which model(s) work on it,
+    e.g. "haiku (high) → sonnet (high)"; `on_pr` of each PR opened: (repo, its number, the branch, and
     (channel, timestamp) of the Slack message that asked for its review, or None). Returns
     (status, message): status "done", "skipped", "waiting" (questions asked on the ticket),
     "question" (the developer is asked) or "failed". Raises on errors, and Cancelled when
@@ -461,7 +497,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     outcome = "failed"
     try:
         outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings, note, on_model,
-                                    on_pr, asked or {}, on_questions)
+                                    on_pr, asked or {}, on_questions, only, announce)
         return outcome, message
     except Cancelled:
         outcome = "stopped"
@@ -472,7 +508,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
 
 def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
              publish: bool, cancel: CancelToken, timings: Timings, note: str, on_model, on_pr, asked,
-             on_questions) -> tuple[str, str]:
+             on_questions, only: tuple[str, ...] = (), announce=None) -> tuple[str, str]:
     with timings.step("Jira and GitHub checks"):
         issues, skipped = select_issues(keys, project, actor, jira)
         for issue in list(issues):
@@ -534,14 +570,14 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
             for issue in issues:
                 move_issue(jira, issue.key, project.start_statuses)
 
-    claude_dir = claude_config_dir(cfg, actor.claude)
+    envs = claude_envs(cfg, actor)
     pushed: list[str] = []  # repos whose branch reached GitHub
     put_back = True
-    with run_folders(cfg, project, branch, claude_dir, keep_change=not publish) as (workspace, scratch):
+    with run_folders(cfg, project, branch, config_dirs(envs), keep_change=not publish) as (workspace, scratch):
         try:
-            outcome = _work(issues, skipped, branch, targets, continued, reopened, workspace, scratch, claude_dir,
+            outcome = _work(issues, skipped, branch, targets, continued, reopened, workspace, scratch, envs,
                             project, actor, cfg, jira, github, publish, cancel, timings, note, on_model, on_pr, pushed,
-                            asked, on_questions)
+                            asked, on_questions, only, announce)
             put_back = outcome[0] in ("failed", "waiting", "question")
             return outcome
         except Cancelled:
@@ -566,10 +602,10 @@ def tested(c: Checkout) -> str:
 
 
 def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tuple[Repo, str]],
-          continued: dict[str, dict | None], reopened: bool, workspace: Path, scratch: Path, claude_dir: Path,
+          continued: dict[str, dict | None], reopened: bool, workspace: Path, scratch: Path, envs: list[dict],
           project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub, publish: bool, cancel: CancelToken,
           timings: Timings, note: str, on_model, on_pr, pushed: list[str], asked: dict[str, list[str]],
-          on_questions) -> tuple[str, str]:
+          on_questions, only: tuple[str, ...] = (), announce=None) -> tuple[str, str]:
     """`targets`: (repo, the base branch its PR goes into). `continued`: the repos whose existing
     branch the run continues (see earlier_work); the others are cut from their base branch."""
     label = branch
@@ -599,8 +635,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
                      ", ".join(e.source for e in found[:8]) + (" …" if len(found) > 8 else ""))
 
     # 2. Per issue: root cause (bug) or plan (task) on the ticket; fix version for bugs.
-    session = partial(ClaudeSession, workspace, claude_env(actor.claude.token, claude_dir), label=label, cfg=cfg,
-                      cancel=cancel)
+    session = partial(ClaudeSession, workspace, envs[0], label=label, cfg=cfg, cancel=cancel, spares=envs[1:])
     if actor.settings.model == "auto":
         with timings.step("Claude model choice"):
             model, effort = choose_model(session, issues, note, label)
@@ -620,7 +655,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     with timings.step("Claude analysis"):
         answered = {i.key: asked[i.key] for i in issues if i.key in asked} if note else {}
         result = ask_usable(claude, analysis_prompt(issues, checkouts, note, may_ask, again, guides, may_ask_developer,
-                                                    answered),
+                                                    answered, only),
                             READ_ONLY_TOOLS, analysis_schema(issues, project.repos, may_ask, may_ask_developer),
                             lambda r: analysis_problem(r, keys_here), "analysis")
     analyses = {item["key"]: item["analysis"] for item in result["issues"]}
@@ -629,6 +664,18 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
                      if may_ask_developer and item["developer_questions"]}
     assumptions = result["assumptions"]
     target_repos = result["repos"]
+    # The developer chose the repos to change. What the fix needs beyond them is theirs to decide:
+    # they are asked once, and the run after that keeps to what they then chose.
+    beyond = [r for r in target_repos if only and r not in only]
+    if beyond and settings.ask_developer and not any(i.key in asked for i in issues):
+        for_developer.setdefault(issues[0].key, []).append(
+            f"The fix needs changes in {', '.join(beyond)} too, but you chose to change only {', '.join(only)}. Run it "
+            f"again with Change set to FE and BE to change them all, or as it is to keep to {', '.join(only)}.")
+    elif beyond:
+        target_repos = [r for r in target_repos if r in only] or list(only)
+        assumptions = [*assumptions, f"Only {', '.join(target_repos)} was changed, as chosen; the fix also needs "
+                                     f"changes in {', '.join(beyond)}."]
+    work_on = [c for c in checkouts if not only or c.repo.name in only]  # what is outside is never committed
     cancel.check()
     if questions:
         with timings.step("Jira questions"):
@@ -674,13 +721,13 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     # 3. Change, test every changed repo, self-heal.
     log.info("%s: Claude making the change in %s", label, ", ".join(target_repos))
     with timings.step("Claude change"):
-        summary = ask_usable(claude, change_prompt(issues, target_repos), EDIT_TOOLS, CHANGE_SCHEMA,
-                             summary_problem, "summary")["summary"]
-    to_ship, summary, failures = heal(claude, checkouts, scratch, cfg, label, timings, cancel, summary, stronger,
-                                      redo=change_prompt(issues, target_repos))
+        change = change_prompt(issues, target_repos, settings.regression_tests, beyond)
+        summary = ask_usable(claude, change, EDIT_TOOLS, CHANGE_SCHEMA, summary_problem, "summary")["summary"]
+    to_ship, summary, failures = heal(claude, work_on, scratch, cfg, label, timings, cancel, summary, stronger,
+                                      redo=change)
     proof = ""
     if settings.regression_tests and to_ship and not failures and any(i.kind == "bug" for i in issues):
-        to_ship, failures, proof = prove_regression(claude, checkouts, to_ship, scratch, cfg, label, timings, cancel,
+        to_ship, failures, proof = prove_regression(claude, work_on, to_ship, scratch, cfg, label, timings, cancel,
                                                     stronger)
     if not to_ship:
         if settings.jira_comments:
@@ -779,7 +826,10 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     asked = None
     if settings.slack_review_request and settings.publish == "pr":  # a draft is not ready for review yet
         with timings.step("Slack review request"):
-            asked = ask_for_review(actor, project, title, opened, label, again=bool(continued))
+            if announce:  # one request for all the runs started with this one, once the last has ended
+                announce(title, opened, branch)
+            else:
+                asked = ask_for_review(actor, project, title, opened, label, again=bool(continued))
     for repo, pr_url in new:  # an updated PR is watched already
         on_pr(repo, int(pr_url.rstrip("/").rsplit("/", 1)[1]), branch, asked)
     unreported = []

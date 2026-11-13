@@ -1,13 +1,18 @@
 """The Runs tab: run issues by hand, and the developer's recent runs."""
 import json
+import re
 import time
 
 from ..automation.rules import MAX_NOTE_CHARS
+from ..automation.timing import duration
 from ..models.project import Project
 from ..models.run import ACTIVE, KINDS, MAX_SEARCH, PAGE_SIZE, STATUSES, RunPage
 from .components import csrf_field, esc, options, plural
 
 SHORT_MESSAGE = 90  # a longer message, or one with a model or note, folds to its first line until opened
+# Links in a run's message (escaped already): PRs, and where to open one by hand.
+URL_RE = re.compile(r"https://[A-Za-z0-9./_#?=%~+:-]+[A-Za-z0-9/_#=%~+-]")
+PR_URL_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 
 def runs_panel(max_parallel_runs: int, joined: list[Project], runs: RunPage, csrf: str, answering=None) -> str:
@@ -30,32 +35,44 @@ def runs_panel(max_parallel_runs: int, joined: list[Project], runs: RunPage, csr
     together = ", " in keys
     return f"""<section class="card">
   <div class="card-head"><h3>Run issues now</h3></div>
-  <p class="muted">New assignments start automatically. Use this for issues that were assigned to you
-    before you joined. Up to {max_parallel_runs} of your runs work at the same time (Settings); more wait their turn.
-    An issue that already has a ShadowDev branch on GitHub is skipped, unless it was sent back with a
-    comment saying what is still wrong: then it continues on that branch. To start it over, close its PR
-    and delete its branch.</p>
+  <p class="muted">For issues assigned to you before you joined. New assignments start by themselves; up to
+    {max_parallel_runs} of your runs work at the same time.</p>
   <form method="post" action="/run" id="run-form">{hidden}
-<label>Issue keys <span class="muted">(separated by commas, and ranges like <code>MAR-1 to MAR-10</code>, leaving
-  some out with <code>except MAR-3, MAR-7</code> or <code>!MAR-3</code>. Of a range, only the issues assigned to you,
-  of a type you automate, are run)</span>
+<label>Issue keys<span class="sub">Separated by commas, with ranges: <code>MAR-1 to MAR-10 except MAR-3</code>. Of a
+  range, only the issues assigned to you run.</span>
   <input name="issue_keys" value="{esc(keys)}" placeholder="MAR-123, MAR-124, MAR-1 to MAR-10 except MAR-3" required spellcheck="false" autocomplete="off"></label>
 {project_pick}
 {questions}
-<label>Note for Claude <span class="muted">(optional: anything the tickets don't say, e.g. where to look or
-  what to leave alone. Start a line with a key, like <code>MAR-123:</code>, for a note that is only for
-  that issue; lines before those are for all of them)</span>
+<label>Note for Claude <span class="optional">optional</span><span class="sub">What the tickets don't say: where to
+  look, what to leave alone. A line starting <code>MAR-123:</code> is for that issue only.</span>
   <textarea name="note" maxlength="{MAX_NOTE_CHARS}" placeholder="Don't change the API.&#10;MAR-123: the bug is in the checkout total, not the cart."{" autofocus" if asked else ""}>{esc(note)}</textarea></label>
+<div class="grid">
+  <label>Change<span class="sub">If the fix needs more, you are asked in Slack first</span><select name="change">
+    <option value="fe" selected>FE only</option><option value="be">BE only</option><option value="all">FE and BE</option>
+  </select></label>
+  <label>Review request in Slack<span class="sub">One lists every PR under FE and BE</span><select name="message">
+    <option value="one" selected>One message for all issues</option><option value="each">A message for each issue</option>
+  </select></label>
+</div>
 <div class="field"><span class="label">With more than one issue</span>
-  <div class="choices">
+  <div class="choices three">
     <label class="choice"><input type="radio" name="grouping" value="separate"{"" if together else " checked"}>
-      <span>Separately<small>A branch and PR for each issue, worked on in parallel</small></span></label>
+      <span>In parallel<small>A branch and PR each, all at once</small></span></label>
+    <label class="choice"><input type="radio" name="grouping" value="sequence">
+      <span>One after another<small>A branch and PR each, in the order given</small></span></label>
     <label class="choice"><input type="radio" name="grouping" value="together"{" checked" if together else ""}>
-      <span>Together<small>One branch for all of them, one PR per changed repo (same project); each ticket
-        still gets its own analysis and comments</small></span></label>
+      <span>Together<small>One branch, one PR per repo</small></span></label>
   </div>
 </div>
-<div class="actions"><button>Run</button></div>
+<div class="setting delay">
+  <div class="setting-text"><label for="run-delay">Minutes between issues</label>
+    <p class="hint">After an issue has ended, the next one starts this much later.</p></div>
+  <div class="unit-input"><input id="run-delay" name="delay" type="number" min="0" max="240" step="any" value="0"
+    inputmode="decimal"><span>min</span></div>
+</div>
+<div class="actions"><button>Run</button>
+  <p class="hint">An issue that already has its branch is skipped unless it was sent back. To start one over, close
+    its PR and delete its branch.</p></div>
   </form>
 </section>
 
@@ -66,7 +83,7 @@ def runs_panel(max_parallel_runs: int, joined: list[Project], runs: RunPage, csr
   {_filters(runs)}
   <p class="sr-only" id="runs-status" role="status"></p>
   <div id="runs-results">{run_results(runs, csrf)}</div>
-</section>"""
+</section>"""  # noqa: S608 (HTML with <select>, not SQL)
 
 
 SEARCH_ICON = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" '
@@ -152,7 +169,7 @@ def _rows(runs: RunPage, csrf: str) -> str:
         f'<tr><td class="pick">{_pick(r)}</td><td class="issue">{_issue_links(r)}</td><td>{esc(r["project"])}</td>'
         f'<td class="state"><span class="badge {esc(r["status"])}">{esc(r["status"])}</span>{_stop_button(r, hidden)}</td>'
         f'<td class="msg">{_details(r)}</td>'
-        f'<td class="when">{esc(time.strftime("%Y-%m-%d %H:%M", time.localtime(r["updated"])))}</td></tr>'
+        f'<td class="when">{_when(r["updated"])}</td></tr>'
         for r in runs.rows
     ) or f'<tr><td colspan="6" class="empty">{empty}</td></tr>'
 
@@ -170,11 +187,41 @@ def _details(run) -> str:
     """The run's message; with more to it (a long message, the model, the developer's note), an
     accordion showing the first line until opened. data-run lets the page keep it open across refreshes."""
     message = run["message"] or ""
-    extras = _extra(run, "model", "Model") + _extra(run, "note", "Your note")
+    extras = _extra(run, "model", "Model") + _extra(run, "note", "Your note") + _took(run)
     if not extras and len(message) <= SHORT_MESSAGE and "\n" not in message:
-        return esc(message)
-    return (f'<details class="run-details" data-run="{esc(run["id"])}"><summary><span class="line">{esc(message)}</span>'
+        return _linked(message)
+    return (f'<details class="run-details" data-run="{esc(run["id"])}"><summary><span class="line">{_linked(message)}</span>'
             f'</summary>{extras}</details>')
+
+
+def _took(run) -> str:
+    """How long a run that has ended worked and what Claude reported for it, with a link to its log."""
+    if not run["seconds"] and not run["has_log"]:
+        return ""
+    parts = [duration(run["seconds"])] if run["seconds"] else []
+    if run["turns"]:
+        parts.append(plural(run["turns"], "Claude turn"))
+    if run["cost"]:
+        parts.append(f"${run['cost']:.2f} as Claude counts it")
+    log = (f'<a href="/runs/log?run={esc(run["id"])}" target="_blank" rel="noopener">Log</a>' if run["has_log"] else "")
+    return f'<small>Took: {esc(" · ".join(parts))}{" · " if parts and log else ""}{log}</small>'
+
+
+def _linked(message: str) -> str:
+    """The message, escaped, with its links clickable; a PR's shown as owner/repo#12."""
+    def link(m: re.Match) -> str:
+        url = m.group(0)
+        pr = PR_URL_RE.fullmatch(url)
+        return (f'<a href="{url}" target="_blank" rel="noopener">'
+                f'{f"{pr.group(1)}#{pr.group(2)}" if pr else url}</a>')
+    return URL_RE.sub(link, esc(message))
+
+
+def _when(at: float) -> str:
+    """When a run was last updated: the time today, else the day too; the full date on hover."""
+    local, now = time.localtime(at), time.localtime()
+    shown = time.strftime("%H:%M" if local[:3] == now[:3] else "%d %b %H:%M", local)
+    return f'<time datetime="{time.strftime("%Y-%m-%dT%H:%M", local)}" title="{time.strftime("%Y-%m-%d %H:%M", local)}">{shown}</time>'
 
 
 def _extra(run, column: str, what: str) -> str:

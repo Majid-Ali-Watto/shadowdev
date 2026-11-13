@@ -54,7 +54,7 @@ def legacy_project(path: Path) -> dict:
 
 
 def upgrade_from_v1(db, conn: sqlite3.Connection, projects_dir: Path | None, site_url: str | None) -> None:
-    backup = db.path.with_name(db.path.name + ".v1-backup")
+    backup = db.v1_backup
     if not backup.exists():
         with closing(sqlite3.connect(backup)) as copy:
             conn.backup(copy)

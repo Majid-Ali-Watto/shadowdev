@@ -1,6 +1,8 @@
+import calendar
+import time
 from urllib.parse import quote, urlencode
 
-from .rest import HTTPError, download, redirect_location, request_json
+from .rest import HTTPError, download, redirect_location, request, request_json
 
 API = "https://api.github.com"
 MAX_DIFF_BYTES = 2 * 1024**2
@@ -19,6 +21,21 @@ CI_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } }"""
 
 
+def expiry(header: str | None) -> float:
+    """GitHub's GitHub-Authentication-Token-Expiration header ("2026-12-31 23:59:59 UTC", or with
+    an offset like "-0700") as a timestamp; 0 without one, or in a form not known."""
+    text = (header or "").strip()
+    try:
+        if text.endswith(" UTC"):
+            return float(calendar.timegm(time.strptime(text, "%Y-%m-%d %H:%M:%S UTC")))
+        if text:
+            parsed = time.strptime(text, "%Y-%m-%d %H:%M:%S %z")
+            return float(calendar.timegm(parsed) - parsed.tm_gmtoff)
+    except ValueError:
+        pass
+    return 0
+
+
 class GitHub:
     """GitHub REST client acting as one developer with their personal access token: fine-grained
     (Contents and Pull requests read & write on the project repos) or classic (`repo` scope)."""
@@ -35,6 +52,11 @@ class GitHub:
 
     def user(self) -> dict:
         return self._request("GET", "/user")
+
+    def user_and_expiry(self) -> tuple[dict, float]:
+        """The token's user, and when the token expires (0: never, or GitHub did not say)."""
+        user, headers = request("GET", API + "/user", self._headers, label="GitHub")
+        return user, expiry(headers.get("GitHub-Authentication-Token-Expiration"))
 
     def repo(self, owner_repo: str) -> dict | None:
         """The repo as this token sees it (permissions, description, default_branch); None if it can't."""
