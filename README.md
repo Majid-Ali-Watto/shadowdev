@@ -238,7 +238,7 @@ ShadowDev/
 │       ├── cancel.py      stopping a run
 │       ├── runlog.py      what a run logged and what Claude reported it cost, kept with the run
 │       └── dryrun.py      python -m shadowdev dry-run: a made-up issue, no Jira or GitHub
-├── deploy/              shadowdev.service: a systemd unit
+├── deploy/              shadowdev.service, a systemd unit, and how to install it (README.md)
 ├── tests/
 ├── Makefile           short names for the commands: `make` lists them
 ├── data/                  database, backups, logs and per-developer Claude config (created; never committed)
@@ -695,9 +695,8 @@ security:
 - [ ] `.env` readable only by that user (`chmod 600 .env`; `data/` and `worktrees/` are created
       `700`). Keep a copy of `SHADOWDEV_SECRET_KEY` in your password manager or secret store
 - [ ] HTTPS in front (a reverse proxy or a named Cloudflare tunnel), with `PUBLIC_URL` set to it
-- [ ] Run it as a service so it survives reboots: edit the user and paths in
-      [`deploy/shadowdev.service`](deploy/shadowdev.service), copy it to `/etc/systemd/system/` and
-      `systemctl enable --now shadowdev`. Its logs then go to the journal too
+- [ ] Run it as a service so it survives reboots, with the systemd unit in `deploy/`: see
+      [deploy/README.md](deploy/README.md). Its logs then go to the journal too
 - [ ] Point the reverse proxy's or a monitor's health check at `/health`
 - [ ] `make backup` on a schedule (e.g. a daily cron job), copied off the machine with the key kept
       separately
