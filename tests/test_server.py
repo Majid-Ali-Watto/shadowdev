@@ -1914,6 +1914,15 @@ class OperationsWebTest(WebTest):
         self.assertNotIn("ghp_secret", page)
         self.assertNotIn('aria-label="Pages of activity"', page)  # one page: no pager
 
+    def test_features_tab_explains_shadowdev(self):
+        self.sign_in()
+        page = self.request("GET", "/?tab=features")[2]
+        self.assertIn('data-tab="features" aria-selected="true"', page)
+        self.assertIn('<ol class="flow" aria-label="A run, step by step">', page)
+        self.assertIn("<b>Sandboxed.</b>", page)
+        self.assertIn('id="panel-features" role="tabpanel" aria-labelledby="tab-features" hidden',
+                      self.request("GET", "/?tab=activity")[2])  # in every page, shown only when chosen
+
     def test_activity_is_shown_a_page_at_a_time(self):
         self.sign_in()  # "Signed in" is the oldest entry
         me = self.me().id

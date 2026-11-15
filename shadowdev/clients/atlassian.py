@@ -1,6 +1,6 @@
 """Atlassian OAuth 2.0 (3LO): developers sign in by granting ShadowDev access to Jira in the
 browser, instead of creating API tokens. The company registers ShadowDev once as an OAuth
-app in the Atlassian developer console (see README).
+app in the Atlassian developer console (see docs/ADMIN.md).
 
 https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/
 """

@@ -1,5 +1,5 @@
 """The developer's page: a header, their status, and a tab per area (run issues, recent runs,
-projects, accounts, settings, activity).
+projects, accounts, settings, activity, features).
 Every tab is in the page, so switching is instant; ?tab= picks the one shown, so links, reloads and
 the page after a form all land on the right one, with scripts off too."""
 from ..config import Config
@@ -9,12 +9,13 @@ from ..models.user import User
 from .accounts import accounts_panel
 from .activity import activity_panel
 from .components import MARK, THEME_TOGGLE, alert, app_scripts, csrf_field, esc, page, plural
+from .features import features_panel
 from .projects import projects_panel
 from .runs import recent_panel, runs_panel
 from .settings import settings_panel
 
 TABS = (("runs", "Run issues"), ("recent", "Recent runs"), ("projects", "Projects"), ("accounts", "Accounts"),
-        ("settings", "Settings"), ("activity", "Activity"))
+        ("settings", "Settings"), ("activity", "Activity"), ("features", "Features"))
 
 # Success messages are fixed strings chosen by key, so nothing from the request is echoed.
 # Each names the tab its form is on, where the page opens after it (or with its error).
@@ -68,6 +69,7 @@ def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[in
         "accounts": accounts_panel(user, hidden, claude_usage),
         "settings": settings_panel(user, hidden),
         "activity": activity_panel(*activity),
+        "features": features_panel(),
     }
     nav = "".join(
         f'<a href="/?tab={key}" id="tab-{key}" role="tab" aria-controls="panel-{key}" data-tab="{key}"'

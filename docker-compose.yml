@@ -13,7 +13,7 @@ services:
     ports:
       - "127.0.0.1:8080:8080"  # this machine only; put a proxy with https in front to publish it
     volumes:
-      # Mounted as a file, never as env_file: secrets stay out of the process environment (README, Rules).
+      # Mounted as a file, never as env_file: secrets stay out of the process environment (CLAUDE.md, Rules).
       - ./.env:/app/.env:ro
       - ./data:/app/data  # the token database, per-developer Claude config, logs and backups
       - worktrees:/app/worktrees  # live run workspaces: a volume, fast on macOS and Windows too

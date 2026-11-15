@@ -53,7 +53,7 @@ dry:  ## run the pipeline on a made-up issue, nothing sent: make dry S="Login bu
 key:  ## print a new SHADOWDEV_SECRET_KEY for .env
 	@$(PY) -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 
-rotate:  ## re-encrypt stored tokens with a new key; first set SHADOWDEV_SECRET_KEY=new,old (see README)
+rotate:  ## re-encrypt stored tokens with a new key; first set SHADOWDEV_SECRET_KEY=new,old (see docs/ADMIN.md)
 	$(PY) -m shadowdev rotate-key
 
 backup:  ## copy the database to data/backups/ (kept 7 days), safe while the server runs

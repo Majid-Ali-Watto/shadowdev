@@ -5,7 +5,9 @@ analyses the issue, changes the project's repos, their tests run in a sandbox, a
 with the developer's own GitHub token. A developer has any number of Jira, GitHub and Claude
 accounts (e.g. office and personal); projects are rows in the database, each on one Jira site,
 and each subscription (developer in a project) says which accounts it runs with. README.md
-explains the product and safety model; its **Architecture** section explains the layers.
+links to the docs: FEATURES.md (the short version, also the page's Features tab, `views/features.py`:
+keep them alike), docs/USER-GUIDE.md, docs/ADMIN.md, docs/SAFETY.md (the safety model) and
+docs/ARCHITECTURE.md (the layers).
 INSTALL.md is the first-run guide for each system (Linux directly; Docker on macOS, Windows, Linux):
 a change to setup, `.env`, the Makefile or the Docker files updates it too. This file covers what to
 know before editing.
@@ -67,7 +69,7 @@ app.py builds everything (build_app); server.py dispatches to routes.ROUTES[(met
   (server-sent events, `routes/settings.run_events`); a running run's step comes from `Timings.step`
   through `runlog`, and `models/run.PHASES` maps steps to its progress bar: a new step name needs a phase.
 
-Keep to these boundaries when adding code; README "Adding things" lists where each kind of change goes.
+Keep to these boundaries when adding code; docs/ARCHITECTURE.md "Adding things" lists where each kind of change goes.
 
 ## Rules
 
