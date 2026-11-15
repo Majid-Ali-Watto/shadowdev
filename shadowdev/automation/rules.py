@@ -1,7 +1,9 @@
 """Pure decision logic: which issues to handle, which release branch, which fix version."""
 import re
+from collections.abc import Sequence
 
 from ..models.issue import PR_COMMENT_HEAD, QUESTIONS_HEAD, asked, by_run, comments_of
+from ..models.project import Repo
 
 # Issue keys become branch names and directory names, so they must be strictly validated.
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-[0-9]+\Z")
@@ -125,15 +127,17 @@ def split_note(note: str) -> tuple[str, dict[str, str]]:
         (general if current is None else current).append(line)
     return "\n".join(general).strip(), {k: "\n".join(v).strip() for k, v in parts.items()}
 
-TASK_TYPES = {"task", "story", "sub-task", "subtask"}
+# Jira priority names by urgency, the most urgent first. Sites name their own; one not listed here
+# counts as Medium.
+PRIORITY_NAMES = (("highest", "blocker", "critical", "urgent", "p0", "p1"), ("high", "major", "p2"),
+                  ("medium", "normal", "p3"), ("low", "minor", "p4"), ("lowest", "trivial", "p5"))
 
 
-def issue_kind(fields: dict) -> str | None:
-    """"bug", "task" (Task, Story, Sub-task), or None for issue types ShadowDev never handles."""
-    issue_type = ((fields.get("issuetype") or {}).get("name") or "").lower()
-    if issue_type == "bug":
-        return "bug"
-    return "task" if issue_type in TASK_TYPES else None
+def urgency(fields: dict) -> int:
+    """How urgent an issue is by its Jira priority: 4 for Highest down to 0 for Lowest, 2 when unknown."""
+    name = str((fields.get("priority") or {}).get("name") or "").lower()
+    found = next((i for i, names in enumerate(PRIORITY_NAMES) if name in names), 2)
+    return len(PRIORITY_NAMES) - 1 - found
 
 
 def wanted(kind: str | None, mode: str) -> bool:
@@ -145,33 +149,15 @@ def assignee(fields: dict) -> str | None:
     return (fields.get("assignee") or {}).get("accountId")
 
 
-FRONTEND_WORDS = {"fe", "frontend"}
-BACKEND_WORDS = {"be", "backend", "service", "services", "api"}
-
-
-CHANGES = ("fe", "be", "all")  # what a run started by hand may change: the FE repos, the BE repos, or any
-
-
-def chosen_repos(repo_names: list[str], change: str) -> tuple[str, ...]:
-    """The repos of `repo_names` a run may change: () when any (Claude decides). Raises ValueError
-    when the project has no such repo."""
-    if change == "all":
-        return ()
-    found = tuple(n for n in repo_names if repo_label(n) == change.upper())
-    if change not in CHANGES or not found:
-        raise ValueError(f"has no {change.upper()} repo among {', '.join(repo_names)}")
-    return found
-
-
-def repo_label(name: str) -> str:
-    """How a repo is named on a ticket: FE or BE for a frontend or backend repo (fe, market-place-fe,
-    services, backend…), else its own name."""
-    words = set(re.split(r"[^a-z0-9]+", name.lower()))
-    if words & FRONTEND_WORDS and not words & BACKEND_WORDS:
-        return "FE"
-    if words & BACKEND_WORDS and not words & FRONTEND_WORDS:
-        return "BE"
-    return name
+def chosen_repos(repos: Sequence[Repo], chosen: Sequence[str]) -> tuple[str, ...]:
+    """The names of the repos a run started by hand may change, of the `chosen` names: () when any
+    (Claude decides), as for a project of one repo or with all of them chosen. Raises ValueError
+    when none of the project's repos is chosen."""
+    names = [r.name for r in repos]
+    picked = tuple(n for n in names if n in chosen)
+    if len(names) > 1 and not picked:
+        raise ValueError(f"choose the repos to change: {', '.join(names)}")
+    return () if len(picked) == len(names) or len(names) == 1 else picked
 
 
 def link_text(url: str) -> str:
@@ -179,10 +165,10 @@ def link_text(url: str) -> str:
     return f"PR #{url.rstrip('/').rsplit('/', 1)[-1]}" if "/pull/" in url else "open the PR"
 
 
-def pr_links_comment(prs: list[tuple[str, str, str]], together_with: list[str]) -> str:
-    """The Jira comment (wiki markup) listing a run's PRs as a table: (repo name, base branch, PR URL,
+def pr_links_comment(prs: list[tuple[Repo, str, str]], together_with: list[str]) -> str:
+    """The Jira comment (wiki markup) listing a run's PRs as a table: (repo, base branch, PR URL,
     or the URL to open it by hand) each, and the other issues fixed in the same change."""
-    rows = "\n".join(f"|*{repo_label(repo)}*|{base}|[{link_text(url)}|{url}]|" for repo, base, url in prs)
+    rows = "\n".join(f"|*{repo.name}*|{base}|[{link_text(url)}|{url}]|" for repo, base, url in prs)
     together = f"\n\nFixed together with {compact_keys(together_with, ', ', ' to ')}." if together_with else ""
     return f"{PR_COMMENT_HEAD}\n{rows}{together}"
 
@@ -244,8 +230,21 @@ def latest_release_branch(branches: list[str], prefix: str) -> str | None:
     return max(candidates, key=lambda b: _version_key(b[len(prefix):]), default=None)
 
 
-def latest_fix_version(versions: list[dict]) -> str | None:
-    """The highest-numbered unreleased, unarchived Jira version ("Rel 15" over "Rel 14" and
-    "Rel 0.10"), whatever the base branch. None if there is no numbered open version."""
+def fix_version(versions: list[dict], pick: str = "next", bases: Sequence[str] = ()) -> str | None:
+    """The unreleased, unarchived numbered Jira version a bug is fixed in, by the project's
+    `pick` (models.project.FIX_VERSION_PICKS): "next", the lowest ("Rel 14" before "Rel 15" and
+    "Rel 0.10" before both); "highest"; or "branch", the one numbered like one of `bases`, the
+    branches the run's PRs go into (release/15 -> "Rel 15"), else the next. None if there is no
+    numbered open version."""
     numbered = [v for v in versions if not v.get("released") and not v.get("archived") and _version_key(v["name"])]
-    return max(numbered, key=lambda v: _version_key(v["name"]))["name"] if numbered else None
+    if not numbered:
+        return None
+    key = lambda v: _version_key(v["name"])
+    if pick == "highest":
+        return max(numbered, key=key)["name"]
+    if pick == "branch":
+        wanted = {_version_key(b) for b in bases} - {()}
+        matching = [v for v in numbered if key(v) in wanted]
+        if matching:
+            return min(matching, key=key)["name"]
+    return min(numbered, key=key)["name"]

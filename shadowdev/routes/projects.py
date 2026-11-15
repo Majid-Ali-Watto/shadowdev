@@ -17,7 +17,10 @@ def project_values(project: Project) -> dict:
     return {"name": project.name, "jira_keys": ", ".join(sorted(project.jira_projects)),
             "root_cause_field": project.root_cause_field or "", "start_statuses": ", ".join(project.start_statuses),
             "review_statuses": ", ".join(project.review_statuses), "slack_channel": project.slack_channel or "",
-            "status_rules": rules_text(project.status_rules),
+            "status_rules": rules_text(project.status_rules), "jira_options": "1",
+            "uses_sprints": "on" if project.uses_sprints else "", "uses_fix_versions": "on" if project.uses_fix_versions else "",
+            "fix_version_pick": project.fix_version_pick, "bug_types": ", ".join(project.bug_types),
+            "task_types": ", ".join(project.task_types),
             "repos": [{"github": r.github, "name": r.name, "description": r.description,
                        "release_prefix": r.release_prefix, "setup": r.setup or "", "test": r.test or "",
                        "reviewers": ", ".join(r.reviewers)}
@@ -27,8 +30,12 @@ def project_values(project: Project) -> dict:
 def show_editor(req: Request, user, csrf: str, project: Project | None, values: dict, error: str = "",
                 status: int = 200) -> None:
     nonce = secrets.token_urlsafe(16)
-    secret = req.app.project_service.webhook_secret(user, project) if project else None
-    req.html(project_page(req.app.cfg, user, values, project, secret, csrf, nonce, req.theme(), error), nonce, status=status)
+    service = req.app.project_service
+    secret = service.webhook_secret(user, project) if project else None
+    statuses = service.jira_statuses(user, project.cloud_id if project else values.get("cloud_id", ""),
+                                     values.get("jira_keys", ""))
+    req.html(project_page(req.app.cfg, user, values, project, secret, csrf, nonce, req.theme(), error, statuses),
+             nonce, status=status)
 
 
 def editor(req: Request) -> None:
@@ -57,7 +64,9 @@ def save(req: Request, post: FormPost) -> None:
         github_account_id=post.form.get("github_account_id", ""), root_cause_field=post.form.get("root_cause_field", ""),
         start_statuses=post.form.get("start_statuses", ""), review_statuses=post.form.get("review_statuses", ""),
         slack_channel=post.form.get("slack_channel", ""), status_rules=post.form.get("status_rules", ""),
-        repos=[RepoForm(**row) for row in rows])
+        uses_sprints=post.form.get("uses_sprints") == "on", uses_fix_versions=post.form.get("uses_fix_versions") == "on",
+        fix_version_pick=post.form.get("fix_version_pick", ""), bug_types=post.form.get("bug_types", ""),
+        task_types=post.form.get("task_types", ""), repos=[RepoForm(**row) for row in rows])
     project_id = post.form.get("project_id", "")
     try:
         req.app.project_service.save(post.user, form, project_id)
@@ -84,14 +93,31 @@ def join(req: Request, post: FormPost) -> None:
                                  post.form.get("mode", ""), bases, settings)
 
 
+def statuses(req: Request) -> None:
+    """GET /project/statuses?id=N: the Jira statuses of a project the developer can see, one per line,
+    suggested in its automation settings."""
+    session = req.session(renew=False)
+    user = req.app.users.get(session[1]) if session else None
+    try:
+        names = req.app.project_service.project_statuses(user, req.arg("id")) if user else None
+    except UserError:
+        names = None
+    if names is None:
+        return req.json(404, "not found")  # also a project on a site the developer can't reach
+    req.text("\n".join(names))
+
+
 ROUTES = {
     ("GET", "/project"): editor,
+    ("GET", "/project/statuses"): statuses,
     ("POST", "/project/save"): save,
     ("POST", "/project/delete"): action("project-deleted", lambda req, p: req.app.project_service.delete(
         p.user, p.form.get("project_id", ""))),
     ("POST", "/project/join"): action("joined", join),
     ("POST", "/project/release"): action("released", lambda req, p: req.app.releases.check_now(
         p.user, p.form.get("project_id", ""))),
+    ("POST", "/project/test-message"): action("test-sent", lambda req, p: req.app.notification_tests.send(
+        p.user, p.form.get("project_id", ""), p.form.get("way", ""))),
     ("POST", "/project/leave"): action("left", lambda req, p: req.app.project_service.leave(
         p.user, p.form.get("project_id", ""))),
 }

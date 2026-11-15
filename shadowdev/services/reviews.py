@@ -2,7 +2,10 @@
 the developer asked (Limits.github_poll_minutes and slack_poll_minutes, a minute by default):
 
 - the PRs ShadowDev opened for them: when reviewers have commented, a run addresses the comments
-  (automation/review.address_review); when their CI fails, a run fixes it (fix_ci);
+  (automation/review.address_review); when one conflicts with its base branch, a run merges that
+  in and resolves the conflicts (fix_conflicts); when their CI fails, a run fixes it (fix_ci); when one has
+  had no review for the developer's Settings.remind_hours since it was asked for in Slack, its
+  reviewers are asked again in that thread, at most once a day and MAX_REMINDERS times;
 - the Slack channel of each project they joined, read as them: when someone mentions them there
   with a pull request of the project, a run reviews it (review_pr); and when, in that thread,
   they are asked to review again, it is reviewed again. The message that asked gets 👀 while its
@@ -20,13 +23,22 @@ import threading
 import time
 from datetime import datetime
 
-from ..automation.review import address_review, failed_checks, fix_ci, is_approved, review_pr, waiting_threads
+from ..automation.review import (
+    address_review,
+    failed_checks,
+    fix_ci,
+    fix_conflicts,
+    is_approved,
+    review_pr,
+    waiting_threads,
+)
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
-from ..clients.slack import Slack
+from ..clients.slack import Slack, link
 from ..config import Config
 from ..models.project import Project
 from ..models.user import User
+from ..repositories.held import HeldRepository
 from ..repositories.projects import ProjectRepository
 from ..repositories.reviews import ReviewRepository
 from ..repositories.users import UserRepository
@@ -36,6 +48,9 @@ log = logging.getLogger("shadowdev")
 
 MAX_ROUNDS = 5  # of fixes, and of reviews, per pull request: two ShadowDevs can't go back and forth forever
 MAX_CI_ROUNDS = 3  # of CI fixes per pull request
+MAX_CONFLICT_ROUNDS = 3  # of merges of the base branch per pull request
+MAX_REMINDERS = 3  # of a PR's reviewers, in its Slack thread
+REMIND_EVERY = 24 * 3600  # seconds between two reminders of the same PR
 CI_FAILED = {"FAILURE", "ERROR"}
 PR_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]+)/pull/([0-9]{1,9})")
 MENTION_OR_PR_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>|" + PR_URL_RE.pattern)
@@ -104,8 +119,9 @@ def claimed_by(message: dict, member: str, github: str, number: int) -> str | No
 
 class ReviewWatcher:
     def __init__(self, cfg: Config, users: UserRepository, projects: ProjectRepository, reviews: ReviewRepository,
-                 queue: RunQueue):
+                 queue: RunQueue, held: HeldRepository):
         self.cfg = cfg
+        self.held = held  # replies to reviewers outside the developer's working hours wait here for them
         self.users = users
         self.projects = projects
         self.reviews = reviews
@@ -155,10 +171,13 @@ class ReviewWatcher:
             except Exception as e:
                 log.warning("%s failed: %s", what, e)
 
+        reminding: dict[tuple[int, str, str], list] = {}  # (developer, Slack thread) -> its PRs to remind of
         for row in self.reviews.tracked_prs():
             if row["user_id"] in github and project(row["project_id"]) and watched(github[row["user_id"]], row["project_id"]):
                 each(f"checking {row['github']}#{row['number']} for review comments", self._check_pr, row,
-                     github[row["user_id"]], project(row["project_id"]), now)
+                     github[row["user_id"]], project(row["project_id"]), now, reminding)
+        for (user_id, channel, ts), rows in reminding.items():
+            each(f"reminding the reviewers of {len(rows)} PR(s)", self._remind, github[user_id], channel, ts, rows, now)
         for user in slack.values():
             if user.slack:
                 for p in self.projects.on_sites(list(user.sites)):
@@ -175,18 +194,68 @@ class ReviewWatcher:
 
     # The PRs ShadowDev opened: review comments and failing CI
 
-    def _check_pr(self, row, user: User, project: Project, now: float) -> None:
+    def _check_pr(self, row, user: User, project: Project, now: float, reminding: dict | None = None) -> None:
+        """`reminding`: where a PR whose reviewers are to be reminded goes, by its Slack thread."""
         actor, repo = user.actor(project.id), project.repo(row["repo"])
-        if not actor or not repo or (row["rounds"] >= MAX_ROUNDS and row["ci_rounds"] >= MAX_CI_ROUNDS):
+        if not actor:
+            return
+        settings = actor.settings
+        remind = self._remind_due(row, user, settings, now) and reminding is not None
+        fixes = ((settings.fix_review_comments and row["rounds"] < MAX_ROUNDS)
+                 or (settings.fix_conflicts and row["conflict_rounds"] < MAX_CONFLICT_ROUNDS)
+                 or (settings.fix_ci and row["ci_rounds"] < MAX_CI_ROUNDS))
+        if not repo or not (fixes or remind):  # nothing it could do: GitHub is not even asked
             return
         github = GitHub(actor.github.token)
         state, threads = github.review_threads(row["github"], row["number"])
         if state != "OPEN":
             return self.reviews.untrack_pr(row["id"])  # merged or closed: nothing more to watch
+        if remind and not self._reviewed(row, github, threads, actor.github.login):
+            reminding.setdefault((user.id, row["slack_channel"], row["slack_ts"]), []).append((row, repo))
         # Review comments first: their fix is a new commit, whose CI is then checked in turn.
         waiting = actor.settings.fix_review_comments and self._review_comments(row, user, project, github, threads, now)
-        if not waiting and actor.settings.fix_ci and row["ci_rounds"] < MAX_CI_ROUNDS:
+        # Then a conflict with the base branch: CI often doesn't even run on a PR that conflicts.
+        if not waiting and settings.fix_conflicts and row["conflict_rounds"] < MAX_CONFLICT_ROUNDS:
+            waiting = self._conflict(row, user, project, github)
+        if not waiting and settings.fix_ci and row["ci_rounds"] < MAX_CI_ROUNDS:
             self._failing_ci(row, user, project, github)
+
+    # Reminding reviewers of a PR nobody has reviewed
+
+    @staticmethod
+    def _remind_due(row, user: User, settings, now: float) -> bool:
+        """Whether a PR's reviewers are due a reminder, if nobody has reviewed it: it was asked for in
+        Slack the developer's hours ago, and they were not reminded in the last day, nor too often. Only
+        within the developer's working hours: one due outside them is due once they begin."""
+        if not (settings.remind_reviewers and user.slack and row["slack_ts"] and row["reminders"] < MAX_REMINDERS
+                and settings.at_work(now)):
+            return False
+        try:
+            asked = float(row["slack_ts"])  # a Slack message's timestamp: when it was posted
+        except ValueError:
+            return False
+        return now - asked >= int(settings.remind_hours) * 3600 and now - row["reminded_at"] >= REMIND_EVERY
+
+    @staticmethod
+    def _reviewed(row, github: GitHub, threads: list[dict], login: str) -> bool:
+        """Someone other than the developer has commented on the PR's code, or approved it or asked for changes."""
+        others = lambda author: author.lower() != login.lower()
+        if any(others(c["author"]) for t in threads for c in t["comments"]):
+            return True
+        return any(others(r["author"]) for r in github.latest_reviews(row["github"], row["number"]))
+
+    def _remind(self, user: User, channel: str, ts: str, rows: list, now: float) -> None:
+        """One reply in the thread that asked for review of these PRs, mentioning their reviewers."""
+        reviewers = " ".join(dict.fromkeys(f"<@{m}>" for _, repo in rows for m in repo.reviewers))
+        prs = [f"• {link('https://github.com/{}/pull/{}'.format(row['github'], row['number']))}" for row, _ in rows]
+        ask = f"{reviewers} A gentle reminder: {'this PR is' if len(rows) == 1 else 'these PRs are'} still waiting for a review."
+        try:
+            Slack(user.slack.token).post(channel, "\n".join([ask.lstrip(), *prs, "Thanks"]), ts)
+        finally:  # posted or not, not tried again before tomorrow
+            for row, _ in rows:
+                self.reviews.pr_reminded(row["id"], now)
+        log.info("reminded the reviewers of %s for %s", ", ".join(f"{r['github']}#{r['number']}" for r, _ in rows),
+                 user.display_name)
 
     def _review_comments(self, row, user: User, project: Project, github: GitHub, threads: list[dict], now: float) -> bool:
         """Queue a run for the review comments waiting on the PR. True while some wait to be acted on."""
@@ -208,12 +277,37 @@ class ReviewWatcher:
             repo = project.repo(row["repo"])
             if not repo:
                 return "skipped", "the repo is no longer in the project"
-            return address_review(repo, number, branch, slack, project, actor, cfg, github, cancel, on_model)
+            return address_review(repo, number, branch, slack, project, actor, cfg, github, cancel, on_model,
+                                  later=lambda channel, text, ts: self.held.hold_slack(user.id, project.id, channel, text, ts))
 
         # Handled whether it worked or not: failing comments are not tried again and again.
         if self.queue.submit(project, [f"{row['github']}#{number}"], user.id, work=work,
                              after=lambda: self.reviews.pr_handled(row["id"], newest)) is None:
             log.info("%s#%d: review comments queued for %s", row["github"], number, user.display_name)
+        return True
+
+    def _conflict(self, row, user: User, project: Project, github: GitHub) -> bool:
+        """Queue a run that merges the base branch into the PR, once per pair of head and base commits,
+        when GitHub says they conflict. True while the PR conflicts (its CI is then left alone)."""
+        pr = github.pr(row["github"], row["number"])
+        if pr.get("mergeable") is not False:  # mergeable, or None while GitHub is still working it out
+            return False
+        key = f"{pr['head']['sha']}:{pr['base']['sha']}"
+        if key == row["conflict_key"]:
+            return True  # acted on already: tried, and it still conflicts, or the merge is not pushed yet
+        number, branch = row["number"], row["branch"]
+
+        def work(project, actor, cfg, github, cancel, on_model):
+            repo = project.repo(row["repo"])
+            if not repo:
+                return "skipped", "the repo is no longer in the project"
+            return fix_conflicts(repo, number, branch, project, actor, cfg, github, cancel, on_model)
+
+        # Handled whether it worked or not: the same conflict is not tried again and again.
+        if self.queue.submit(project, [f"{row['github']}#{number}"], user.id, work=work,
+                             after=lambda: self.reviews.conflict_handled(row["id"], key)) is None:
+            log.info("%s#%d: conflicts with %s; merge queued for %s", row["github"], number, pr["base"]["ref"],
+                     user.display_name)
         return True
 
     def _failing_ci(self, row, user: User, project: Project, github: GitHub) -> None:

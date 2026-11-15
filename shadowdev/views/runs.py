@@ -1,4 +1,4 @@
-"""The Runs tab: run issues by hand, and the developer's recent runs."""
+"""The Run issues tab (running issues by hand) and the Recent runs tab (the developer's runs)."""
 import json
 import re
 import time
@@ -6,7 +6,7 @@ import time
 from ..automation.rules import MAX_NOTE_CHARS
 from ..automation.timing import duration
 from ..models.project import Project
-from ..models.run import ACTIVE, KINDS, MAX_SEARCH, PAGE_SIZE, STATUSES, RunPage
+from ..models.run import ACTIVE, KINDS, MAX_SEARCH, PAGE_SIZE, PHASES, STATUSES, RunPage, phase
 from .components import csrf_field, esc, options, plural
 
 SHORT_MESSAGE = 90  # a longer message, or one with a model or note, folds to its first line until opened
@@ -15,7 +15,14 @@ URL_RE = re.compile(r"https://[A-Za-z0-9./_#?=%~+:-]+[A-Za-z0-9/_#=%~+-]")
 PR_URL_RE = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
 
 
-def runs_panel(max_parallel_runs: int, joined: list[Project], runs: RunPage, csrf: str, answering=None) -> str:
+def example_keys(joined: list[Project]) -> tuple[str, str]:
+    """Two Jira project keys for the form's examples, from the developer's own projects: their first
+    project's, and another project's when there is one (the same key otherwise)."""
+    keys = list(dict.fromkeys(min(p.jira_projects) for p in joined if p.jira_projects)) or ["ABC"]
+    return keys[0], keys[-1] if len(keys) > 1 else keys[0]
+
+
+def runs_panel(max_parallel_runs: int, joined: list[Project], csrf: str, answering=None) -> str:
     """`answering`: a run that asked the developer questions; the form is filled in to answer them."""
     hidden = csrf_field(csrf)
     asked = json.loads(answering["questions"]) if answering and answering["questions"] else {}
@@ -33,24 +40,23 @@ def runs_panel(max_parallel_runs: int, joined: list[Project], runs: RunPage, csr
                        "your answers.</p></div>")
     note = "".join(f"{key}: \n" for key in asked)
     together = ", " in keys
+    k, other = map(esc, example_keys(joined))
     return f"""<section class="card">
   <div class="card-head"><h3>Run issues now</h3></div>
   <p class="muted">For issues assigned to you before you joined. New assignments start by themselves; up to
     {max_parallel_runs} of your runs work at the same time.</p>
   <form method="post" action="/run" id="run-form">{hidden}
-<label>Issue keys<span class="sub">Separated by commas, with ranges: <code>MAR-1 to MAR-10 except MAR-3</code>. Of a
+<label>Issue keys<span class="sub">Separated by commas, with ranges: <code>{k}-1 to {k}-10 except {k}-3</code>. Of a
   range, only the issues assigned to you run.</span>
-  <input name="issue_keys" value="{esc(keys)}" placeholder="MAR-123, MAR-124, MAR-1 to MAR-10 except MAR-3" required spellcheck="false" autocomplete="off"></label>
+  <input name="issue_keys" value="{esc(keys)}" placeholder="{k}-123, {other}-45, {k}-1 to {k}-10 except {k}-3" required spellcheck="false" autocomplete="off"></label>
 {project_pick}
 {questions}
 <label>Note for Claude <span class="optional">optional</span><span class="sub">What the tickets don't say: where to
-  look, what to leave alone. A line starting <code>MAR-123:</code> is for that issue only.</span>
-  <textarea name="note" maxlength="{MAX_NOTE_CHARS}" placeholder="Don't change the API.&#10;MAR-123: the bug is in the checkout total, not the cart."{" autofocus" if asked else ""}>{esc(note)}</textarea></label>
+  look, what to leave alone. A line starting <code>{k}-123:</code> is for that issue only.</span>
+  <textarea name="note" maxlength="{MAX_NOTE_CHARS}" placeholder="Don't change the API.&#10;{k}-123: the bug is in the checkout total, not the cart."{" autofocus" if asked else ""}>{esc(note)}</textarea></label>
+{_repo_pick(joined, answering)}
 <div class="grid">
-  <label>Change<span class="sub">If the fix needs more, you are asked in Slack first</span><select name="change">
-    <option value="fe" selected>FE only</option><option value="be">BE only</option><option value="all">FE and BE</option>
-  </select></label>
-  <label>Review request in Slack<span class="sub">One lists every PR under FE and BE</span><select name="message">
+  <label>Review request in Slack<span class="sub">One lists every PR by repo</span><select name="message">
     <option value="one" selected>One message for all issues</option><option value="each">A message for each issue</option>
   </select></label>
 </div>
@@ -74,16 +80,37 @@ def runs_panel(max_parallel_runs: int, joined: list[Project], runs: RunPage, csr
   <p class="hint">An issue that already has its branch is skipped unless it was sent back. To start one over, close
     its PR and delete its branch.</p></div>
   </form>
-</section>
+</section>"""  # noqa: S608 (HTML with <select>, not SQL)
 
-<section class="card">
+
+def recent_panel(runs: RunPage, csrf: str) -> str:
+    hidden = csrf_field(csrf)
+    return f"""<section class="card">
   <div class="card-head"><h3>Recent runs</h3>
     <form method="post" action="/runs/delete" id="delete-runs" data-confirm="Remove the selected runs from Recent runs? Their tickets and pull requests are not touched.">{hidden}
       <button class="danger small" id="delete-selected" disabled>Delete selected</button></form></div>
   {_filters(runs)}
   <p class="sr-only" id="runs-status" role="status"></p>
   <div id="runs-results">{run_results(runs, csrf)}</div>
-</section>"""  # noqa: S608 (HTML with <select>, not SQL)
+</section>"""
+
+
+def _repo_pick(joined: list[Project], answering) -> str:
+    """A checkbox per repo, per project (static/runs.js shows the picked project's): the repos the runs
+    may change. A project's only repo is ticked; so are those of the run being answered."""
+    again = (answering["project_id"], set(filter(None, answering["repos"].split(",")))) if answering else None
+    groups = []
+    for p in joined:
+        every = {r.name for r in p.repos}
+        ticked = every if len(every) == 1 else (again[1] or every) if again and again[0] == p.id else set()
+        boxes = "".join(
+            f'<label class="choice"><input type="checkbox" name="repos" value="{esc(f"{p.id}:{r.name}")}"'
+            f'{" checked" if r.name in ticked else ""}><span>{esc(r.name)}<small class="mono">{esc(r.github)}</small>'
+            '</span></label>' for r in p.repos)
+        head = f'<div class="sub-head">{esc(p.name)}</div>' if len(joined) > 1 else ""
+        groups.append(f'<div data-project="{esc(p.id)}">{head}<div class="choices repos">{boxes}</div></div>')
+    return f"""<div class="field" id="run-repos"><span class="label">Repos to change<span class="sub">If the fix needs
+  more, you are asked in Slack first</span></span>{"".join(groups)}</div>"""
 
 
 SEARCH_ICON = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" '
@@ -99,7 +126,7 @@ def _filters(runs: RunPage) -> str:
     projects = runs.projects if not f.project or f.project in runs.projects else [*runs.projects, f.project]
     count = sum(1 for v in (f.status, f.project, f.kind) if v)
     return f"""<form method="get" action="/" id="run-filter" class="filters" role="search">
-    <input type="hidden" name="tab" value="runs">
+    <input type="hidden" name="tab" value="recent">
     <div class="search-box">{SEARCH_ICON}<input type="search" name="q" value="{esc(f.text)}" maxlength="{MAX_SEARCH}"
       placeholder="Search by issue key, message or note" aria-label="Search runs" spellcheck="false" autocomplete="off"></div>
     <details class="filter-menu" id="filter-menu">
@@ -167,11 +194,22 @@ def _rows(runs: RunPage, csrf: str) -> str:
              else "No runs yet. Runs show up here once an issue is queued.")
     return "".join(
         f'<tr><td class="pick">{_pick(r)}</td><td class="issue">{_issue_links(r)}</td><td>{esc(r["project"])}</td>'
-        f'<td class="state"><span class="badge {esc(r["status"])}">{esc(r["status"])}</span>{_stop_button(r, hidden)}</td>'
+        f'<td class="state"><span class="badge {esc(r["status"])}">{esc(r["status"])}</span>{_stop_button(r, hidden)}'
+        f'{_progress(r)}</td>'
         f'<td class="msg">{_details(r)}</td>'
         f'<td class="when">{_when(r["updated"])}</td></tr>'
         for r in runs.rows
     ) or f'<tr><td colspan="6" class="empty">{empty}</td></tr>'
+
+
+def _progress(run) -> str:
+    """How far a running run is: a bar of its phases (models.run.PHASES), and the step it is on."""
+    if run["status"] != "running" or not run["step"]:
+        return ""
+    found = phase(run["step"])
+    bar = (f'<progress max="{len(PHASES)}" value="{found[0]}" title="{esc(found[1])}" '
+           f'aria-label="{esc(found[1])}: phase {found[0]} of {len(PHASES)}"></progress>' if found else "")
+    return f'<div class="progress">{bar}<small>{esc(run["step"])}</small></div>'
 
 
 def _pick(run) -> str:
@@ -187,7 +225,7 @@ def _details(run) -> str:
     """The run's message; with more to it (a long message, the model, the developer's note), an
     accordion showing the first line until opened. data-run lets the page keep it open across refreshes."""
     message = run["message"] or ""
-    extras = _extra(run, "model", "Model") + _extra(run, "note", "Your note") + _took(run)
+    extras = _extra(run, "model", "Model") + _extra(run, "note", "Your note") + _took(run) + _log_so_far(run)
     if not extras and len(message) <= SHORT_MESSAGE and "\n" not in message:
         return _linked(message)
     return (f'<details class="run-details" data-run="{esc(run["id"])}"><summary><span class="line">{_linked(message)}</span>'
@@ -205,6 +243,13 @@ def _took(run) -> str:
         parts.append(f"${run['cost']:.2f} as Claude counts it")
     log = (f'<a href="/runs/log?run={esc(run["id"])}" target="_blank" rel="noopener">Log</a>' if run["has_log"] else "")
     return f'<small>Took: {esc(" · ".join(parts))}{" · " if parts and log else ""}{log}</small>'
+
+
+def _log_so_far(run) -> str:
+    """While it runs: what it logged so far."""
+    if run["status"] not in ("running", "stopping"):
+        return ""
+    return f'<small><a href="/runs/log?run={esc(run["id"])}" target="_blank" rel="noopener">Log so far</a></small>'
 
 
 def _linked(message: str) -> str:

@@ -1,6 +1,7 @@
 // The project editor's repos: add another from the template, remove one (always keeping one to fill in).
-(() => {
+ShadowDev.mount(() => {
   const repos = document.getElementById("repos");
+  if (!repos) return;
   const addRepo = () => repos.appendChild(document.getElementById("repo-template").content.cloneNode(true));
   document.getElementById("add-repo").addEventListener("click", addRepo);
   repos.addEventListener("click", e => {
@@ -9,4 +10,4 @@
     remove.closest("fieldset").remove();
     if (!repos.querySelector("fieldset")) addRepo();
   });
-})();
+});

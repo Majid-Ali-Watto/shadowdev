@@ -1,6 +1,7 @@
 """One HTTP request: reading it, and sending the response with the right security headers."""
 import hmac
 import json
+import select
 from collections.abc import Callable
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
@@ -116,12 +117,38 @@ class Request:
     def html(self, html: str, nonce: str = "", status: int = 200, cookies: tuple[str, ...] = ()) -> None:
         headers = [
             ("Content-Security-Policy", f"default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-{nonce}'; connect-src 'self'; "
-                                        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
+                                        "img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"),
             ("Referrer-Policy", "same-origin"),  # no-referrer would make browsers send Origin: null on form posts
             ("Cache-Control", "no-store"),
             *(("Set-Cookie", c) for c in cookies),
         ]
         self.send(status, html.encode(), "text/html; charset=utf-8", headers)
+
+    def events(self) -> None:
+        """Start a stream of server-sent events (text/event-stream): no length, sent as it is written
+        with write(), and the connection closes when the route returns."""
+        h = self.handler
+        self.sent = True
+        h.send_response(200)
+        for name, value in [("Content-Type", "text/event-stream; charset=utf-8"), ("Cache-Control", "no-store"),
+                            ("X-Content-Type-Options", "nosniff"), ("X-Accel-Buffering", "no"),  # nginx: don't hold it back
+                            ("Connection", "close"), *self._renewed]:
+            h.send_header(name, value)
+        if self._https:
+            h.send_header("Strict-Transport-Security", "max-age=31536000")
+        h.end_headers()
+        h.wfile.flush()
+
+    def gone(self, seconds: float) -> bool:
+        """Wait up to `seconds` for the browser to close a stream started with events(): True once it
+        has. It sends nothing after its request, so anything to read means it closed (or misbehaves)."""
+        readable, _, _ = select.select([self.handler.connection], [], [], seconds)
+        return bool(readable)
+
+    def write(self, data: bytes) -> None:
+        """More of a stream started with events(). Raises OSError once the browser has gone."""
+        self.handler.wfile.write(data)
+        self.handler.wfile.flush()
 
     def redirect(self, location: str, *cookies: str) -> None:
         headers = [("Location", location), ("Cache-Control", "no-store"), *(("Set-Cookie", c) for c in cookies)]

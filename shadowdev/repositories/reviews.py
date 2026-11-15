@@ -43,6 +43,17 @@ class ReviewRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE pull_requests SET ci_sha = ?, ci_rounds = ci_rounds + 1 WHERE id = ?", (sha, pr_id))
 
+    def conflict_handled(self, pr_id: int, key: str) -> None:
+        """Its conflict between those two commits ("head:base") was acted on, in one more round."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE pull_requests SET conflict_key = ?, conflict_rounds = conflict_rounds + 1 WHERE id = ?",
+                         (key, pr_id))
+
+    def pr_reminded(self, pr_id: int, at: float) -> None:
+        """Its reviewers were reminded, once more, in its Slack thread."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE pull_requests SET reminded_at = ?, reminders = reminders + 1 WHERE id = ?", (at, pr_id))
+
     def untrack_pr(self, pr_id: int) -> None:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("DELETE FROM pull_requests WHERE id = ?", (pr_id,))

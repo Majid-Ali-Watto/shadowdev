@@ -1,5 +1,6 @@
 """A developer and the accounts they connected. One person can have several of each kind, e.g. a
 personal and an office Jira, GitHub and Claude; each project they join says which ones it uses."""
+import hashlib
 import time
 from dataclasses import dataclass, field, replace
 
@@ -9,6 +10,13 @@ from .settings import Settings
 
 MODES = ("bugs", "all")  # "bugs": only Bugs; "all": Bugs, Tasks and Stories
 EXPIRES_SOON = 7 * 86400  # a GitHub token this near its end is pointed out to its developer
+MAX_TESTS = 3  # test messages per way of telling the developer, per project
+NOREPLY = "@users.noreply.github.com"  # GitHub's address for a hidden email: no mailbox
+
+
+def address_key(address: str) -> str:
+    """Stands for an email address where only "is it the same one?" is kept, not the address."""
+    return hashlib.sha256(address.strip().lower().encode()).hexdigest()[:16]
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,15 @@ class Subscription:
     base_branches: dict[str, str] = field(default_factory=dict)  # repo name -> branch; missing = default
     settings: Settings = Settings()
     release_report: ReleaseReport | None = None  # the last check of its tickets against the status rules
+    tests_sent: dict = field(default_factory=dict)  # test messages sent: services.notifications
+
+    def tests_left(self, way: str, address: str = "") -> int:
+        """How many test messages the developer may still send `way` ("slack", "email"): MAX_TESTS
+        each, the email ones counted again from none when the address they go to changes."""
+        sent = self.tests_sent
+        if way == "email" and sent.get("email_to") != address_key(address):
+            return MAX_TESTS
+        return max(0, MAX_TESTS - int(sent.get(way, 0)))
 
 
 @dataclass(frozen=True)
@@ -94,6 +111,7 @@ class Actor:
     slack: SlackAccount | None = None
     settings: Settings = Settings()
     spare_claudes: tuple[ClaudeAccount, ...] = ()  # the accounts a run may switch to at `claude`'s usage limit
+    email: str = ""  # where the developer is emailed about this project (User.email_for)
 
     def with_claude(self, config_key: str) -> "Actor":
         """This actor working with that one of its Claude accounts, the others as its spares."""
@@ -139,7 +157,17 @@ class User:
             return None
         spares = tuple(a for a in self.claude_accounts if a.id != claude.id) if sub.settings.switch_claude else ()
         return Actor(self.id, self.display_name, jira.account_id, github, claude, sub.mode, sub.base_branches, self.slack,
-                     sub.settings, spares)
+                     sub.settings, spares, self.email_for(sub)[0])
+
+    def email_for(self, sub: Subscription) -> tuple[str, str]:
+        """(address, where it is from) the developer is emailed at about a project: the one they typed
+        for it, else the email of its Jira account, its GitHub account (not GitHub's noreply address),
+        or the one they signed in with. ("", "") when none is known."""
+        jira, github = self.jira(sub.jira_account_id), self.github(sub.github_account_id)
+        found = ((sub.settings.notify_address, "you chose"), (jira.email if jira else "", "of your Jira account"),
+                 (github.git_email if github and not github.git_email.endswith(NOREPLY) else "", "of your GitHub account"),
+                 (self.email, "you signed in with"))
+        return next(((a, why) for a, why in found if a), ("", ""))
 
     @property
     def ready_projects(self) -> list[int]:

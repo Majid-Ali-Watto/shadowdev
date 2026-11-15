@@ -18,7 +18,7 @@ def login_page(public_url: str, nonce: str, theme: str = "", error: str = "") ->
   <p class="hint">Already use ShadowDev with another Jira account, e.g. your office one? Sign in with
     that one, and connect this one from your page, so all your projects are in one place.</p>
 </section>
-{script("theme.js", nonce)}""", theme)
+{script("app.js", nonce)}{script("theme.js", nonce)}""", theme)
 
 
 def continue_page(url: str, nonce: str, theme: str = "") -> str:

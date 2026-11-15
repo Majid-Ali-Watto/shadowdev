@@ -1,5 +1,5 @@
-# ShadowDev as a systemd service; deploy/README.md explains it. Install (as root), after editing User= and the paths:
-#   cp deploy/shadowdev.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now shadowdev
+# ShadowDev as a systemd service; deploy/README.md explains it. `make service` installs it filled in
+# for the checkout (User=, the paths and PATH below), and `make service-remove` removes it.
 # Then: systemctl status shadowdev, journalctl -u shadowdev -f, systemctl stop shadowdev.
 [Unit]
 Description=ShadowDev

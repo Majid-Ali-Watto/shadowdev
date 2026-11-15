@@ -5,6 +5,7 @@ import logging
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -17,23 +18,35 @@ class Record:
     lines: deque = field(default_factory=lambda: deque(maxlen=MAX_LINES))
     cost: float = 0  # US dollars, as Claude reported
     turns: int = 0
+    on_step: Callable[[str], None] = lambda name: None  # told each step the run starts, for its progress
 
     @property
     def log(self) -> str:
-        return "\n".join(self.lines)
+        return "\n".join(self.lines.copy())  # copied at once: the run's thread may be adding to it
 
 
 _run = threading.local()
 
 
 @contextmanager
-def recording():
-    """Within it, what this thread logs and the Claude usage it reports are kept in the Record given."""
-    record = _run.record = Record()
+def recording(on_step: Callable[[str], None] = lambda name: None):
+    """Within it, what this thread logs and the Claude usage it reports are kept in the Record given,
+    and `on_step` is told each step the thread starts."""
+    record = _run.record = Record(on_step=on_step)
     try:
         yield record
     finally:
         _run.record = None
+
+
+def step(name: str) -> None:
+    """The run on this thread starts the step `name` (automation/timing.Timings.step)."""
+    record = getattr(_run, "record", None)
+    if record:
+        try:
+            record.on_step(name)
+        except Exception:  # showing progress must not break the run
+            logging.getLogger("shadowdev").exception("could not record the step %s", name)
 
 
 def add_usage(cost, turns) -> None:

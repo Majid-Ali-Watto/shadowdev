@@ -1,0 +1,10 @@
+# Never in the image: secrets (.env, data/ with the token database and Claude config), live run
+# workspaces, and what the build makes again. The .env and data/ are mounted when the container runs.
+.env
+data/
+worktrees/
+.git/
+.venv/
+.ruff_cache/
+**/__pycache__/
+*.egg-info/

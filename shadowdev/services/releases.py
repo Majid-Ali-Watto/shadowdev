@@ -3,26 +3,30 @@ Ready for Release -> Done once the ticket has its fix version, parent, estimate 
 for a bug its root cause. For the developers who switched it on (Settings.release_moves) every
 Settings.release_hours, and whenever they ask on the Projects tab. Only tickets assigned to the
 Jira account of the developer's subscription are moved; one that misses a check stays where it is,
-the check's report on the project's card says what it misses, and the developer is told in a Slack
-direct message (if they connected Slack): on every check they ask for, and on a scheduled one when
-something is missing that the last check did not report, so the same list does not come every few hours."""
+the check's report on the project's card says what it misses, and the developer is told the ways
+they chose for it in the project (Settings.notify_missing): on every check they ask for, and on
+a scheduled one when something is missing that the last check did not report, so the same list does
+not come every few hours."""
 import logging
 import random
 import threading
 import time
 
 from ..automation import rules
+from ..automation.pipeline import email_developer
 from ..clients.atlassian import AtlassianOAuth, JiraAccessLost, jira_client
 from ..clients.jira import Jira
 from ..clients.rest import HTTPError
 from ..clients.slack import Slack, issue_link
 from ..clients.slack import escape as slack_escape
+from ..config import Config
 from ..models import release
 from ..models.project import Project
 from ..models.release import ReleaseReport, StatusRule
 from ..models.user import User
 from ..repositories.projects import ProjectRepository
 from ..repositories.users import UserRepository
+from ..views import emails
 from .accounts import form_id
 from .errors import UserError
 
@@ -33,7 +37,8 @@ TICK_SECONDS = 300  # how often it looks for subscriptions due a check
 
 
 class ReleaseMover:
-    def __init__(self, users: UserRepository, projects: ProjectRepository, oauth: AtlassianOAuth):
+    def __init__(self, cfg: Config, users: UserRepository, projects: ProjectRepository, oauth: AtlassianOAuth):
+        self.cfg = cfg
         self.users = users
         self.projects = projects
         self.oauth = oauth
@@ -84,13 +89,13 @@ class ReleaseMover:
             raise UserError(f"{e}.") from None
 
     def _check(self, user: User, project: Project, now: float, asked: bool = False) -> ReleaseReport:
-        """`asked`: the developer pressed Check now (always told in Slack what is missing)."""
+        """`asked`: the developer pressed Check now (always told what is missing)."""
         sub = user.subscriptions[project.id]
         me = user.jira(sub.jira_account_id).account_id
         jira = jira_client(self.oauth, self.users, sub.jira_account_id, project.cloud_id)
         keys = ", ".join(sorted(project.jira_projects))  # validated: letters, digits and _
         moved, held, failed = [], [], []
-        gaps_of: list[tuple[str, StatusRule, list[str]]] = []  # (key, rule, what it misses), for Slack
+        gaps_of: list[tuple[str, StatusRule, list[str]]] = []  # (key, rule, what it misses), to tell them
         for rule in project.status_rules:
             # Status names hold no quote or backslash (release.parse_rules).
             jql = (f'project in ({keys}) AND assignee = currentUser() AND status = "{rule.from_status}" '
@@ -106,7 +111,7 @@ class ReleaseMover:
                 key, fields = issue.get("key") or "", issue.get("fields") or {}
                 if not (rules.ISSUE_KEY_RE.match(key) and project.handles(key) and rules.assignee(fields) == me):
                     continue
-                gaps = release.missing(rule, fields, project.root_cause_field)
+                gaps = release.missing(rule, fields, project)
                 if gaps:
                     held.append(f"{key} ({rule.from_status}): no {', '.join(gaps)}")
                     gaps_of.append((key, rule, gaps))
@@ -123,16 +128,29 @@ class ReleaseMover:
                     log.info("%s: moved from %s to %s for %s", key, rule.from_status, rule.to_status, user.display_name)
                     moved.append(f"{key} to {rule.to_status}")
         previous = sub.release_report.held if sub.release_report else ()
-        if gaps_of and user.slack and (asked or set(held) - set(previous)):
+        if gaps_of and (asked or set(held) - set(previous)):
+            failed += self._tell(user, project, gaps_of)
+        report = ReleaseReport(now, tuple(moved), tuple(held), tuple(failed))
+        self.users.save_release_report(user.id, project.id, report)
+        return report
+
+    def _tell(self, user: User, project: Project, gaps_of: list[tuple[str, StatusRule, list[str]]]) -> list[str]:
+        """Tell the developer which tickets stay and what they miss, the ways they chose. Returns
+        the problems, for the report."""
+        settings, problems = user.subscriptions[project.id].settings, []
+        if settings.tells("missing", "slack") and user.slack:
             try:
                 Slack(user.slack.token).post(user.slack.user_id, missing_message(project, gaps_of))
                 log.info("%s: %s told in Slack about %d incomplete tickets", project.name, user.display_name, len(gaps_of))
             except HTTPError as e:
                 log.warning("%s: could not tell %s in Slack about incomplete tickets: %s", project.name, user.display_name, e)
-                failed.append("Could not send you the missing fields in Slack: reconnect Slack on the Accounts tab?")
-        report = ReleaseReport(now, tuple(moved), tuple(held), tuple(failed))
-        self.users.save_release_report(user.id, project.id, report)
-        return report
+                problems.append("Could not send you the missing fields in Slack: reconnect Slack on the Accounts tab?")
+        actor = user.actor(project.id)
+        if settings.tells("missing", "email") and actor and not email_developer(
+                actor, self.cfg, f"{project.name}: tickets not complete yet", missing_message(project, gaps_of, slack=False),
+                project.name, emails.missing(project, gaps_of)):
+            problems.append("Could not email you the missing fields: see the server log.")
+        return problems
 
     @staticmethod
     def _move(jira: Jira, key: str, rule: StatusRule) -> str | None:
@@ -148,9 +166,14 @@ class ReleaseMover:
         return None
 
 
-def missing_message(project: Project, gaps_of: list[tuple[str, StatusRule, list[str]]]) -> str:
-    """The developer's direct message: each ticket left where it is, linked, and what it misses."""
-    lines = [f"• {issue_link(project.site_url, key)} stays in {slack_escape(rule.from_status)}, "
-             f"missing {slack_escape(', '.join(gaps))} (needed for {slack_escape(rule.to_status)})"
-             for key, rule, gaps in gaps_of]
+def missing_message(project: Project, gaps_of: list[tuple[str, StatusRule, list[str]]], slack: bool = True) -> str:
+    """The developer's message: each ticket left where it is, linked, and what it misses. `slack`:
+    in Slack's markup; else plain text, for an email."""
+    if slack:
+        lines = [f"• {issue_link(project.site_url, key)} stays in {slack_escape(rule.from_status)}, "
+                 f"missing {slack_escape(', '.join(gaps))} (needed for {slack_escape(rule.to_status)})"
+                 for key, rule, gaps in gaps_of]
+    else:
+        lines = [f"• {key} stays in {rule.from_status}, missing {', '.join(gaps)} (needed for {rule.to_status}): "
+                 f"{project.site_url}/browse/{key}" for key, rule, gaps in gaps_of]
     return "These tickets are not complete yet, so they were not moved:\n" + "\n".join(lines)

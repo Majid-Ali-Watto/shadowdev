@@ -41,7 +41,8 @@ code { font-family:var(--mono); font-size:.86em; background:var(--code); padding
 .top { display:flex; justify-content:space-between; align-items:center; gap:16px; flex-wrap:wrap; }
 .brand { display:flex; align-items:center; gap:12px; min-width:0; }
 .brand p { font-size:13.5px; margin:2px 0 0; overflow-wrap:anywhere; }
-.mark { width:34px; height:34px; color:var(--accent); flex:none; }
+.mark { width:64px; height:64px; flex:none; border-radius:50%; object-fit:cover;
+        box-shadow:0 0 0 1px var(--line), 0 2px 8px light-dark(rgba(79,70,229,.18), rgba(139,147,255,.25)); }
 .top + .card, .top + .alert { margin-top:20px; }
 .status { display:flex; align-items:center; gap:10px; margin:20px 0 0; padding:12px 14px; border-radius:var(--radius-sm);
           font-weight:500; font-size:14px; }
@@ -87,7 +88,7 @@ button.theme-toggle[hidden] { display:none; }
 
 /* Login */
 .login { max-width:440px; margin:12vh auto 0; padding:32px; text-align:center; }
-.login .mark { width:44px; height:44px; margin-bottom:14px; }
+.login .mark { display:block; width:160px; height:160px; margin:0 auto 18px; }
 .login h1 { font-size:24px; margin-bottom:8px; }
 .login .lead { color:var(--muted); margin-bottom:22px; }
 .login .alert { text-align:left; margin:0 0 16px; }
@@ -98,21 +99,42 @@ label { display:block; margin:14px 0; font-size:14px; font-weight:500; }
 label > .sub { display:block; margin-top:2px; font-size:13px; font-weight:400; color:var(--muted); }
 .optional { margin-left:6px; font-size:11.5px; font-weight:500; color:var(--muted); padding:1px 7px;
             border-radius:999px; background:var(--bg); border:1px solid var(--line); vertical-align:1px; }
-input[type=email], input[type=password], input[type=number], input[type=search], input:not([type]) {
+/* Text fields, selects and textareas share one look: a field, its hover, focus, error and disabled states. */
+input[type=email], input[type=password], input[type=number], input[type=search], input[type=time], input:not([type]), select, textarea {
   display:block; width:100%; margin-top:6px; padding:9px 12px; min-height:40px; font:15px var(--sans); font-weight:400;
-  color:var(--text); background:var(--field); border:1px solid var(--line-strong); border-radius:var(--radius-sm);
-  transition:border-color .15s, box-shadow .15s; }
-input::placeholder { color:var(--muted); opacity:.8; }
-input:hover { border-color:var(--muted); }
-input:focus { outline:none; border-color:var(--accent); box-shadow:var(--ring); }
-input[type=checkbox], input[type=radio] { accent-color:var(--accent); width:16px; height:16px; margin:0; flex:none; }
+  color:var(--text); background-color:var(--field); border:1px solid var(--line-strong); border-radius:var(--radius-sm);
+  box-shadow:inset 0 1px 2px light-dark(rgba(16,24,40,.05), rgba(0,0,0,.25));
+  transition:border-color .15s, box-shadow .15s, background-color .15s; }
+input::placeholder, textarea::placeholder { color:var(--muted); opacity:.75; }
+input:hover, select:hover, textarea:hover { border-color:var(--muted); }
+input:focus, select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:var(--ring);
+                                            background-color:var(--surface); }
+input:user-invalid, select:user-invalid, textarea:user-invalid { border-color:var(--err); }
+input:user-invalid:focus, select:user-invalid:focus, textarea:user-invalid:focus {
+  box-shadow:0 0 0 3px color-mix(in srgb, var(--err) 22%, transparent); }
+input:disabled, select:disabled, textarea:disabled { opacity:.6; cursor:not-allowed; background-color:var(--bg); }
+/* The select's own arrow is replaced by a chevron drawn with gradients (the CSP allows no images). */
+select { appearance:none; padding-right:36px; cursor:pointer; text-overflow:ellipsis;
+         background-image:linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+                          linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+         background-position:calc(100% - 18px) 52%, calc(100% - 13px) 52%; background-size:5px 5px;
+         background-repeat:no-repeat; }
+select:focus { background-image:linear-gradient(45deg, transparent 50%, var(--accent) 50%),
+                                linear-gradient(135deg, var(--accent) 50%, transparent 50%); }
+/* A textarea grows with its text (where field-sizing is supported) up to three lines, then scrolls. */
+textarea { font:13px/1.5 var(--mono); min-height:40px; max-height:calc(3lh + 20px); resize:none; overflow-y:auto;
+           field-sizing:content; scrollbar-width:thin; }
+input[type=checkbox], input[type=radio] { accent-color:var(--accent); width:17px; height:17px; margin:0; flex:none;
+                                          cursor:pointer; }
 .field { margin:16px 0; } .label { display:block; font-size:14px; font-weight:500; margin-bottom:6px; }
 .choices { display:grid; gap:8px; }
 .choice { display:flex; gap:10px; align-items:flex-start; margin:0; padding:11px 14px; font-weight:400; cursor:pointer;
           border:1px solid var(--line-strong); border-radius:var(--radius-sm); transition:border-color .15s, background .15s; }
 .choice input { margin-top:3px; }
-.choice:hover { border-color:var(--muted); }
+.choice:hover { border-color:var(--muted); background:color-mix(in srgb, var(--bg) 55%, transparent); }
 .choice:has(input:checked) { border-color:var(--accent); background:var(--accent-soft); }
+.choice:has(input:focus-visible) { box-shadow:var(--ring); }
+.choice:has(input:disabled) { opacity:.6; cursor:not-allowed; }
 .choice small { display:block; color:var(--muted); font-size:13px; margin-top:1px; }
 .choices.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
 #run-form .setting.delay { border-bottom:0; padding:4px 0 8px; }
@@ -122,22 +144,25 @@ input[type=checkbox], input[type=radio] { accent-color:var(--accent); width:16px
 /* Project picker */
 .dropdown summary { list-style:none; cursor:pointer; padding:9px 12px; min-height:40px; border:1px solid var(--line-strong);
                     border-radius:var(--radius-sm); background:var(--field); display:flex; justify-content:space-between;
-                    align-items:center; gap:8px; }
+                    align-items:center; gap:8px; transition:border-color .15s, box-shadow .15s;
+                    box-shadow:inset 0 1px 2px light-dark(rgba(16,24,40,.05), rgba(0,0,0,.25)); }
+.dropdown summary:hover { border-color:var(--muted); }
 .dropdown summary::-webkit-details-marker { display:none; }
 .dropdown summary::after { content:""; width:7px; height:7px; border:solid var(--muted); border-width:0 1.5px 1.5px 0;
                            transform:translateY(-2px) rotate(45deg); transition:transform .15s; flex:none; }
 .dropdown[open] summary { border-color:var(--accent); box-shadow:var(--ring); }
 .dropdown[open] summary::after { transform:translateY(2px) rotate(-135deg); }
-.dropdown .menu { border:1px solid var(--line); border-radius:var(--radius-sm); padding:4px; margin-top:6px;
-                  background:var(--surface); box-shadow:var(--shadow); }
+.dropdown .menu { border:1px solid var(--line-strong); border-radius:var(--radius-sm); padding:4px; margin-top:6px;
+                  background:var(--surface); box-shadow:0 8px 24px light-dark(rgba(16,24,40,.10), rgba(0,0,0,.5)); }
 .option { display:flex; gap:10px; align-items:center; margin:0; padding:8px 10px; border-radius:6px; font-weight:400;
-          cursor:pointer; }
+          cursor:pointer; transition:background .1s; }
 .option:hover { background:var(--bg); }
+.option:has(input:checked) { background:var(--accent-soft); }
 .option .muted { font-size:13px; margin-left:6px; }
 fieldset { border:1px solid var(--line); border-radius:var(--radius-sm); margin:12px 0 0; padding:8px 14px 4px;
            display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); column-gap:14px; }
 fieldset[hidden] { display:none; }
-legend { padding:0 6px; font-size:13px; font-weight:600; color:var(--muted); }
+legend { padding:0 6px; font-size:13px; font-weight:700; color:var(--accent); }
 fieldset label { font-family:var(--mono); font-size:13px; }
 fieldset input:not([type]) { font-family:var(--mono); font-size:14px; }
 
@@ -145,13 +170,23 @@ fieldset input:not([type]) { font-family:var(--mono); font-size:14px; }
 button, .button { display:inline-flex; align-items:center; justify-content:center; gap:6px; min-height:38px;
                   padding:8px 16px; font:600 14px var(--sans); border-radius:var(--radius-sm); cursor:pointer;
                   text-decoration:none; border:1px solid var(--accent); background:var(--accent); color:var(--on-accent);
-                  transition:background .15s, border-color .15s, color .15s, box-shadow .15s; }
+                  white-space:nowrap; user-select:none;
+                  box-shadow:0 1px 2px light-dark(rgba(16,24,40,.08), rgba(0,0,0,.3)),
+                             inset 0 1px 0 light-dark(rgba(255,255,255,.14), rgba(255,255,255,.08));
+                  transition:background .15s, border-color .15s, color .15s, box-shadow .15s, transform .05s; }
 button:hover, .button:hover { background:var(--accent-hover); border-color:var(--accent-hover); color:var(--on-accent); }
+button:active:not(:disabled), .button:active:not([aria-disabled]) { transform:translateY(1px); box-shadow:none; }
+button:focus-visible, .button:focus-visible { box-shadow:var(--ring); }
+button:disabled, button:disabled:hover { opacity:.5; cursor:not-allowed; background:var(--accent); border-color:var(--accent); }
 .button.block { display:flex; width:100%; min-height:44px; font-size:15px; }
-button.secondary, .button.secondary { background:var(--surface); color:var(--text); border-color:var(--line-strong); }
+button.secondary, .button.secondary { background:var(--surface); color:var(--text); border-color:var(--line-strong);
+                                      box-shadow:0 1px 2px light-dark(rgba(16,24,40,.06), rgba(0,0,0,.3)); }
 button.secondary:hover, .button.secondary:hover { background:var(--bg); border-color:var(--muted); color:var(--text); }
-button.danger { background:transparent; color:var(--err); border-color:color-mix(in srgb, var(--err) 50%, transparent); }
+button.secondary:disabled { background:var(--surface); border-color:var(--line-strong); }
+button.danger { background:transparent; color:var(--err); border-color:color-mix(in srgb, var(--err) 50%, transparent);
+                box-shadow:none; }
 button.danger:hover { background:var(--err-soft); border-color:var(--err); color:var(--err); }
+button.danger:disabled { background:transparent; border-color:color-mix(in srgb, var(--err) 50%, transparent); }
 button.small, .button.small { min-height:26px; padding:2px 10px; font-size:12px; }
 .actions { margin-top:18px; }
 
@@ -262,13 +297,30 @@ td.empty { text-align:center; padding:28px; color:var(--muted); font-family:var(
 form.stop { display:inline; margin-left:6px; }
 td.state > .button { margin-left:6px; }
 @keyframes pulse { 50% { opacity:.3; } }
+/* A running run's progress: a bar of its phases, and the step it is on. */
+td.state .progress { margin-top:6px; white-space:normal; }
+td.state progress { display:block; width:120px; height:6px; border:0; border-radius:3px; overflow:hidden;
+                    appearance:none; background:var(--accent-soft); accent-color:var(--accent); }
+td.state progress::-webkit-progress-bar { background:var(--accent-soft); }
+td.state progress::-webkit-progress-value { background:var(--accent); border-radius:3px; transition:width .4s ease; }
+td.state progress::-moz-progress-bar { background:var(--accent); border-radius:3px; }
+td.state .progress small { display:block; color:var(--muted); font-size:12px; margin-top:3px; max-width:180px; }
+
+/* While the next page or a form's answer loads (static/app.js): a bar along the top of the window,
+   and a spinner on the button that sent the form. */
+.loading-bar { position:fixed; top:0; left:0; right:0; height:3px; z-index:100; overflow:hidden; pointer-events:none;
+               background:var(--accent-soft); }
+.loading-bar::before { content:""; position:absolute; top:0; bottom:0; width:40%; background:var(--accent);
+                       animation:loading 1.1s ease-in-out infinite; }
+.loading-bar[hidden] { display:none; }
+@keyframes loading { from { left:-40%; } to { left:100%; } }
+button.busy { position:relative; color:transparent !important; }
+button.busy::after { content:""; position:absolute; inset:0; margin:auto; width:14px; height:14px; border-radius:50%;
+                     border:2px solid var(--on-accent); border-right-color:transparent; animation:spin .7s linear infinite; }
+button.secondary.busy::after, button.danger.busy::after { border-color:var(--text); border-right-color:transparent; }
+@keyframes spin { to { transform:rotate(360deg); } }
 
 /* Accounts, projects, the project editor */
-select, textarea { display:block; width:100%; margin-top:6px; padding:9px 12px; font:15px var(--sans); font-weight:400;
-                   color:var(--text); background:var(--field); border:1px solid var(--line-strong); border-radius:var(--radius-sm); }
-select { min-height:40px; }
-textarea { font:13px/1.5 var(--mono); min-height:66px; resize:vertical; }
-select:focus, textarea:focus { outline:none; border-color:var(--accent); box-shadow:var(--ring); }
 .items { list-style:none; margin:0 0 14px; padding:0; }
 .items li { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 0;
             border-bottom:1px solid var(--line); }
@@ -283,6 +335,9 @@ details.more { margin:10px 0; }
 details.more > summary { cursor:pointer; color:var(--accent); font-size:14px; font-weight:500; }
 /* A repo in the project editor: its fields stacked, unlike the grid of base-branch fields. */
 fieldset.settings label { font-family:var(--sans); }
+fieldset.settings, fieldset.repo { background:color-mix(in srgb, var(--bg) 40%, var(--surface)); }
+fieldset.settings .choice, fieldset.repo :is(input, select, textarea):not(:focus) { background-color:var(--surface); }
+fieldset.settings .choice:has(input:checked) { background:var(--accent-soft); }
 fieldset.settings .choices { margin:4px 0 10px; }
 fieldset.settings .sub-choices { margin:-2px 0 2px 22px; padding:2px 0 2px 14px; border-left:2px solid var(--line);
                                 transition:opacity .15s; }
@@ -299,13 +354,26 @@ fieldset.how > .hint { margin:10px 0 0; padding-bottom:12px; border-bottom:1px s
 .automation:has(input[name="set:release_moves"]:not(:checked)) [data-needs-release] { opacity:.5; }
 .automation:has(input[name="set:auto_start"]:not(:checked)) fieldset.start { opacity:.5; }
 fieldset.start input:not([type]) { width:320px; font-family:var(--sans); }
+/* Working hours: two time fields, the days as one segmented row of toggles, and a time zone. */
+.time-range { display:flex; align-items:center; gap:8px; flex:none; font-size:13px; color:var(--muted); }
+fieldset.how input[name="set:work_timezone"] { font-family:var(--sans); }
+.time-range input[type=time] { width:124px; margin:0; font-variant-numeric:tabular-nums; }
+.days { display:inline-flex; flex:none; border:1px solid var(--line-strong); border-radius:var(--radius-sm);
+        overflow:hidden; background:var(--field); }
+.day { position:relative; margin:0; cursor:pointer; }
+.day + .day { border-left:1px solid var(--line); }
+.day input { position:absolute; inset:0; width:100%; height:100%; margin:0; opacity:0; cursor:pointer; }
+.day span { display:block; min-width:46px; padding:9px 0; text-align:center; font-size:13px; font-weight:500;
+            color:var(--muted); transition:background-color .15s, color .15s; }
+.day:hover span { color:var(--text); }
+.day input:checked + span { background:var(--accent); color:var(--on-accent); }
+.day input:focus-visible + span { box-shadow:inset 0 0 0 2px var(--accent); }
 .choices.repos .choice { padding:9px 12px; }
 .choice small.mono { font-family:var(--mono); font-size:12px; overflow-wrap:anywhere; }
 label > .hint { display:block; font-weight:400; margin:4px 0 0; }
 fieldset.repo { display:block; padding:6px 16px 14px; margin:8px 0 12px; }
 fieldset.repo label { font-family:var(--sans); font-size:14px; }
 fieldset.repo label .muted { font-weight:400; }
-fieldset.repo textarea { margin-top:6px; min-height:40px; }
 fieldset.repo details.more { margin:6px 0 2px; }
 fieldset.repo [data-remove-repo] { margin-top:12px; }
 .row.intro .button { flex:none; }
@@ -314,6 +382,7 @@ fieldset.repo [data-remove-repo] { margin-top:12px; }
 .actions { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
 
 @media (max-width:600px) {
+  .mark { width:52px; height:52px; } .login .mark { width:128px; height:128px; }
   fieldset.settings .sub-choices { margin-left:8px; }
   body { padding:20px 12px 48px; }
   .card { padding:18px 16px; }
@@ -324,6 +393,8 @@ fieldset.repo [data-remove-repo] { margin-top:12px; }
   .setting { gap:14px; } .unit-input { width:112px; }
   fieldset.how .setting { flex-direction:column; align-items:stretch; gap:8px; }
   fieldset.how select, fieldset.how input:not([type]) { width:100%; }
+  .days { display:flex; width:100%; } .day { flex:1; } .day span { min-width:0; }
+  .time-range input[type=time] { flex:1; width:auto; }
   .row form button { width:100%; }
   .items li { flex-direction:column; align-items:stretch; }
   .choices.three { grid-template-columns:1fr; }

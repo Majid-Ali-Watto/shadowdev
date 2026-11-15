@@ -40,7 +40,9 @@ class ProjectRepository:
         return [Project(r["id"], r["name"], r["owner_id"], r["cloud_id"], r["url"], frozenset(keys.get(r["id"], ())),
                         r["root_cause_field"], tuple(repos.get(r["id"], ())), tuple(json.loads(r["start_statuses"])),
                         tuple(json.loads(r["review_statuses"])), r["slack_channel"],
-                        rules_from_json(r["status_rules"])) for r in rows]
+                        rules_from_json(r["status_rules"]), bool(r["uses_sprints"]), bool(r["uses_fix_versions"]),
+                        r["fix_version_pick"], tuple(json.loads(r["bug_types"])), tuple(json.loads(r["task_types"])))
+                for r in rows]
 
     def get(self, project_id: int) -> Project | None:
         found = self._query("p.id = ?", (project_id,))
@@ -67,18 +69,22 @@ class ProjectRepository:
         """Create (id 0) or update a project; returns its ID. Raises Taken."""
         with closing(self.db.connect()) as conn, conn:
             values = (project.name, project.root_cause_field, json.dumps(project.start_statuses),
-                      json.dumps(project.review_statuses), project.slack_channel, rules_to_json(project.status_rules))
+                      json.dumps(project.review_statuses), project.slack_channel, rules_to_json(project.status_rules),
+                      int(project.uses_sprints), int(project.uses_fix_versions), project.fix_version_pick,
+                      json.dumps(project.bug_types), json.dumps(project.task_types))
             try:
                 if project.id:
                     pid = project.id
                     conn.execute("UPDATE projects SET name = ?, root_cause_field = ?, start_statuses = ?, review_statuses = ?, "
-                                 "slack_channel = ?, status_rules = ? WHERE id = ?", (*values, pid))
+                                 "slack_channel = ?, status_rules = ?, uses_sprints = ?, uses_fix_versions = ?, "
+                                 "fix_version_pick = ?, bug_types = ?, task_types = ? WHERE id = ?", (*values, pid))
                     conn.execute("DELETE FROM project_keys WHERE project_id = ?", (pid,))
                     conn.execute("DELETE FROM repos WHERE project_id = ?", (pid,))
                 else:
                     pid = conn.execute(
                         "INSERT INTO projects (name, root_cause_field, start_statuses, review_statuses, slack_channel, status_rules, "
-                        "cloud_id, owner_id, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "uses_sprints, uses_fix_versions, fix_version_pick, bug_types, task_types, "
+                        "cloud_id, owner_id, webhook_secret) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (*values, project.cloud_id, project.owner_id, self.db.encrypt(secrets.token_urlsafe(32)))).lastrowid
                 conn.executemany("INSERT INTO project_keys VALUES (?, ?, ?)",
                                  [(pid, project.cloud_id, k) for k in sorted(project.jira_projects)])

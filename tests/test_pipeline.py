@@ -11,16 +11,19 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
 from cryptography.fernet import Fernet
 
-from shadowdev.automation import dryrun, pipeline, review, verify
+from shadowdev.automation import dryrun, pipeline, prompts, review, verify
 from shadowdev.automation.cancel import Cancelled
-from shadowdev.models.issue import RUN_COMMENT_STARTS
+from shadowdev.clients.mail import Smtp
+from shadowdev.models.issue import ROOT_CAUSE_HEAD, RUN_COMMENT_STARTS
 from shadowdev.models.project import Project, Repo
-from shadowdev.models.settings import Settings
+from shadowdev.models.publication import Publication
+from shadowdev.models.settings import DAYS, Settings
 from shadowdev.models.user import Actor, ClaudeAccount, GitHubAccount, SlackAccount, Subscription
 from shadowdev.repositories.database import Database
 from shadowdev.repositories.projects import ProjectRepository
@@ -127,7 +130,8 @@ class PipelineTest(unittest.TestCase):
                         setup="touch .setup-done", test="python3 -B run_tests.py")
 
         self.project = Project(id=1, name="proj", owner_id=1, cloud_id=OFFICE.cloud_id, site_url=OFFICE.url,
-                               jira_projects=frozenset({"PROJ"}), root_cause_field=None, repos=(repo("app"), repo("docs")))
+                               jira_projects=frozenset({"PROJ"}), root_cause_field=None, repos=(repo("app"), repo("docs")),
+                               fix_version_pick="highest")
         self.cfg = make_cfg(self.tmp, max_fix_attempts=3)
         self.actor = Actor(
             user_id=1, display_name="Majid", jira_account_id=ME,
@@ -401,6 +405,7 @@ class PipelineTest(unittest.TestCase):
     def test_a_pushed_branch_whose_pr_cannot_be_opened_stays_in_progress(self):
         self.jira.get_issue.return_value["fields"]["status"] = {"name": "To Do"}
         self.github.create_pr.side_effect = pipeline.HTTPError("GitHub 422: validation failed", 422)
+        self.github.prs_for_branch.return_value = []  # nor one opened by another run of the branch
         with self.assertLogs("shadowdev", "WARNING"):
             status, message = self.run_pipeline([RIGHT_FIX])
         self.assertEqual(status, "failed")
@@ -590,6 +595,52 @@ class PipelineTest(unittest.TestCase):
             return review.review_pr(self.project.repos[0], 1, ("C0REVIEWS1", "333.444"), self.project, self.actor,
                                     self.cfg, self.github)
 
+    def outside_working_hours(self, **chosen):
+        later = datetime.now(UTC) + timedelta(hours=2)
+        self.with_settings(work_from=later.strftime("%H:%M"), work_until=(later + timedelta(hours=1)).strftime("%H:%M"),
+                           work_days=DAYS, work_timezone="UTC", **chosen)
+
+    def test_outside_working_hours_the_run_works_and_its_prs_wait(self):
+        slack, held, opened = self.with_slack(), [], []
+        self.outside_working_hours()
+        status, message = self.run_pipeline([RIGHT_FIX], hold=held.append, on_pr=lambda *pr: opened.append(pr))
+        self.assertEqual(status, "done")
+        self.assertIn("branch PROJ-1 pushed in app; its PRs, and the review request, wait for your working hours", message)
+        self.assertEqual(sh(self.app_origin, "git", "rev-parse", "PROJ-1~1"),
+                         sh(self.app_origin, "git", "rev-parse", "release/1.10"))  # the work is on GitHub
+        self.github.create_pr.assert_not_called()
+        slack.post.assert_not_called()
+        self.assertFalse(any("pull/" in str(c.args[1]) for c in self.jira.comment.call_args_list))  # no PR links yet
+        self.assertNotIn(mock.call("PROJ-1", self.project.review_statuses), self.jira.move_along.call_args_list)
+        (publication,) = held
+        self.assertEqual(Publication.from_json(publication.to_json()), publication)
+        self.assertEqual([(c.repo, c.base, c.kind) for c in publication.changes], [("app", "release/1.10", "new")])
+        # In working hours: opened, with its review request and PR links, as at the end of a run.
+        self.with_settings()
+        status, message = pipeline.open_prs(publication, self.project, self.actor, self.jira, self.github, "PROJ-1",
+                                            on_pr=lambda *pr: opened.append(pr))
+        self.assertEqual((status, message), ("done", "app into release/1.10: https://github.com/o/r/pull/1"))
+        self.github.create_pr.assert_called_once()
+        self.assertEqual(slack.post.call_args.args[0], "C0REVIEWS1")
+        self.assertEqual(opened, [(self.project.repos[0], 1, "PROJ-1", ("C0REVIEWS1", "111.222"))])
+        self.assertTrue(any("pull/1" in str(c.args[1]) for c in self.jira.comment.call_args_list))
+        # Only pushing the branch involves nobody else: nothing waits.
+        sh(self.app_origin, "git", "branch", "-D", "PROJ-1")
+        held.clear()
+        self.outside_working_hours(publish="branch")
+        self.assertEqual(self.run_pipeline([RIGHT_FIX], hold=held.append)[0], "done")
+        self.assertEqual(held, [])
+
+    def test_outside_working_hours_a_review_answers_only_with_reactions(self):
+        slack = self.with_slack()
+        self.run_pipeline([RIGHT_FIX])
+        slack.post.reset_mock()
+        self.outside_working_hours()
+        status, _, state = self.review({"verdict": "approve", "comments": [], "summary": "Correct, and its test covers the case."})
+        self.assertEqual((status, state), ("done", "approved"))
+        self.github.create_review.assert_called_once()  # reviewed on GitHub, as asked
+        slack.post.assert_not_called()  # nothing said in the thread
+
     def test_a_pr_between_the_chosen_branches_is_approved_without_a_review_or_a_word_in_slack(self):
         slack = self.with_slack()
         self.run_pipeline([RIGHT_FIX])
@@ -755,14 +806,45 @@ class PipelineTest(unittest.TestCase):
         self.assertIn(f"- Majid (questions asked earlier): {asked}", analysis)
         self.assertIn("- Sara: The invoice total.", analysis)
 
+    def test_the_developer_is_told_the_ways_they_chose(self):
+        slack = self.with_slack()
+        FakeClaude.repos = ["app", "docs"]
+        self.actor = dataclasses.replace(self.actor, email="majid@office.example",
+                                         settings=Settings(notify_decisions="email"))
+        smtp = Smtp("mail.office.example", 587, "dev@office.example")
+        self.cfg = dataclasses.replace(self.cfg, smtp=smtp)
+        with mock.patch.object(pipeline, "send_mail") as send:
+            self.assertEqual(self.run_pipeline([RIGHT_FIX], only=("app",))[0], "question")
+        slack.post.assert_not_called()  # Slack switched off for this project
+        (used, to, subject, text, html), _ = send.call_args
+        self.assertEqual((used, to, subject), (smtp, "majid@office.example", "PROJ-1: your decision is needed"))
+        self.assertIn('<a href="https://office.atlassian.net/browse/PROJ-1"', html)
+        self.assertIn("The fix needs changes in docs too", html)
+        self.assertIn("goes on:\nPROJ-1: The fix needs changes in docs too", text)  # plain text, no Slack markup
+        self.assertTrue(text.endswith("\n\nPROJ-1: https://office.atlassian.net/browse/PROJ-1"))
+        # Neither: only the run's message on the page.
+        self.actor = dataclasses.replace(self.actor, settings=Settings(notify_decisions="none"))
+        with mock.patch.object(pipeline, "send_mail") as send:
+            self.assertEqual(self.run_pipeline([RIGHT_FIX], only=("app",))[0], "question")
+        send.assert_not_called()
+        slack.post.assert_not_called()
+        # Email chosen, but the server can't send it: logged, and the run goes on as before.
+        self.actor = dataclasses.replace(self.actor, settings=Settings(notify_decisions="both"))
+        self.cfg = dataclasses.replace(self.cfg, smtp=None)
+        with mock.patch.object(pipeline, "send_mail") as send, self.assertLogs("shadowdev", "WARNING") as logs:
+            self.assertEqual(self.run_pipeline([RIGHT_FIX], only=("app",))[0], "question")
+        send.assert_not_called()
+        self.assertIn("the server has no SMTP account", "\n".join(logs.output))
+        slack.post.assert_called_once()
+
     def test_a_fix_that_needs_more_than_the_chosen_repos_asks_the_developer_once(self):
         slack = self.with_slack()
         FakeClaude.repos = ["app", "docs"]
         reported = []
         status, message = self.run_pipeline([RIGHT_FIX], only=("app",), on_questions=reported.append)
         self.assertEqual(status, "question")
-        question = ("The fix needs changes in docs too, but you chose to change only app. Run it again with Change set "
-                    "to FE and BE to change them all, or as it is to keep to app.")
+        question = ("The fix needs changes in docs too, but you chose to change only app. Run it again with docs "
+                    "ticked too to change them, or as it is to keep to app.")
         self.assertEqual(reported, [{"PROJ-1": [question]}])
         self.assertEqual(slack.post.call_args.args[0], "U0000MEME0")  # the developer's own direct messages
         self.assertIn("goes on:\n<https://office.atlassian.net/browse/PROJ-1|PROJ-1>: The fix needs changes in docs too",
@@ -969,6 +1051,67 @@ Thanks"""))
             return review.fix_ci(self.project.repos[0], 1, "PROJ-1", sha or branch_head, self.project, self.actor, self.cfg,
                                  self.github)
 
+    BASE_MOVED = "def add(first, second):\n    return first - second\n"  # base renamed the arguments meanwhile
+    RESOLVED = "def add(first, second):\n    return first + second\n"
+
+    def conflicting(self):
+        """The PR of PROJ-1, and its base branch since changed on the same lines. Returns the PR's head."""
+        self.run_pipeline([RIGHT_FIX])
+        seed = self.tmp / "moved"
+        sh(self.tmp, "git", "clone", "-q", "-b", "release/1.10", str(self.app_origin), str(seed))
+        (seed / "calc.py").write_text(self.BASE_MOVED)
+        sh(seed, "git", "commit", "-qam", "Rename the arguments")
+        sh(seed, "git", "push", "-q", "origin", "HEAD:release/1.10")
+        head = sh(self.app_origin, "git", "rev-parse", "PROJ-1")
+        self.github.pr.return_value = {"state": "open", "number": 1, "title": "PROJ-1: Totals are wrong", "mergeable": False,
+                                       "head": {"sha": head, "ref": "PROJ-1"}, "base": {"ref": "release/1.10"}}
+        return head
+
+    def merge(self, content):
+        with self.fake_fixer(content), self.local_github():
+            return review.fix_conflicts(self.project.repos[0], 1, "PROJ-1", self.project, self.actor, self.cfg, self.github)
+
+    def test_a_conflict_with_the_base_branch_is_merged_resolved_and_pushed(self):
+        head = self.conflicting()
+        base = sh(self.app_origin, "git", "rev-parse", "release/1.10")
+        status, message = self.merge(self.RESOLVED)
+        self.assertEqual((status, message), ("done", "release/1.10 merged into https://github.com/acme/app/pull/1, "
+                                                     "1 conflict(s) resolved"))
+        self.assertEqual(sh(self.app_origin, "git", "show", "PROJ-1:calc.py") + "\n", self.RESOLVED)
+        # A merge commit on top of what was there, as the developer: nothing rewritten, no force push.
+        self.assertEqual(sh(self.app_origin, "git", "log", "-1", "--format=%P", "PROJ-1"), f"{head} {base}")
+        self.assertEqual(sh(self.app_origin, "git", "log", "-1", "--format=%an: %s", "PROJ-1"),
+                         "Majid Ali: Merge release/1.10 into PROJ-1")
+        self.assertIn("- app/calc.py", self.fixer.prompts[0])
+        self.github.comment.assert_called_with(
+            "acme/app", 1, "release/1.10 had moved on and conflicted with this. Merged it in and resolved the conflicts "
+                           "in calc.py: Renamed the arguments of add() as the reviewer asked.")
+        self.assertEqual(self.code_left_on_server(), [])
+
+    def test_a_merge_that_fails_the_tests_is_not_pushed(self):
+        head = self.conflicting()
+        status, message = self.merge("def add(first, second):\n    return first * second\n")  # add(2, 3) == 6
+        self.assertEqual((status, message), ("failed", "the merge of release/1.10 into https://github.com/acme/app/pull/1 "
+                                                       "still fails the tests; nothing pushed"))
+        self.assertEqual(sh(self.app_origin, "git", "rev-parse", "PROJ-1"), head)
+        self.assertIn("doesn't pass the tests yet, so nothing is pushed", self.github.comment.call_args.args[2])
+
+    def test_a_pr_that_no_longer_conflicts_is_left_alone(self):
+        head = self.conflicting()
+        self.github.pr.return_value["mergeable"] = True
+        self.assertEqual(self.merge(self.RESOLVED)[0], "skipped")
+        self.assertEqual(sh(self.app_origin, "git", "rev-parse", "PROJ-1"), head)
+
+    def test_conflict_markers_left_are_refused(self):
+        work = self.tmp / "work"
+        work.mkdir()
+        (work / "a.py").write_text("x = 1\n<<<<<<< HEAD\ny = 2\n=======\ny = 3\n>>>>>>> base\n")
+        (work / "b.py").write_text("s = '<<<<<<< in a string'\n# =======  a ruler\n")
+        self.assertEqual(prompts.markers_left(work, ["a.py", "b.py", "gone.py"]),
+                         "conflict markers are still in a.py: resolve every conflict and remove them")
+        (work / "a.py").write_text("x = 1\ny = 3\n")
+        self.assertIsNone(prompts.markers_left(work, ["a.py", "b.py"]))
+
     def test_failing_ci_is_fixed_on_the_prs_branch(self):
         self.run_pipeline([RIGHT_FIX])
         head = sh(self.app_origin, "git", "rev-parse", "PROJ-1")
@@ -1008,6 +1151,37 @@ Thanks"""))
 
     def with_settings(self, **chosen):
         self.actor = dataclasses.replace(self.actor, settings=Settings(**chosen))
+
+    def test_fix_version_by_the_projects_pick_and_none_without_fix_versions(self):
+        self.project = dataclasses.replace(self.project, fix_version_pick="branch")  # base release/1.10
+        self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
+        self.jira.set_fix_versions.assert_called_once_with("PROJ-1", ["Rel 1.10"])
+        sh(self.app_origin, "git", "branch", "-D", "PROJ-1")
+        self.jira.reset_mock()
+        self.project = dataclasses.replace(self.project, uses_fix_versions=False)
+        self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
+        self.jira.set_fix_versions.assert_not_called()
+        self.jira.project_versions.assert_not_called()
+
+    def test_root_cause_field_has_its_own_switch(self):
+        self.project = dataclasses.replace(self.project, root_cause_field="customfield_10201")
+        self.with_settings(jira_comments=False)  # the field is no comment: it is still filled
+        self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
+        self.jira.set_field.assert_called_once()
+        self.assertEqual(self.jira.set_field.call_args.args[:2], ("PROJ-1", "customfield_10201"))
+        self.jira.comment.assert_not_called()
+        sh(self.app_origin, "git", "branch", "-D", "PROJ-1")
+        self.jira.reset_mock()
+        self.with_settings(jira_root_cause=False)  # off: neither the field nor a comment instead
+        self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
+        self.jira.set_field.assert_not_called()
+        self.assertFalse(any(str(c.args[1]).startswith(ROOT_CAUSE_HEAD) for c in self.jira.comment.call_args_list))
+
+    def test_issue_types_come_from_the_project(self):
+        self.project = dataclasses.replace(self.project, bug_types=("Incident",))
+        self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "skipped")  # a Bug is no bug here
+        self.jira.get_issue.return_value["fields"]["issuetype"] = {"name": "Incident"}
+        self.assertEqual(self.run_pipeline([RIGHT_FIX])[0], "done")
 
     def test_with_jira_updates_off_nothing_is_written_to_the_ticket(self):
         self.with_settings(jira_status=False, jira_comments=False, jira_fix_version=False)
@@ -1216,9 +1390,10 @@ Thanks"""))
             self.assertEqual(self.run_pipeline([WRONG_FIX, RIGHT_FIX])[0], "done")
         text = "\n".join(logs.output)
         for step in ("Jira and GitHub checks", "clone app", "Claude analysis", "Claude change",
-                     "test app (attempt 1)", "Claude fix (attempt 1)", "test app (attempt 2)", "commit, push and PR app"):
+                     "test app (attempt 1)", "Claude fix (attempt 1)", "test app (attempt 2)", "commit and push app",
+                     "open PR app"):
             self.assertRegex(text, rf"PROJ-1: step {re.escape(step)} took \d")
-        self.assertRegex(text, r"PROJ-1: done in [\d.ms]+ \(Jira and GitHub checks [\d.ms]+ · .*commit, push and PR app")
+        self.assertRegex(text, r"PROJ-1: done in [\d.ms]+ \(Jira and GitHub checks [\d.ms]+ · .*commit and push app")
 
     def test_trailing_markup_is_trimmed_not_rejected(self):
         # MAR-2105 rerun: a correct analysis, with "</analysis>\n</invoke>" left at its end.

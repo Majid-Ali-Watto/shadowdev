@@ -1,9 +1,15 @@
 """Moving finished tickets along the Jira workflow once they are complete, e.g. Ready for Release ->
 Done when the ticket has its fix version, parent, estimate and logged time (and, for a bug, its root
-cause). A project's owner sets its rules; each developer switches the moves on for themselves
-(Settings.release_moves), and they act only on tickets assigned to that developer."""
+cause), or In Progress -> PR Review once a comment links its PR. A project's owner sets its rules
+(none by default: workflows differ);
+each developer switches the moves on for themselves (Settings.release_moves), and they act only on tickets assigned to that developer."""
 import json
+import re
 from dataclasses import asdict, dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .project import Project
 
 # (name, label): what a ticket must have filled before a rule moves it.
 CHECKS = (
@@ -12,11 +18,14 @@ CHECKS = (
     ("parent", "parent"),
     ("original_estimate", "original estimate"),
     ("time_spent", "logged time"),
+    ("pr_link", "PR link"),  # a comment links to a pull request of one of the project's repos
 )
 LABELS = dict(CHECKS)
-ALIASES = {**{label: name for name, label in CHECKS}, **{name: name for name, _ in CHECKS},
+ALIASES = {**{label.lower(): name for name, label in CHECKS}, **{name: name for name, _ in CHECKS},
            "time tracking": "time_spent", "time spent": "time_spent", "estimate": "original_estimate",
-           "parent ticket": "parent", "fix versions": "fix_version"}
+           "parent ticket": "parent", "fix versions": "fix_version", "pull request": "pr_link",
+           "pr": "pr_link", "ticket comment has pr link": "pr_link", "comment has pr link": "pr_link"}
+_PR_URL_RE = re.compile(r"github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]+)/pull/[0-9]+")
 MAX_RULES = 8
 MAX_STATUS_CHARS = 60
 
@@ -32,7 +41,7 @@ class StatusRule:
         return f"{self.from_status} -> {self.to_status}" + (f": {checks}" if checks else "")
 
 
-DEFAULT_RULES = (StatusRule("Ready for Release", "Done", tuple(name for name, _ in CHECKS)),)
+DEFAULT_RULES: tuple[StatusRule, ...] = ()  # workflows differ: a project's owner writes its own
 
 
 def parse_rules(text: str) -> tuple[StatusRule, ...]:
@@ -81,21 +90,26 @@ def rules_from_json(text: str | None) -> tuple[StatusRule, ...]:
 
 def fields_needed(root_cause_field: str | None) -> list[str]:
     """The Jira fields a ticket is searched with to check it."""
-    return ["issuetype", "status", "fixVersions", "parent", "timeoriginalestimate", "timespent",
-            root_cause_field or "comment"]
+    return ["issuetype", "status", "fixVersions", "parent", "timeoriginalestimate", "timespent", "comment",
+            *([root_cause_field] if root_cause_field else [])]
 
 
-def missing(rule: StatusRule, fields: dict, root_cause_field: str | None) -> list[str]:
-    """Labels of the rule's checks the ticket does not pass. Root cause: a bug's root cause field,
-    or, for a project without one, a comment that gives it."""
-    is_bug = ((fields.get("issuetype") or {}).get("name") or "").lower() == "bug"
+def missing(rule: StatusRule, fields: dict, project: "Project") -> list[str]:
+    """Labels of the rule's checks the ticket does not pass. Root cause: for an issue of one of the
+    project's bug types, its root cause field, or, for a project without one, a comment that gives
+    it. PR link: a comment linking to a pull request of one of the project's repos."""
+    root_cause_field = project.root_cause_field
+    is_bug = project.issue_kind(fields) == "bug"
+    comments = json.dumps(fields.get("comment") or {})
+    ours = {r.github.lower() for r in project.repos}
     passed = {
         "root_cause": not is_bug or (filled(fields.get(root_cause_field)) if root_cause_field
-                                     else "root cause" in json.dumps(fields.get("comment") or {}).lower()),
+                                     else "root cause" in comments.lower()),
         "fix_version": bool(fields.get("fixVersions")),
         "parent": bool(fields.get("parent")),
         "original_estimate": _positive(fields.get("timeoriginalestimate")),
         "time_spent": _positive(fields.get("timespent")),
+        "pr_link": any(m.lower() in ours for m in _PR_URL_RE.findall(comments)),
     }
     return [LABELS[c] for c in rule.checks if not passed[c]]
 

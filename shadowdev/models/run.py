@@ -18,6 +18,26 @@ STATUSES = {
 }
 KINDS = {"issue": "Jira issues", "pr": "Pull requests"}  # a run's issue_key is "MAR-1" or "acme/fe#12"
 
+# How far a running run is, for its progress bar: each phase, and how the names of the steps it
+# times (automation/timing.Timings.step, kept as the run's `step`) start. Work on a PR goes through
+# some of them only.
+PHASES = (
+    ("Checking", ("Jira and GitHub checks", "earlier branches", "base branches", "Jira status", "CI output", "diff")),
+    ("Cloning", ("clone ", "Jira attachments", "instructions from")),
+    ("Analysing", ("Claude model choice", "Claude analysis", "Jira questions", "Jira analysis")),
+    ("Changing", ("Claude change", "Claude resolves", "Claude review")),
+    ("Testing", ("test ", "Claude fix", "Claude regression", "regression tests")),
+    ("Publishing", ("commit", "open PR", "Jira: PRs", "Slack review", "Jira PR links", "answer and resolve")),
+)
+
+
+def phase(step: str) -> tuple[int, str] | None:
+    """(1-based number, name) of the phase the step is part of; None for a step of none."""
+    for number, (name, starts) in enumerate(PHASES, 1):
+        if step.startswith(starts):
+            return number, name
+    return None
+
 
 @dataclass(frozen=True)
 class RunFilter:
@@ -34,9 +54,9 @@ class RunFilter:
                    kind if kind in KINDS else "", int(page) if page.isdigit() and 0 < int(page) < 10_000 else 1)
 
     def query(self, **changes) -> str:
-        """This filter (with `changes`) as the query of the Runs tab's address, without the defaults."""
+        """This filter (with `changes`) as the query of the Recent runs tab's address, without the defaults."""
         f = replace(self, **changes)
-        return urlencode({k: v for k, v in (("tab", "runs"), ("q", f.text), ("status", f.status),
+        return urlencode({k: v for k, v in (("tab", "recent"), ("q", f.text), ("status", f.status),
                                             ("project", f.project), ("kind", f.kind), ("page", f.page)) if v and v != 1})
 
 

@@ -1,14 +1,15 @@
 """Building blocks shared by every page. Every value from outside is escaped with esc()."""
+import base64
 import html
 from pathlib import Path
 
 STATIC = Path(__file__).parent / "static"
 STYLE = (STATIC / "style.css").read_text()
 
-# The logo: a shape and its shadow. Inline, so the Content-Security-Policy needs no img-src.
-MARK = ('<svg class="mark" viewBox="0 0 32 32" aria-hidden="true">'
-        '<rect x="10" y="10" width="19" height="19" rx="5" fill="currentColor" opacity=".3"/>'
-        '<rect x="3" y="3" width="19" height="19" rx="5" fill="currentColor"/></svg>')
+# The logo (assets/logo.jpg), inlined as a data: URI so pages load nothing
+# else: the Content-Security-Policy allows images only from data: (routes/request.html).
+LOGO = "data:image/jpeg;base64," + base64.b64encode((Path(__file__).parent / "assets" / "logo.jpg").read_bytes()).decode()
+MARK = f'<img class="mark" src="{LOGO}" alt="">'
 
 THEMES = ("light", "dark")  # what the developer can choose; no choice follows the system's setting
 
@@ -32,6 +33,15 @@ def esc(value) -> str:
 def script(name: str, nonce: str) -> str:
     """static/<name> as an inline script carrying the page's nonce."""
     return f'<script nonce="{esc(nonce)}">\n{_SCRIPTS[name]}</script>'
+
+
+# The signed-in pages' scripts. Every one of those pages has all of them, so moving between them
+# without a reload (static/app.js) finds each part's script there; each looks for its own elements.
+APP_SCRIPTS = ("app.js", "theme.js", "tabs.js", "runs.js", "project_editor.js", "statuses.js")
+
+
+def app_scripts(nonce: str) -> str:
+    return "".join(script(name, nonce) for name in APP_SCRIPTS)
 
 
 def csrf_field(csrf: str) -> str:
@@ -69,13 +79,15 @@ def plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'s' if count != 1 else ''}"
 
 
-def page(title: str, body: str, theme: str = "") -> str:
-    """`theme`: one of THEMES, or "" for the system's."""
+def page(title: str, body: str, theme: str = "", app: bool = False) -> str:
+    """`theme`: one of THEMES, or "" for the system's. `app`: a signed-in page, which static/app.js
+    replaces with another without a reload (with app_scripts in its body)."""
     chosen = f' data-theme="{esc(theme)}"' if theme in THEMES else ""
     return f"""<!doctype html>
 <html lang="en"{chosen}><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>{esc(title)}</title>
+<link rel="icon" type="image/jpeg" href="{LOGO}">
 <style>
 {STYLE}</style></head>
-<body><main>{body}</main></body></html>"""
+<body><main{" data-app" if app else ""}>{body}</main></body></html>"""

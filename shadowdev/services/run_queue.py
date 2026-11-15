@@ -1,7 +1,11 @@
 """The pool that works on issues. Each developer's issues (or groups of issues fixed together) run up
-to their own Limits.max_parallel_runs at once, and at most MAX_WORKERS in all, taken from the
-developers in turn. Every run acts as the developer the
-issues are assigned to, with the Jira, GitHub and Claude accounts of their subscription."""
+to their own Limits.max_parallel_runs at once, each project's up to its own Settings.parallel_runs
+(its Settings.priority first, then the most urgent issue by its Jira priority), and at most
+MAX_WORKERS in all, taken from the developers in turn. Every run acts as the developer the issues
+are assigned to, with the Jira, GitHub and Claude accounts of their subscription. Runs work at any
+time; outside the developer's working hours a run's PRs are held for them (services/outbox.py)."""
+import bisect
+import itertools
 import json
 import logging
 import threading
@@ -19,6 +23,7 @@ from ..clients.github import GitHub
 from ..config import Config
 from ..models.issue import NOT_FINISHED
 from ..models.project import Project
+from ..repositories.held import HeldRepository
 from ..repositories.projects import ProjectRepository
 from ..repositories.reviews import ReviewRepository
 from ..repositories.runs import RunRepository
@@ -26,7 +31,7 @@ from ..repositories.users import UserRepository
 
 log = logging.getLogger("shadowdev")
 
-MAX_JOBS_PER_DEVELOPER = 10  # queued or running
+MAX_JOBS_PER_PROJECT = 10  # of one developer in one project, queued or running
 MAX_WORKERS = 20  # runs at the same time, of all developers: what one machine can take
 STOP_SECONDS = 10  # what a run being stopped at shutdown gets to end and record that
 
@@ -34,43 +39,76 @@ STOP_SECONDS = 10  # what a run being stopped at shutdown gets to end and record
 class FairQueue:
     """Jobs waiting for a worker, handed out one developer at a time in turn: a developer with ten
     queued jobs doesn't hold up one who just queued one. A developer with `limit(developer)` jobs
-    running gets no more until one is done(), or wake() says a limit was raised."""
+    running gets no more until one is done(), or wake() says a limit was raised.
 
-    def __init__(self, limit: Callable[[int], int] = lambda user_id: MAX_WORKERS):
-        self._jobs: dict[int, deque] = {}  # developer -> their waiting jobs
+    Each developer's jobs wait in one lane per project, the most urgent first (put's `urgency`,
+    the highest first; of the same urgency, the oldest). `lane(developer, project)` is (that
+    project's own limit, its rank): a project with that many jobs running gets no more, and of a
+    developer's projects with room, the lowest rank (the highest priority) goes first, then the
+    one whose next job is the most urgent, then in turn."""
+
+    def __init__(self, limit: Callable[[int], int] = lambda user_id: MAX_WORKERS,
+                 lane: Callable[[int, int], tuple[int, int]] = lambda user_id, project_id: (MAX_WORKERS, 0)):
+        # (developer, project) -> its waiting jobs, sorted: (-urgency, order put, job)
+        self._jobs: dict[tuple[int, int], list[tuple[int, int, object]]] = {}
+        self._order = itertools.count()
+        self._lanes: dict[int, deque[int]] = {}  # developer -> their projects with waiting jobs, in turn
         self._turn: deque[int] = deque()  # developers with waiting jobs, whose turn is next first
-        self._running: Counter[int] = Counter()  # developer -> their jobs handed out and not done
+        self._running: Counter = Counter()  # developer, and (developer, project) -> jobs handed out and not done
         self._limit = limit
+        self._lane = lane
         self._ready = threading.Condition()
 
-    def put(self, user_id: int, job) -> None:
+    def put(self, user_id: int, project_id: int, job, urgency: int = 0) -> None:
         with self._ready:
-            if user_id not in self._jobs:
-                self._jobs[user_id] = deque()
+            if user_id not in self._lanes:
+                self._lanes[user_id] = deque()
                 self._turn.append(user_id)
-            self._jobs[user_id].append(job)
+            if (user_id, project_id) not in self._jobs:
+                self._jobs[user_id, project_id] = []
+                self._lanes[user_id].append(project_id)
+            bisect.insort(self._jobs[user_id, project_id], (-urgency, next(self._order), job))  # orders never tie
             self._ready.notify()
+
+    def _pick(self) -> tuple[int, int] | None:
+        """The developer whose turn it is and who has room, and their project to run next."""
+        for user_id in self._turn:
+            if self._running[user_id] >= self._limit(user_id):
+                continue
+            open_lanes = []
+            for order, project_id in enumerate(self._lanes[user_id]):
+                room, rank = self._lane(user_id, project_id)
+                if self._running[user_id, project_id] < room:
+                    open_lanes.append((rank, self._jobs[user_id, project_id][0][0], order, project_id))
+            if open_lanes:
+                return user_id, min(open_lanes)[3]
+        return None
 
     def get(self):
         with self._ready:
-            while True:
-                user_id = next((u for u in self._turn if self._running[u] < self._limit(u)), None)
-                if user_id is not None:
-                    break
+            while (picked := self._pick()) is None:
                 self._ready.wait()
-            self._turn.remove(user_id)
-            jobs = self._jobs[user_id]
-            job = jobs.popleft()
+            user_id, project_id = picked
+            jobs, lanes = self._jobs[picked], self._lanes[user_id]
+            job = jobs.pop(0)[2]
+            lanes.remove(project_id)
             if jobs:
+                lanes.append(project_id)
+            else:
+                del self._jobs[picked]
+            self._turn.remove(user_id)
+            if lanes:
                 self._turn.append(user_id)
             else:
-                del self._jobs[user_id]
+                del self._lanes[user_id]
             self._running[user_id] += 1
+            self._running[picked] += 1
             return job
 
-    def done(self, user_id: int) -> None:
+    def done(self, user_id: int, project_id: int) -> None:
         with self._ready:
             self._running[user_id] -= 1
+            self._running[user_id, project_id] -= 1
             self._ready.notify_all()
 
     def wake(self) -> None:
@@ -86,17 +124,20 @@ class RunQueue:
     whether it is still queued (it never starts) or running (it stops at once: see cancel.py)."""
 
     def __init__(self, cfg: Config, users: UserRepository, projects: ProjectRepository, runs: RunRepository,
-                 oauth: AtlassianOAuth, reviews: ReviewRepository | None = None, workers: int = MAX_WORKERS):
+                 oauth: AtlassianOAuth, reviews: ReviewRepository | None = None, workers: int = MAX_WORKERS,
+                 held: HeldRepository | None = None):
         self.cfg = cfg
+        self.held = held  # set: runs outside their developer's working hours leave their PRs for them
         self.workers = workers
         self.users = users
         self.projects = projects
         self.runs = runs
         self.oauth = oauth
         self.reviews = reviews  # set: the PRs runs open are tracked, to act on their review comments
-        self._queue = FairQueue(lambda user_id: users.limits(user_id).max_parallel_runs)
+        self._queue = FairQueue(lambda user_id: users.limits(user_id).max_parallel_runs, self._lane)
         self._pending: set[tuple[str, str]] = set()  # (Jira site, issue key) queued or running
         self._jobs: dict[int, tuple[int, int, CancelToken]] = {}  # run id -> (developer, project, token)
+        self._records: dict[int, runlog.Record] = {}  # run id -> what it logged so far, while a worker is on it
         # Runs of a sequence not handed to the workers yet: run id -> (the run it follows, seconds
         # after it, developer, job), and, once that run has ended, run id -> (timer, developer, job).
         self._held: dict[int, tuple[int, float, int, tuple]] = {}
@@ -113,7 +154,7 @@ class RunQueue:
             project = self.projects.get(row["project_id"]) if row["project_id"] else None
             refusal = (self.submit(project, row["issue_key"].split(", "), row["user_id"], run_id=row["id"],
                                    note=row["note"], repos=tuple(filter(None, row["repos"].split(","))), batch=row["batch"],
-                                   follows=row["follows"], delay=row["delay"])
+                                   follows=row["follows"], delay=row["delay"], urgency=row["urgency"])
                        if project else "its project was deleted")
             if refusal:
                 self.runs.update(row["id"], "failed", f"not resumed after a ShadowDev restart: {refusal}")
@@ -125,13 +166,13 @@ class RunQueue:
     def submit(self, project: Project, keys: list[str], user_id: int, run_id: int | None = None,
                note: str = "", automatic: bool = False, work=None, after=None, claude: bool = True,
                repos: tuple[str, ...] = (), batch: int | None = None, follows: int | None = None,
-               delay: float = 0, never_run: bool = False) -> str | None:
+               delay: float = 0, never_run: bool = False, urgency: int = 2) -> str | None:
         """Queue the issues as one job. Returns why not, or None when queued; see queue().
         `never_run`: only when the developer never ran these issues before."""
         if never_run and any(self.runs.last_status(user_id, project.id, k) for k in keys):
             return "already run before"
         return self.queue(project, keys, user_id, run_id, note, automatic, work, after, claude, repos, batch, follows,
-                          delay)[0]
+                          delay, urgency)[0]
 
     def submit_sequence(self, items: list[tuple[Project, list[str], str, tuple[str, ...], int | None]], user_id: int,
                         delay: float) -> list[str | None]:
@@ -149,7 +190,7 @@ class RunQueue:
     def queue(self, project: Project, keys: list[str], user_id: int, run_id: int | None = None,
               note: str = "", automatic: bool = False, work=None, after=None, claude: bool = True,
               repos: tuple[str, ...] = (), batch: int | None = None, follows: int | None = None,
-              delay: float = 0) -> tuple[str | None, int | None]:
+              delay: float = 0, urgency: int = 2) -> tuple[str | None, int | None]:
         """Queue the issues as one job. Returns (why not, None), or (None, its run). `run_id`: an
         existing queued run, resumed after a restart. `note`: the developer's instructions for it.
         `automatic`: queued by a webhook or by polling, not by the developer. An issue whose last
@@ -163,7 +204,9 @@ class RunQueue:
         approved without a review), which the Claude account's usage limits then don't hold.
         `repos`: the repos the developer chose to change (none: Claude decides). `batch`: the runs
         started with this one, whose PRs get one review request once the last of them has ended.
-        `follows`: the run this one starts after, `delay` seconds after it has ended."""
+        `follows`: the run this one starts after, `delay` seconds after it has ended. `urgency`: by
+        its issue's Jira priority (rules.urgency), the more urgent first among the developer's
+        waiting runs of the project."""
         pending = {(project.cloud_id, k) for k in keys}
         if automatic:
             for key in keys:
@@ -177,13 +220,14 @@ class RunQueue:
             busy = sorted(k for _, k in self._pending & pending)
             if busy:
                 return f"already queued or running: {', '.join(busy)}", None
-            if sum(1 for owner, _, _ in self._jobs.values() if owner == user_id) >= MAX_JOBS_PER_DEVELOPER:
-                return f"you already have {MAX_JOBS_PER_DEVELOPER} runs queued or running", None
+            if sum(1 for owner, p, _ in self._jobs.values() if (owner, p) == (user_id, project.id)) >= MAX_JOBS_PER_PROJECT:
+                return f"you already have {MAX_JOBS_PER_PROJECT} runs of {project.name} queued or running", None
             self._pending |= pending
             run_id = run_id or self.runs.add(", ".join(keys), user_id, project.id, project.name, note, ",".join(repos), batch,
-                                             follows, delay)
+                                             follows, delay, urgency)
             self._jobs[run_id] = (user_id, project.id, CancelToken())
-            job = (project.id, tuple(keys), user_id, run_id, frozenset(pending), note, work, after, claude, repos, batch)
+            job = (project.id, tuple(keys), user_id, run_id, frozenset(pending), note, work, after, claude, repos, batch,
+                   urgency)
             waits = follows is not None and follows in self._jobs  # the run before it is still queued or running
             if waits:
                 self._held[run_id] = (follows, delay, user_id, job)
@@ -195,17 +239,20 @@ class RunQueue:
             self._start_later(run_id, user_id, job, ended + delay - time.time() if ended else 0)
         return None, run_id
 
+    def _put(self, user_id: int, job: tuple) -> None:
+        self._queue.put(user_id, job[0], job, job[11])
+
     def _start_later(self, run_id: int, user_id: int, job: tuple, seconds: float) -> None:
         """Hand the job to the workers, now or in `seconds`."""
         if seconds <= 0:
-            return self._queue.put(user_id, job)
+            return self._put(user_id, job)
 
         def start() -> None:
             with self._lock:
                 waiting = self._timers.pop(run_id, None)
             if waiting:
                 self.runs.set_message(run_id, "")
-                self._queue.put(user_id, job)
+                self._put(user_id, job)
 
         timer = threading.Timer(seconds, start)
         timer.daemon = True
@@ -230,18 +277,21 @@ class RunQueue:
             if timed:
                 timed[0].cancel()
             if held or timed:
-                self._queue.put(*(held[2:] if held else timed[1:]))
+                user_id, job = held[2:] if held else timed[1:]
+                self._put(user_id, job)
 
     def run_forever(self) -> None:
         while True:
-            project_id, keys, user_id, run_id, pending, note, work, after, claude, repos, batch = self._queue.get()
+            project_id, keys, user_id, run_id, pending, note, work, after, claude, repos, batch, _ = self._queue.get()
             with self._lock:
                 if self._closing:  # it stays queued in the database, and is queued again at the next start
                     continue
                 self._working += 1
             started = time.monotonic()
             try:
-                with runlog.recording() as record:
+                with runlog.recording(on_step=lambda name, run_id=run_id: self.runs.set_step(run_id, name)) as record:
+                    with self._lock:
+                        self._records[run_id] = record
                     try:
                         self._run(project_id, list(keys), user_id, run_id, note, work, claude, repos, batch)
                     except Exception:
@@ -254,9 +304,10 @@ class RunQueue:
                 with self._lock:
                     self._pending -= pending
                     del self._jobs[run_id]
+                    self._records.pop(run_id, None)
                     self._working -= 1
                 self._release(run_id)
-                self._queue.done(user_id)
+                self._queue.done(user_id, project_id)
                 if after:
                     try:
                         after()
@@ -295,9 +346,23 @@ class RunQueue:
             time.sleep(0.1)
         return left
 
+    def _lane(self, user_id: int, project_id: int) -> tuple[int, int]:
+        settings = self.users.settings(user_id, project_id)
+        return settings.max_runs, settings.rank
+
     def limits_changed(self) -> None:
-        """A developer changed their limits: runs waiting for a free slot of theirs look again."""
+        """A developer changed their limits, or a project's runs at the same time or priority:
+        runs waiting for a free slot of theirs look again."""
         self._queue.wake()
+
+    def log(self, user_id: int, run_id: int) -> str | None:
+        """What one of the developer's runs logged: so far while it works, else what was kept when it
+        ended. None for another developer's run, or one without a log."""
+        with self._lock:
+            job, record = self._jobs.get(run_id), self._records.get(run_id)
+        if job and record and job[0] == user_id:
+            return record.log
+        return self.runs.log(user_id, run_id)
 
     def stop_run(self, run_id: int, user_id: int) -> bool:
         """Stop one of the developer's queued or running jobs. False if there is no such job of
@@ -423,7 +488,9 @@ class RunQueue:
                                                  on_pr=lambda repo, number, branch, slack: self._track(
                                                      user_id, project_id, repo, number, branch, slack),
                                                  asked=asked, on_questions=lambda q: self.runs.set_questions(run_id, q),
-                                                 only=tuple(r for r in repos if project.repo(r)), announce=announce)
+                                                 only=tuple(r for r in repos if project.repo(r)), announce=announce,
+                                                 hold=(lambda publication: self.held.hold_publication(
+                                                     user_id, project_id, run_id, batch, publication)) if self.held else None)
             log.info("%s: %s: %s", label, status, message)
             self.runs.update(run_id, status, message)
         except Cancelled:

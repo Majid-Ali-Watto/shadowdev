@@ -16,16 +16,17 @@ class RunRepository:
         self.db = db
 
     def add(self, issue_key: str, user_id: int, project_id: int, project: str, note: str = "", repos: str = "",
-            batch: int | None = None, follows: int | None = None, delay: float = 0) -> int:
+            batch: int | None = None, follows: int | None = None, delay: float = 0, urgency: int = 2) -> int:
         """`repos`: the repos the developer chose to change, separated by commas; `batch`: the runs
-        whose PRs get one review request; `follows`: the run it starts `delay` seconds after."""
+        whose PRs get one review request; `follows`: the run it starts `delay` seconds after;
+        `urgency`: by its issue's Jira priority."""
         with closing(self.db.connect()) as conn, conn:
             conn.execute("DELETE FROM runs WHERE user_id = ? AND status NOT IN ('queued', 'running', 'stopping') AND id NOT IN "
                          "(SELECT id FROM runs WHERE user_id = ? ORDER BY id DESC LIMIT ?)", (user_id, user_id, KEPT_RUNS - 1))
             return conn.execute(
-                "INSERT INTO runs (issue_key, user_id, project_id, project, note, repos, batch, follows, delay, status, "
-                "updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
-                (issue_key, user_id, project_id, project, note, repos, batch, follows, delay, time.time()),
+                "INSERT INTO runs (issue_key, user_id, project_id, project, note, repos, batch, follows, delay, urgency, "
+                "status, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                (issue_key, user_id, project_id, project, note, repos, batch, follows, delay, urgency, time.time()),
             ).lastrowid
 
     def update(self, run_id: int, status: str, message: str = "") -> None:
@@ -37,8 +38,8 @@ class RunRepository:
         """What a run that has ended took (see automation/runlog.py), and what was logged while it
         worked: kept with the run, and deleted with it."""
         with closing(self.db.connect()) as conn, conn:
-            if conn.execute("UPDATE runs SET seconds = ?, cost = ?, turns = ? WHERE id = ?",
-                            (seconds, cost, turns, run_id)).rowcount and log:
+            if conn.execute("UPDATE runs SET seconds = ?, cost = ?, turns = ?, step = '', updated = ? WHERE id = ?",
+                            (seconds, cost, turns, time.time(), run_id)).rowcount and log:
                 conn.execute("INSERT OR REPLACE INTO run_logs (run_id, log) VALUES (?, ?)", (run_id, log))
 
     def log(self, user_id: int, run_id: int) -> str | None:
@@ -90,9 +91,21 @@ class RunRepository:
                 f"DELETE FROM runs WHERE user_id = ? AND status NOT IN ('queued', 'running', 'stopping') "  # noqa: S608
                 f"AND id IN ({','.join('?' * len(run_ids))})", (user_id, *run_ids)).rowcount
 
+    def set_step(self, run_id: int, step: str) -> None:
+        """The step a running run started (automation/timing.Timings.step), for its progress bar."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE runs SET step = ?, updated = ? WHERE id = ? AND status = 'running'",
+                         (step[:200], time.time(), run_id))
+
+    def version(self, user_id: int) -> tuple:
+        """Changes whenever one of the developer's runs is added, changed or removed: what the page's
+        live updates watch (routes/settings.run_events)."""
+        with closing(self.db.connect()) as conn:
+            return tuple(conn.execute("SELECT COUNT(*), MAX(updated) FROM runs WHERE user_id = ?", (user_id,)).fetchone())
+
     def set_model(self, run_id: int, model: str) -> None:
         with closing(self.db.connect()) as conn, conn:
-            conn.execute("UPDATE runs SET model = ? WHERE id = ?", (model[:200], run_id))
+            conn.execute("UPDATE runs SET model = ?, updated = ? WHERE id = ?", (model[:200], time.time(), run_id))
 
     def set_questions(self, run_id: int, questions: dict[str, list[str]]) -> None:
         """The questions the run asked its developer, by issue key, for their next run of it."""

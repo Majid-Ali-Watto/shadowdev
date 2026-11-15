@@ -1,6 +1,6 @@
-"""A limit on the requests one client may send to the routes anyone can call without signing in:
-starting a sign-in, the OAuth callback, and the webhook. Counted per client address and route,
-in memory, per minute."""
+"""A limit on the requests one client may send to the routes anyone can call without signing in
+(starting a sign-in, the OAuth callback, and the webhook), and to the ones that send messages out
+(test messages). Counted per client address and route, in memory, per minute."""
 import threading
 import time
 
@@ -8,7 +8,7 @@ from ..config import OAUTH_CALLBACK_PATH
 
 WINDOW_SECONDS = 60
 # Requests per client in a window. A Jira site sends every issue event of its projects to /webhook.
-LIMITS = {"/login/jira": 30, OAUTH_CALLBACK_PATH: 30, "/webhook": 600}
+LIMITS = {"/login/jira": 30, OAUTH_CALLBACK_PATH: 30, "/webhook": 600, "/project/test-message": 6}
 MAX_CLIENTS = 10_000  # counters kept; past it, those of windows gone by are dropped
 
 
