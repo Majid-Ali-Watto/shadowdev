@@ -5,6 +5,7 @@ from ..models.project import Project
 from ..models.release import rules_text
 from ..services.errors import UserError
 from ..services.projects import ProjectForm, RepoForm
+from ..views.overview import needs_count
 from ..views.project_editor import project_page
 from .request import FormPost, Request, form_action
 from .settings import action
@@ -34,7 +35,8 @@ def show_editor(req: Request, user, csrf: str, project: Project | None, values: 
     secret = service.webhook_secret(user, project) if project else None
     statuses = service.jira_statuses(user, project.cloud_id if project else values.get("cloud_id", ""),
                                      values.get("jira_keys", ""))
-    req.html(project_page(req.app.cfg, user, values, project, secret, csrf, nonce, req.theme(), error, statuses),
+    needs = needs_count(user, req.app.overview.of(user))
+    req.html(project_page(req.app.cfg, user, values, project, secret, csrf, nonce, req.theme(), error, statuses, needs),
              nonce, status=status)
 
 

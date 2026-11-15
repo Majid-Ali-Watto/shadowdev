@@ -30,6 +30,7 @@ from ..automation.review import (
     fix_conflicts,
     is_approved,
     review_pr,
+    review_state,
     waiting_threads,
 )
 from ..clients.github import GitHub
@@ -210,15 +211,18 @@ class ReviewWatcher:
         state, threads = github.review_threads(row["github"], row["number"])
         if state != "OPEN":
             return self.reviews.untrack_pr(row["id"])  # merged or closed: nothing more to watch
-        if remind and not self._reviewed(row, github, threads, actor.github.login):
+        verdicts = github.latest_reviews(row["github"], row["number"])
+        if remind and not self._reviewed(verdicts, threads, actor.github.login):
             reminding.setdefault((user.id, row["slack_channel"], row["slack_ts"]), []).append((row, repo))
         # Review comments first: their fix is a new commit, whose CI is then checked in turn.
-        waiting = actor.settings.fix_review_comments and self._review_comments(row, user, project, github, threads, now)
+        waiting = actor.settings.fix_review_comments and self._review_comments(row, user, project, threads, verdicts, now)
         # Then a conflict with the base branch: CI often doesn't even run on a PR that conflicts.
+        conflicts = ci_failed = False
         if not waiting and settings.fix_conflicts and row["conflict_rounds"] < MAX_CONFLICT_ROUNDS:
-            waiting = self._conflict(row, user, project, github)
+            waiting = conflicts = self._conflict(row, user, project, github)
         if not waiting and settings.fix_ci and row["ci_rounds"] < MAX_CI_ROUNDS:
-            self._failing_ci(row, user, project, github)
+            ci_failed = self._failing_ci(row, user, project, github)
+        self.reviews.set_pr_review(row["id"], review_state(threads, verdicts, actor.github.login, conflicts, ci_failed))
 
     # Reminding reviewers of a PR nobody has reviewed
 
@@ -237,12 +241,13 @@ class ReviewWatcher:
         return now - asked >= int(settings.remind_hours) * 3600 and now - row["reminded_at"] >= REMIND_EVERY
 
     @staticmethod
-    def _reviewed(row, github: GitHub, threads: list[dict], login: str) -> bool:
-        """Someone other than the developer has commented on the PR's code, or approved it or asked for changes."""
+    def _reviewed(verdicts: list[dict], threads: list[dict], login: str) -> bool:
+        """Someone other than the developer has commented on the PR's code, or approved it or asked for
+        changes (`verdicts`: GitHub.latest_reviews)."""
         others = lambda author: author.lower() != login.lower()
         if any(others(c["author"]) for t in threads for c in t["comments"]):
             return True
-        return any(others(r["author"]) for r in github.latest_reviews(row["github"], row["number"]))
+        return any(others(r["author"]) for r in verdicts)
 
     def _remind(self, user: User, channel: str, ts: str, rows: list, now: float) -> None:
         """One reply in the thread that asked for review of these PRs, mentioning their reviewers."""
@@ -257,8 +262,10 @@ class ReviewWatcher:
         log.info("reminded the reviewers of %s for %s", ", ".join(f"{r['github']}#{r['number']}" for r, _ in rows),
                  user.display_name)
 
-    def _review_comments(self, row, user: User, project: Project, github: GitHub, threads: list[dict], now: float) -> bool:
-        """Queue a run for the review comments waiting on the PR. True while some wait to be acted on."""
+    def _review_comments(self, row, user: User, project: Project, threads: list[dict], verdicts: list[dict],
+                         now: float) -> bool:
+        """Queue a run for the review comments waiting on the PR. True while some wait to be acted on.
+        `verdicts`: GitHub.latest_reviews."""
         if row["rounds"] >= MAX_ROUNDS:
             return False
         waiting = waiting_threads(threads, user.actor(project.id).github.login)
@@ -268,7 +275,7 @@ class ReviewWatcher:
         # A review is often several comments: act once none came for the developer's quiet time.
         if now - datetime.fromisoformat(newest.replace("Z", "+00:00")).timestamp() < user.limits.review_quiet_minutes * 60:
             return True  # the reviewer may still be writing
-        if is_approved(github.latest_reviews(row["github"], row["number"])):
+        if is_approved(verdicts):
             return False  # approved, comments and all: the reviewers don't need them fixed
         slack = (row["slack_channel"], row["slack_ts"]) if row["slack_ts"] else None
         number, branch = row["number"], row["branch"]
@@ -310,11 +317,14 @@ class ReviewWatcher:
                      user.display_name)
         return True
 
-    def _failing_ci(self, row, user: User, project: Project, github: GitHub) -> None:
-        """Queue a run for the PR's failing CI, once per head commit, when every check has finished."""
+    def _failing_ci(self, row, user: User, project: Project, github: GitHub) -> bool:
+        """Queue a run for the PR's failing CI, once per head commit, when every check has finished.
+        Whether its CI fails."""
         sha, state = github.ci_state(row["github"], row["number"])
-        if state not in CI_FAILED or sha == row["ci_sha"] or failed_checks(github, row["github"], sha) is None:
-            return
+        if state not in CI_FAILED:
+            return False
+        if sha == row["ci_sha"] or failed_checks(github, row["github"], sha) is None:
+            return True
         number, branch = row["number"], row["branch"]
 
         def work(project, actor, cfg, github, cancel, on_model):
@@ -327,6 +337,7 @@ class ReviewWatcher:
         if self.queue.submit(project, [f"{row['github']}#{number}"], user.id, work=work,
                              after=lambda: self.reviews.ci_handled(row["id"], sha)) is None:
             log.info("%s#%d: failing CI queued for %s", row["github"], number, user.display_name)
+        return True
 
     # Review requests in Slack
 

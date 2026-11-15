@@ -15,7 +15,7 @@ ShadowDev/
 │   ├── app.py             wires repositories and services together
 │   ├── server.py          HTTP server: dispatches each request to its route; stops gracefully on SIGTERM
 │   ├── logfiles.py        data/logs/: a private log file per day, kept 5 days
-│   ├── models/            plain dataclasses: User and its accounts and Limits, Subscription and its Settings, Actor, Project/Repo, Issue, Tokens, status rules (release.py), run search (run.py)
+│   ├── models/            plain dataclasses: User and its accounts and Limits, Subscription and its Settings, Actor, Project/Repo, Issue, Tokens, status rules (release.py), run search (run.py), the Overview (overview.py)
 │   ├── repositories/      SQLite, one class per table group
 │   │   ├── database.py    schema, connections, token encryption, key rotation, backups
 │   │   ├── migrations.py  upgrading a v1 database (and its projects/*.toml) in one transaction
@@ -30,6 +30,7 @@ ShadowDev/
 │   │   ├── projects.py    add/edit/delete projects, join/leave them
 │   │   ├── runs.py        run issues by hand, stop a run
 │   │   ├── run_queue.py   the pool of parallel runs, developers taking turns
+│   │   ├── overview.py    what the Overview tab shows: runs needing the developer, numbers, PRs, Claude usage, held work
 │   │   ├── webhook.py     Jira webhook: signature, replay protection, matching the developer
 │   │   ├── privacy.py     Atlassian's personal data reporting: erase closed accounts, refresh changed ones
 │   │   ├── poller.py      Poll Jira (Settings): ask Jira for new assignments, each developer at their interval
@@ -45,14 +46,17 @@ ShadowDev/
 │   │   └── webhook.py     /webhook, /health
 │   ├── views/             HTML: one module per page or tab
 │   │   ├── components.py  esc(), page(), and the pieces every page shares
-│   │   ├── home.py        the developer's page: header, status, tabs, NOTICES
+│   │   ├── layout.py      the frame of signed-in pages: the sidebar (sections, who is signed in), page titles
+│   │   ├── home.py        the developer's page: its sections as tabs, status, NOTICES
+│   │   ├── overview.py    Overview tab: the developer's dashboard (refreshed from GET /overview)
+│   │   ├── logs.py        Live logs tab: a terminal of the developer's working runs (static/logs.js, GET /logs/live)
 │   │   ├── runs.py        Run issues tab, and Recent runs tab (search, filters, pages)
 │   │   ├── projects.py    Projects tab: projects to join, webhook help
 │   │   ├── accounts.py    Accounts tab: Jira, GitHub, Claude, Slack
 │   │   ├── settings.py    Settings tab: timing and limits, pause, delete account
 │   │   ├── activity.py    Activity tab: sign-ins and changes to the account, by pages
 │   │   ├── features.py    Features tab: what ShadowDev does (FEATURES.md, alike)
-│   │   ├── project_editor.py  add or edit a project
+│   │   ├── project_editor.py  add or edit a project (part of Projects, in the same frame)
 │   │   ├── auth.py        sign in, connecting another Jira account
 │   │   ├── assets/        logo.jpg (inlined as a data: URI by components.LOGO)
 │   │   └── static/        style.css and the scripts (inlined with the page's CSP nonce); app.js moves

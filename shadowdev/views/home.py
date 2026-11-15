@@ -1,21 +1,22 @@
-"""The developer's page: a header, their status, and a tab per area (run issues, recent runs,
-projects, accounts, settings, activity, features).
-Every tab is in the page, so switching is instant; ?tab= picks the one shown, so links, reloads and
-the page after a form all land on the right one, with scripts off too."""
+"""The developer's page: a sidebar with the sections (Overview, run issues, recent runs, live logs,
+projects, accounts, settings, activity, features) and who is signed in, and beside it their status and the
+section shown. Every section is in the page, so switching is instant; ?tab= picks the one shown, so
+links, reloads and the page after a form all land on the right one, with scripts off too."""
 from ..config import Config
+from ..models.overview import Overview
 from ..models.project import Project
 from ..models.run import RunPage
 from ..models.user import User
 from .accounts import accounts_panel
 from .activity import activity_panel
-from .components import MARK, THEME_TOGGLE, alert, app_scripts, csrf_field, esc, page, plural
+from .components import alert, app_scripts, csrf_field, esc, page
 from .features import features_panel
+from .layout import TABS, automation_state, page_head, shell, sidebar
+from .logs import logs_panel
+from .overview import needs_count, overview_panel
 from .projects import projects_panel
 from .runs import recent_panel, runs_panel
 from .settings import settings_panel
-
-TABS = (("runs", "Run issues"), ("recent", "Recent runs"), ("projects", "Projects"), ("accounts", "Accounts"),
-        ("settings", "Settings"), ("activity", "Activity"), ("features", "Features"))
 
 # Success messages are fixed strings chosen by key, so nothing from the request is echoed.
 # Each names the tab its form is on, where the page opens after it (or with its error).
@@ -47,63 +48,44 @@ def first_tab(user: User) -> str:
     """Where a developer starts: the next setup step, or their runs once set up."""
     if not (user.github_accounts and user.claude_accounts):
         return "accounts"
-    return "recent" if user.ready_projects else "projects"
+    return "overview" if user.ready_projects else "projects"
 
 
 def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], runs: RunPage, csrf: str,
               nonce: str, theme: str = "", tab: str = "", error: str = "", notice: str = "", answering=None,
               claude_usage: dict[int, tuple[str, bool]] | None = None,
-              activity: tuple[list[tuple[float, str, str]], int, int] = ([], 1, 1)) -> str:
+              activity: tuple[list[tuple[float, str, str]], int, int] = ([], 1, 1), overview: Overview | None = None) -> str:
     """`tab`: the one shown (a key of TABS; anything else means first_tab). `error` and `notice`
     show at the top of that tab. `answering`: a run whose questions the Run issues tab's form answers.
-    `claude_usage`: AccountService.claude_usage, per Claude account. `activity`: a page of UserRepository.activity."""
+    `claude_usage`: AccountService.claude_usage, per Claude account. `activity`: a page of UserRepository.activity.
+    `overview`: OverviewService.of the developer."""
+    overview = overview or Overview()
     claude_usage = claude_usage or {}
     hidden = csrf_field(csrf)
     if tab not in dict(TABS):
         tab = first_tab(user)
     joined = [p for p in projects if p.id in user.subscriptions]
     panels = {
+        "overview": page_head("Overview", (), "", _status(user)) + overview_panel(user, overview),
         "runs": runs_panel(user.limits.max_parallel_runs, joined, csrf, answering),
         "recent": recent_panel(runs, csrf),
+        "logs": logs_panel(),
         "projects": projects_panel(cfg, user, projects, secrets, hidden, claude_usage),
         "accounts": accounts_panel(user, hidden, claude_usage),
         "settings": settings_panel(user, hidden),
         "activity": activity_panel(*activity),
         "features": features_panel(),
     }
-    nav = "".join(
-        f'<a href="/?tab={key}" id="tab-{key}" role="tab" aria-controls="panel-{key}" data-tab="{key}"'
-        f' aria-selected="{"true" if key == tab else "false"}" tabindex="{0 if key == tab else -1}">{label}</a>'
-        for key, label in TABS)
     sections = "".join(
         f'<section id="panel-{key}" role="tabpanel" aria-labelledby="tab-{key}"{"" if key == tab else " hidden"}>'
         f'{alert(error) + alert(notice, "notice") if key == tab else ""}{panels[key]}</section>'
         for key, _ in TABS)
-    return page("ShadowDev", f"""
-<header class="top">
-  <div class="brand">{MARK}<div><h1>ShadowDev</h1>
-    <p class="muted">Signed in as {esc(user.display_name)}{f" ({esc(user.email)})" if user.email else ""}</p></div></div>
-  <div class="header-actions">{THEME_TOGGLE}
-    <form method="post" action="/logout" data-reload>{hidden}<button class="secondary">Sign out</button></form></div>
-</header>
-{_status(user)}
-<nav class="tabs" role="tablist" aria-label="Sections">{nav}</nav>
-{sections}
-{app_scripts(nonce)}""", theme, app=True)
+    side = sidebar(user, hidden, tab, needs_count(user, overview), tabs=True)
+    return page("ShadowDev", shell(side, sections) + app_scripts(nonce), theme, app=True)
 
 
 def _status(user: User) -> str:
-    ready = user.ready_projects
-    if user.paused:
-        text = "Paused: nothing runs for you until you resume. Your settings are kept."
-    elif not ready:
-        text = "Not active yet: connect GitHub and Claude, and join a project with them."
-    else:
-        text = f"Active in {plural(len(ready), 'project')}: issues assigned to you there are worked on automatically."
-    # What stops runs sooner or later, and only the developer can mend (under Accounts).
-    problems = [f"Jira access of {a.display_name} was lost (expired or revoked): connect that account again under Accounts."
-                for a in user.jira_accounts if a.lost]
-    problems += [f"The GitHub {warning} ({g.label}): save a new token under Accounts."
-                 for g in user.github_accounts if (warning := g.expiry_warning())]
-    return (f'<p class="status {"ok" if ready and not user.paused else "warn"}" role="status">{esc(text)}</p>'
-            + "".join(f'<p class="status warn" role="status">{esc(p)}</p>' for p in problems))
+    """Overview's line under its title: whether automation works for the developer, in a sentence
+    (the sidebar says it in a word, layout.automation_state)."""
+    kind, _, sentence, _ = automation_state(user)
+    return f'<span class="state-line {kind}">{esc(sentence)}</span>'

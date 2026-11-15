@@ -54,6 +54,16 @@ class ReviewRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE pull_requests SET reminded_at = ?, reminders = reminders + 1 WHERE id = ?", (at, pr_id))
 
+    def set_pr_review(self, pr_id: int, review: str) -> None:
+        """How its review stands, as last read from GitHub (models.overview.PR_STATES)."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE pull_requests SET review = ? WHERE id = ?", (review, pr_id))
+
+    def prs_of(self, user_id: int) -> list[sqlite3.Row]:
+        """The developer's PRs being watched, the newest first."""
+        with closing(self.db.connect()) as conn:
+            return conn.execute("SELECT * FROM pull_requests WHERE user_id = ? ORDER BY id DESC", (user_id,)).fetchall()
+
     def untrack_pr(self, pr_id: int) -> None:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("DELETE FROM pull_requests WHERE id = ?", (pr_id,))

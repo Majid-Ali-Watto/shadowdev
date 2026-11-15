@@ -6,7 +6,7 @@ from ..models.project import Project
 from ..models.release import ReleaseReport
 from ..models.settings import DAYS, MAX_BRANCH_PATTERNS, PARALLEL_RUNS_CHOICES, REMIND_HOURS_CHOICES, Settings
 from ..models.user import MAX_TESTS, Subscription, User
-from .components import esc, options, tag
+from .components import confirm, esc, options, tag
 
 MODE_CHOICES = (("bugs", "Bug fixes only", "Bug"), ("all", "Bug fixes and tasks", "Bug, Task, Story, Sub-task"))
 # The automation switches of models.settings, by where they act: (legend, [(setting, label, detail)]).
@@ -129,7 +129,9 @@ def _subscription_form(user: User, project: Project, sub: Subscription | None, h
         f'<label>{esc(r.name)} <input name="base:{esc(r.name)}" value="{esc(bases.get(r.name, ""))}"'
         f' placeholder="latest {esc(r.release_prefix)}*, else default" spellcheck="false" autocomplete="off"></label>'
         for r in project.repos)
-    leave = (f'<button class="secondary" formaction="/project/leave" formnovalidate data-confirm="Leave {esc(project.name)}?">Leave</button>'
+    ask = confirm(f"Leave {project.name}?", "Issues assigned to you there are no longer worked on, your runs there are "
+                  "stopped, and your settings for it are removed.", "Leave")
+    leave = (f'<button class="secondary" formaction="/project/leave" formnovalidate{ask}>Leave</button>'
              if sub else "")
     return f"""<form method="post" action="/project/join">{hidden}<input type="hidden" name="project_id" value="{esc(project.id)}">
 {jira_field}
@@ -143,7 +145,7 @@ def _subscription_form(user: User, project: Project, sub: Subscription | None, h
   <fieldset><legend>Work is branched from here and the PR goes into it</legend>{branches}</fieldset></details>
 {_settings_fields(sub.settings if sub else Settings(), project, mail, user.email_for(sub) if sub else ("", ""),
                   bool(user.slack), sub)}
-<div class="actions"><button>{"Save" if sub else "Join"}</button>{leave}</div>
+<div class="actions"><button{confirm(f"Save your settings for {project.name}?", "Runs that start from now on use them.", "Save", danger=False) if sub else ""}>{"Save" if sub else "Join"}</button>{leave}</div>
 </form>"""  # noqa: S608
 
 
@@ -289,7 +291,7 @@ def _release_checks(project: Project, sub: Subscription, hidden: str, slack: boo
   <p class="hint">A ticket that misses something stays where it is{_told(sub, slack)}.</p>
   {_release_report(sub.release_report)}
   <form method="post" action="/project/release">{hidden}<input type="hidden" name="project_id" value="{esc(project.id)}">
-    <button class="secondary small">Check now</button></form>
+    <button class="secondary small"{confirm("Check tickets now?", "Tickets assigned to you that pass the project's status rules are moved in Jira now.", "Check now", danger=False)}>Check now</button></form>
 </details>"""
 
 
@@ -361,10 +363,13 @@ def _review_repos(settings: Settings, project: Project) -> str:
 </div>"""
 
 
-def webhook_help(project: Project, secret: str | None, cfg: Config) -> str:
+def webhook_help(project: Project, secret: str | None, cfg: Config, section: bool = False) -> str:
+    """The Jira webhook's URL and secret, folded away: under a link, or (`section`) as a card's own heading."""
     if not secret:
         return ""
-    return f"""<details class="more"><summary>Jira webhook for instant runs</summary>
+    summary = ('<h3>Jira webhook</h3><span class="muted">For instant runs: the URL and secret to give Jira</span>'
+               if section else "Jira webhook for instant runs")
+    return f"""<details class="more{" section" if section else ""}"><summary>{summary}</summary>
   <p class="hint">In Jira ({esc(project.site_url)}): <b>Settings → System → WebHooks → Create a WebHook</b>, with
     events Issue <b>created</b> and <b>updated</b>, and JQL <code>project in ({esc(", ".join(sorted(project.jira_projects)))})</code>.</p>
   <span class="label">URL</span><div class="secret">{esc(cfg.public_url)}/webhook?project={esc(project.id)}</div>

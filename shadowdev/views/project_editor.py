@@ -3,49 +3,63 @@ from ..config import Config
 from ..models.project import BUG_TYPES, TASK_TYPES, Project
 from ..models.release import LABELS
 from ..models.user import User
-from .components import MARK, THEME_TOGGLE, alert, app_scripts, csrf_field, esc, options, page
+from .components import alert, app_scripts, confirm, csrf_field, esc, options, page
+from .layout import page_head, shell, sidebar
 from .projects import webhook_help
 
 
 def project_page(cfg: Config, user: User, form: dict, project: Project | None, secret: str | None, csrf: str,
-                 nonce: str, theme: str = "", error: str = "", statuses: list[str] = ()) -> str:
-    """Add a project (project None) or edit one the developer owns. `form`: the values to show.
-    `statuses`: those of its Jira projects, suggested in the status fields."""
+                 nonce: str, theme: str = "", error: str = "", statuses: list[str] = (), needs: int = 0) -> str:
+    """Add a project (project None) or edit one the developer owns, in the frame of the developer's
+    page, as part of its Projects. `form`: the values to show. `statuses`: those of its Jira projects,
+    suggested in the status fields. `needs`: what needs the developer, on the sidebar's Overview."""
     hidden = csrf_field(csrf)
     v = lambda k: esc(form.get(k) or "")
     # Ticked unless the form was sent (or is a saved project's) with the box unticked.
     on = lambda k: " checked" if "jira_options" not in form or form.get(k) == "on" else ""
     sites = [(cid, f"{s.name} ({s.url})") for cid, s in sorted(user.sites.items(), key=lambda i: i[1].name)]
     site_field = (f'<label>Jira site <select name="cloud_id" required>{options(sites, form.get("cloud_id") or (sites[0][0] if len(sites) == 1 else None), "Choose…")}</select></label>'
-                  if not project else f'<p class="muted">Jira site: {esc(user.sites[project.cloud_id].name)}</p>')
+                  if not project else f'<label>Jira site <input value="{esc(user.sites[project.cloud_id].name)}" disabled></label>')
     github = [(g.id, f"{g.label} (@{g.login})") for g in user.github_accounts]
     chosen = int(form["github_account_id"]) if str(form.get("github_account_id") or "").isdigit() else (
         github[0][0] if len(github) == 1 else None)
     repos = "".join(_repo_fields(r) for r in form.get("repos") or [{}])
     title = f"Edit {project.name}" if project else "Add a project"
-    return page(f"{title} · ShadowDev", f"""
-<header class="top">
-  <div class="brand">{MARK}<div><h1>{esc(title)}</h1><p class="muted"><a href="/?tab=projects">Back to your projects</a></p></div></div>
-  {THEME_TOGGLE}
-</header>
+    head = page_head(title, (("Projects", "/?tab=projects"),), project.name if project else "New project",
+                     "Only you can change it. Every member's runs use it, each with their own accounts." if project else
+                     "Paste its repos and Jira keys: ShadowDev checks them against GitHub and Jira, and you join it.")
+    save_ask = confirm(f"Save changes to {project.name}?", "Every member's runs use them from their next start.", "Save",
+                       danger=False) if project else ""
+    content = f"""{head}
 {alert(error)}
-<section class="card">
-  <form method="post" action="/project/save" id="project">{hidden}
+<form method="post" action="/project/save" id="project" class="editor">{hidden}
 {f'<input type="hidden" name="project_id" value="{esc(project.id)}">' if project else ""}
-<label>Name <input name="name" value="{v('name')}" required maxlength="60" placeholder="e.g. marketplace"></label>
-{site_field}
-<label>Jira projects <input name="jira_keys" value="{v('jira_keys')}" required placeholder="MAR, MARS" spellcheck="false"></label>
-<label>Check the repos with GitHub account <select name="github_account_id" required>{options(github, chosen, "Choose…")}</select></label>
-<p class="hint">Your Jira account must see these Jira projects, and this GitHub account must be able to push to
-  every repo. Only you can change the project later; members bring their own accounts.</p>
-<span class="label">Repos</span>
-<div id="repos">{repos}</div>
-<button type="button" class="secondary" id="add-repo">Add another repo</button>
-<label>Slack channel for reviews <span class="optional">optional</span><span class="sub">The channel's ID</span>
-  <input name="slack_channel" value="{v('slack_channel')}" placeholder="C012ABC3DE" spellcheck="false" autocomplete="off"></label>
-<p class="hint">Members who connected Slack ask there for review of the PRs ShadowDev opens, mentioning each repo's
-  reviewers; and when one of them is mentioned there with a PR of this project, ShadowDev reviews it for them.</p>
-<details class="more"><summary>Jira workflow and fields</summary>
+<section class="card">
+  <div class="card-head"><h3>Project</h3></div>
+  <div class="grid">
+    <label>Name <input name="name" value="{v('name')}" required maxlength="60" placeholder="e.g. marketplace"></label>
+    {site_field}
+    <label>Jira projects <input name="jira_keys" value="{v('jira_keys')}" required placeholder="MAR, MARS" spellcheck="false"></label>
+  </div>
+  <label>Check the repos with GitHub account <select name="github_account_id" required>{options(github, chosen, "Choose…")}</select></label>
+  <p class="hint">Your Jira account must see these Jira projects, and this GitHub account must be able to push to
+    every repo. Only you can change the project later; members bring their own accounts.</p>
+</section>
+<section class="card">
+  <div class="card-head"><h3>Repos</h3><button type="button" class="secondary small" id="add-repo">Add another repo</button></div>
+  <p class="hint">Each run clones the ones it needs into one workspace, by folder name, and tests each it changes.</p>
+  <div id="repos">{repos}</div>
+</section>
+<section class="card">
+  <div class="card-head"><h3>Reviews in Slack</h3><span class="tag off">optional</span></div>
+  <label>Slack channel for reviews <span class="sub">The channel's ID</span>
+    <input name="slack_channel" value="{v('slack_channel')}" placeholder="C012ABC3DE" spellcheck="false" autocomplete="off"></label>
+  <p class="hint">Members who connected Slack ask there for review of the PRs ShadowDev opens, mentioning each repo's
+    reviewers; and when one of them is mentioned there with a PR of this project, ShadowDev reviews it for them.</p>
+</section>
+<section class="card">
+<details class="more section"><summary><h3>Jira workflow and fields</h3><span class="muted">Statuses, root cause, sprints,
+  fix versions, issue types, status rules</span></summary>
   <label>Statuses to move an issue through when work starts <input name="start_statuses" value="{v('start_statuses')}" placeholder="In Progress" list="jira-statuses" autocomplete="off" data-statuses></label>
   <label>Statuses once the PR is open <input name="review_statuses" value="{v('review_statuses')}" placeholder="In Review" list="jira-statuses" autocomplete="off" data-statuses></label>
   <datalist id="jira-statuses">{"".join(f'<option value="{esc(s)}">' for s in statuses)}</datalist>
@@ -71,13 +85,15 @@ def project_page(cfg: Config, user: User, form: dict, project: Project | None, s
     field, or a comment giving it); PR link is a comment linking a pull request of one of the project's repos. No checks: it moves as it is, e.g. <code>Merged -&gt; Ready for QA</code>. Empty: no
     tickets are moved.</p>
 </details>
-<div class="actions"><button>{"Save project" if project else "Add project"}</button></div>
-  </form>
 </section>
-{f'<section class="card">{webhook_help(project, secret, cfg)}</section>' if project and secret else ""}
+<div class="form-bar"><a class="button secondary" href="/?tab=projects">Cancel</a>
+  <button{save_ask}>{"Save project" if project else "Add project"}</button></div>
+</form>
+{f'<section class="card">{webhook_help(project, secret, cfg, section=True)}</section>' if project and secret else ""}
 {_delete_card(project, hidden) if project else ""}
-<template id="repo-template">{_repo_fields({})}</template>
-{app_scripts(nonce)}""", theme, app=True)
+<template id="repo-template">{_repo_fields({})}</template>"""
+    side = sidebar(user, hidden, "projects", needs, tabs=False)
+    return page(f"{title} · ShadowDev", shell(side, content) + app_scripts(nonce), theme, app=True)
 
 
 FIX_VERSION_LABELS = (("next", "The next release (lowest open version)"), ("highest", "The highest open version"),
@@ -85,9 +101,9 @@ FIX_VERSION_LABELS = (("next", "The next release (lowest open version)"), ("high
 
 
 def _delete_card(project: Project, hidden: str) -> str:
-    return f"""<section class="card"><div class="row">
-  <div><h3>Delete project</h3><p class="muted">For every member.</p></div>
-  <form method="post" action="/project/delete" data-confirm="Delete {esc(project.name)}? Its members stop running there and its queued runs are stopped.">{hidden}
+    return f"""<section class="card danger-zone"><div class="row">
+  <div><h3>Delete project</h3><p class="muted">For every member: their runs there stop, and it can't be undone.</p></div>
+  <form method="post" action="/project/delete"{confirm(f"Delete {project.name}?", "For every member: their runs there are stopped, and nothing more runs in it. This can't be undone.", "Delete project")}>{hidden}
     <input type="hidden" name="project_id" value="{esc(project.id)}"><button class="danger">Delete project</button></form>
 </div></section>"""
 

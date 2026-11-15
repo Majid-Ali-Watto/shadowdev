@@ -45,6 +45,7 @@ from shadowdev.services.errors import UserError
 from shadowdev.services.run_queue import RunQueue
 from shadowdev.services.webhook import matching_issue, verify_signature
 from shadowdev.views.home import home_page
+from shadowdev.views.overview import overview_panel
 from shadowdev.views.runs import example_keys, runs_panel
 from tests.helpers import HOME, OFFICE, add_developer, add_project, join, make_cfg, repo
 
@@ -627,7 +628,10 @@ class WebTest(Env):
         # Removing the personal GitHub account leaves that project waiting for another one.
         self.request("POST", "/github/remove", {"csrf": csrf, "github_account_id": gh["personal"].id})
         self.assertIsNone(self.me().actor(side.id))
-        self.assertIn("Active in 1 project:", self.request("GET", "/")[2])
+        page = self.request("GET", "/")[2]
+        self.assertIn("Active in 1 project:", page)  # under Overview's title
+        self.assertIn('<a class="side-status ok" href="/?tab=projects" title="Active in 1 project:', page)
+        self.assertIn(">Active · 1 project</a>", page)
         self.assertEqual(self.request("POST", "/project/leave", {"csrf": csrf, "project_id": side.id})[1], "/?ok=left")
         self.assertNotIn(side.id, self.me().subscriptions)
 
@@ -1134,6 +1138,9 @@ class WebTest(Env):
         self.assertEqual(self.request("POST", "/pause", {"csrf": csrf})[1], "/?ok=paused")
         page = self.request("GET", "/")[2]
         self.assertIn("Paused: nothing runs for you", page)
+        # In a word in the sidebar, on every page, leading to where to resume.
+        self.assertIn('<a class="side-status warn" href="/?tab=settings" title="Paused: nothing runs for you', page)
+        self.assertIn('<a class="side-status warn" href="/?tab=settings"', self.request("GET", "/project")[2])
         self.assertIn("Resume automation", page)
         self.assertTrue(self.me().paused)
         self.assertIn(market.id, self.me().subscriptions)  # settings kept
@@ -1923,6 +1930,36 @@ class OperationsWebTest(WebTest):
         self.assertIn('id="panel-features" role="tabpanel" aria-labelledby="tab-features" hidden',
                       self.request("GET", "/?tab=activity")[2])  # in every page, shown only when chosen
 
+    def test_overview_shows_what_needs_the_developer_and_what_runs(self):
+        self.assertEqual(self.request("GET", "/overview")[0], 401)
+        self.sign_in()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        asked = self.runs.add("MAR-1", uid, market.id, "marketplace")
+        self.runs.update(asked, "question", "needs your decision")
+        self.runs.set_questions(asked, {"MAR-1": ["Keep the old <API>?"]})
+        self.runs.update(self.runs.add("MAR-2", uid, market.id, "marketplace"), "failed", "tests <b>failed</b>")
+        self.runs.update(self.runs.add("MAR-3", uid, market.id, "marketplace"), "failed", "flaky")
+        self.runs.update(self.runs.add("MAR-3", uid, market.id, "marketplace"), "done", "PR opened")  # ran again since
+        running = self.runs.add("MAR-4", uid, market.id, "marketplace")
+        self.runs.update(running, "running")
+        self.runs.set_step(running, "Claude analysis")
+        self.runs.add("MAR-5", uid, market.id, "marketplace")  # queued
+        page = self.request("GET", "/?tab=overview")[2]
+        self.assertIn('data-tab="overview" aria-selected="true"', page)
+        self.assertIn('<span class="count" data-needs-count aria-label="2 need you">2</span>', page)
+        self.assertIn("MAR-1 asks you 1 question<small>Keep the old &lt;API&gt;?", page)
+        self.assertIn(f'href="/?tab=runs&amp;answer={asked}#run-form">Answer</a>', page)
+        self.assertIn("MAR-2 failed<small>tests &lt;b&gt;failed&lt;/b&gt;", page)
+        self.assertNotIn("MAR-3 failed", page)  # run again since: it no longer needs the developer
+        self.assertIn('aria-valuenow="3" aria-label="Analysing: phase 3 of 6"', page)
+        self.assertIn('<div class="v">1</div><div class="s">1 queued', page)  # running now
+        self.assertIn('<div class="k">Done, last 7 days</div><div class="v">1</div>', page)
+        # What the page loads to keep itself up to date: the same panel.
+        panel = self.request("GET", "/overview")[2]
+        self.assertTrue(panel.startswith('<div id="overview" data-needs="2">'), panel[:80])
+        self.assertIn("MAR-2 failed", panel)
+
     def test_activity_is_shown_a_page_at_a_time(self):
         self.sign_in()  # "Signed in" is the oldest entry
         me = self.me().id
@@ -2028,11 +2065,28 @@ class ProgressTest(QueueEnv):
         self.assertEqual((run["status"], run["step"]), ("running", "Claude analysis"))
         self.assertRegex(pool.log(me, run["id"]), r"MAR-1: Claude analysing")
         self.assertIsNone(pool.log(me + 1, run["id"]))  # another developer's
+        # Live logs: what it logged so far, then only what is new; never to another developer.
+        ((run_id, total, lines),) = pool.live(me, {})
+        self.assertEqual(run_id, run["id"])
+        self.assertTrue(any("MAR-1: Claude analysing" in line for line in lines))
+        self.assertEqual(pool.live(me, {run_id: total}), [(run_id, total, [])])
+        self.assertEqual(pool.live(me + 1, {}), [])
         release.set()
         self.wait_for(lambda: self.runs.recent(me)[0]["has_log"])
         run = self.runs.recent(me)[0]
         self.assertEqual((run["status"], run["step"]), ("done", ""))
         self.assertRegex(pool.log(me, run["id"]), r"MAR-1: Claude analysing")  # kept when it ended
+
+    def test_a_live_reader_gets_only_the_lines_it_has_not_seen(self):
+        record = runlog.Record()
+        for n in range(runlog.MAX_LINES + 5):
+            record.add(f"line {n}")
+        total, lines = record.since(0)
+        self.assertEqual((total, len(lines), lines[0]), (runlog.MAX_LINES + 5, runlog.MAX_LINES, "line 5"))  # the ones kept
+        record.add("new")
+        self.assertEqual(record.since(total), (total + 1, ["new"]))
+        self.assertEqual(record.since(total + 1), (total + 1, []))
+        self.assertEqual(record.since(total + 9), (total + 1, []))  # a reader ahead of it gets nothing
 
     def test_a_step_is_kept_only_while_the_run_is_running(self):
         me = self.developer()
@@ -2074,13 +2128,49 @@ class LiveWebTest(WebTest):
         self.sign_in()
         page = self.request("GET", "/")[2]
         self.assertIn("<main data-app>", page)
-        for name in ("app.js", "theme.js", "tabs.js", "runs.js", "project_editor.js", "statuses.js"):
+        for name in ("app.js", "theme.js", "tabs.js", "runs.js", "overview.js", "logs.js", "project_editor.js", "statuses.js"):
             self.assertIn(Path(settings_routes.__file__).parents[1].joinpath("views/static", name).read_text(), page)
-        self.assertEqual(page.count("<script nonce="), 6)
+        self.assertEqual(page.count("<script nonce="), 8)
         # Forms that leave the app load in full.
         for action in ("/logout", "/jira/connect", "/delete-account"):
             self.assertRegex(page, rf'<form method="post" action="{action}" data-reload')
-        self.assertIn("<main data-app>", self.request("GET", "/project")[2])
+        editor = self.request("GET", "/project")[2]
+        self.assertIn("<main data-app>", editor)
+        # The project editor is part of Projects: the same sidebar, there with links back to the sections.
+        self.assertIn('<a href="/?tab=projects" aria-current="page">', editor)
+        self.assertIn('<a href="/?tab=overview">', editor)
+        self.assertNotIn('id="tab-projects"', editor)  # links, not tabs of this page
+        self.assertIn('<nav class="crumbs" aria-label="Breadcrumb"><a href="/?tab=projects">Projects</a>', editor)
+        self.assertIn('action="/logout" data-reload data-confirm=', editor)
+        # Forms that delete, stop, change or sign out ask first, saying what follows.
+        self.assertIn('action="/logout" data-reload data-confirm="Only this browser is signed out. Automation keeps '
+                      'working on your issues." data-confirm-title="Sign out?" data-confirm-action="Sign out">', page)
+        self.assertIn('data-confirm-title="Delete your ShadowDev account?" data-confirm-action="Delete account" '
+                      'data-confirm-danger>', page)
+        self.assertIn('action="/pause" data-confirm=', page)
+        self.assertIn('action="/limits" data-confirm=', page)
+        self.assertIn('id="delete-runs" data-confirm=', page)
+
+    def test_live_logs_show_only_the_developers_own_working_runs(self):
+        self.assertEqual(self.request("GET", "/logs/live")[0], 401)
+        self.sign_in()
+        uid = self.me().id
+        market = add_project(self.projects, uid, "marketplace", ["MAR"])
+        run_id = self.runs.add("MAR-1", uid, market.id, "marketplace")
+        asked = []
+        self.pool.live = lambda user_id, seen: asked.append((user_id, seen)) or [(run_id, 3, ["12:00:00 <b>hi</b>"])]
+        status, _, body = self.request("GET", "/logs/live?seen=7:120,x:1,8:y," + ",".join(f"{n}:0" for n in range(1000, 1060)))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"runs": [{"id": run_id, "label": "MAR-1", "project": "marketplace",
+                                                      "total": 3, "lines": ["12:00:00 <b>hi</b>"]}]})
+        user_id, seen = asked[0]
+        self.assertEqual((user_id, seen[7], "x" in seen, 8 in seen), (uid, 120, False, False))  # only run:count pairs
+        self.assertLessEqual(len(seen), settings_routes.MAX_LIVE_RUNS)
+        self.pool.live = lambda user_id, seen: [(run_id + 99, 1, ["not a run of theirs"])]
+        self.assertEqual(json.loads(self.request("GET", "/logs/live")[2]), {"runs": []})
+        page = self.request("GET", "/?tab=logs")[2]
+        self.assertIn('data-tab="logs" aria-selected="true"', page)
+        self.assertIn('<div class="terminal" data-terminal role="log"', page)
 
     def test_a_running_run_shows_its_progress(self):
         self.sign_in()
@@ -2179,3 +2269,53 @@ class GitHubExpiryTest(unittest.TestCase):
         self.assertEqual(account(now + 3600).expiry_warning(now), "token expires today")
         self.assertEqual(account(now - 1).expiry_warning(now), "token expired")
         self.assertNotIn("'t'", repr(account(0)))  # the token is never in its repr
+
+
+class OverviewTest(unittest.TestCase):
+    """What the Overview gathers beyond runs: PRs in review, what waits for working hours, Claude usage."""
+
+    def setUp(self):
+        limits.USAGE.clear()
+        self.addCleanup(limits.USAGE.clear)
+        self.app = build_app(make_cfg(Path(tempfile.mkdtemp())), mock.Mock(), mock.Mock())
+        self.uid = add_developer(self.app.users, "acc-majid")
+        self.market = add_project(self.app.projects, self.uid, "marketplace", ["MAR"])
+        join(self.app.users, self.uid, self.market, "acc-majid",
+             settings=Settings(work_from="09:00", work_until="17:00", work_days=("sat",), work_timezone="UTC"))
+
+    def panel(self) -> str:
+        user = self.app.users.get(self.uid)
+        return overview_panel(user, self.app.overview.of(user))
+
+    def test_prs_held_work_and_claude_usage(self):
+        self.assertIn("No open PRs of yours are watched", self.panel())
+        self.assertIn("Nothing is waiting", self.panel())
+        self.assertIn("Not known yet", self.panel())
+        reviews = self.app.reviews
+        reviews.track_pr(self.uid, self.market.id, "fe", "acme/fe", 7, "MAR-1", None)
+        reviews.track_pr(self.uid, self.market.id, "fe", "acme/fe", 8, "MAR-2", None)
+        reviews.set_pr_review(reviews.prs_of(self.uid)[0]["id"], "approved:2")
+        held = self.app.overview.held
+        held.hold_publication(self.uid, self.market.id, None, None,
+                              Publication(("MAR-3",), "MAR-3", "MAR-3: x", (Change("fe", "main", "new", "body"),)))
+        held.hold_call(self.uid, self.market.id, "jira", "comment", ["MAR-3", "secret <text>"])
+        held.hold_slack(self.uid, self.market.id, "C1", "reply", "1.2")
+        user = self.app.users.get(self.uid)
+        key = str(claude_config_dir(self.app.cfg, user.claude_accounts[0]))
+        now = time.time()
+        limits.USAGE.record(key, {"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": 0.4, "resetsAt": now + 3600},
+            "seven_day": {"utilization": 0.95, "resetsAt": now + 86400}}})
+        panel = self.panel()
+        self.assertIn('href="https://github.com/acme/fe/pull/8" target="_blank" rel="noopener">acme/fe#8</a><small>MAR-2</small>', panel)
+        self.assertIn("approved by 2", panel)
+        self.assertIn("not checked yet", panel)  # its review was not read yet
+        self.assertIn('<div class="k">PRs in review</div><div class="v">2</div>', panel)
+        self.assertIn("marketplace: your hours begin", panel)
+        self.assertIn("Pull requests of MAR-3", panel)
+        self.assertIn("1 comment on Jira and GitHub", panel)
+        self.assertIn("1 Slack reply to reviewers", panel)
+        self.assertNotIn("secret", panel)  # what a held comment says is not shown
+        self.assertIn('aria-valuenow="40" aria-label="5-hour limit"><i class="" style="width:40%">', panel)
+        self.assertIn('aria-valuenow="95" aria-label="Weekly limit"><i class="warn" style="width:95%">', panel)
+        self.assertIn('<span class="tag warn">at its limit</span>', panel)  # 95% of the week, which resets in a day

@@ -2,7 +2,7 @@
 account."""
 from ..models.limits import BOUNDS, LABELS, MINUTES, Limits, number
 from ..models.user import User
-from .components import esc
+from .components import confirm, esc
 
 # The numbers of models.limits, by what they are about: (heading, [(limit, unit, what it does)]).
 LIMIT_GROUPS = (
@@ -61,7 +61,7 @@ def _limits_card(user: User, hidden: str) -> str:
   <p class="muted">Yours alone: how often ShadowDev looks for your work, and how much a run may take. Times are
     in minutes, with decimals for less: 0.5 is 30 seconds. Polls use a change from their next round, runs from
     their start.</p>
-  <form method="post" action="/limits">{hidden}
+  <form method="post" action="/limits"{confirm("Save timing and limits?", "Polls use them from their next round, and runs from their start.", "Save", danger=False)}>{hidden}
 {rows}
 <div class="actions"><button>Save timing and limits</button></div>
   </form>
@@ -75,7 +75,7 @@ def settings_panel(user: User, hidden: str) -> str:
     else:
         pause_title = "Pause automation"
         pause_text = "Stops ShadowDev from working on your issues, without changing your settings. A run in progress finishes."
-        pause_form = f'<form method="post" action="/pause">{hidden}<button class="secondary">Pause automation</button></form>'
+        pause_form = f'<form method="post" action="/pause"{confirm("Pause automation?", "Nothing runs for you until you resume: webhooks for your issues are ignored and queued runs are skipped. A run in progress finishes, and your settings are kept.", "Pause", danger=False)}>{hidden}<button class="secondary">Pause automation</button></form>'
     return _limits_card(user, hidden) + f"""<section class="card">
   <div class="row">
     <div><h3>{pause_title}</h3><p class="muted">{esc(pause_text)}</p></div>
@@ -87,7 +87,7 @@ def settings_panel(user: User, hidden: str) -> str:
         removes your accounts, tokens, settings and run history from ShadowDev. Projects you own pass to
         their longest-standing member. To revoke access completely, also remove it at Atlassian
         (Connected apps), GitHub (your tokens) and Claude.</p></div>
-    <form method="post" action="/delete-account" data-reload data-confirm="Delete your ShadowDev account? Your queued and running runs are stopped and your stored tokens removed.">{hidden}
+    <form method="post" action="/delete-account" data-reload{confirm("Delete your ShadowDev account?", "Your queued and running runs are stopped, and your accounts, tokens, settings and run history are removed. This can't be undone.", "Delete account")}>{hidden}
       <button class="danger">Delete my ShadowDev account</button></form>
   </div>
 </section>"""

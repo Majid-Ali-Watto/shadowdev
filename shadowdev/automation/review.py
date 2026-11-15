@@ -83,6 +83,17 @@ def is_approved(reviews: list[dict]) -> bool:
     return "APPROVED" in states and "CHANGES_REQUESTED" not in states
 
 
+def review_state(threads: list[dict], verdicts: list[dict], login: str, conflicts: bool, ci_failed: bool) -> str:
+    """How a PR the developer opened stands, for their Overview: "conflict", "ci" (its CI fails),
+    "changes" (changes requested), "comments:N" (N threads wait for them), "approved:N" (by N
+    reviewers) or "waiting" (for a review). The first of those that holds."""
+    states = [r["state"] for r in verdicts if r["association"] in REVIEWERS and r["author"].lower() != login.lower()]
+    waiting = len(waiting_threads(threads, login))
+    return ("conflict" if conflicts else "ci" if ci_failed else "changes" if "CHANGES_REQUESTED" in states
+            else f"comments:{waiting}" if waiting else f"approved:{states.count('APPROVED')}" if "APPROVED" in states
+            else "waiting")
+
+
 def reviewed_by_others(pr: dict, reviews: list[dict], threads: list[dict], login: str) -> str | None:
     """Why the developer should not review the PR: it is approved (by anyone, them too), or a
     reviewer other than them and its author has commented on it or asked for changes. None: review it."""

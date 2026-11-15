@@ -7,7 +7,7 @@ from ..automation.rules import MAX_NOTE_CHARS
 from ..automation.timing import duration
 from ..models.project import Project
 from ..models.run import ACTIVE, KINDS, MAX_SEARCH, PAGE_SIZE, PHASES, STATUSES, RunPage, phase
-from .components import csrf_field, esc, options, plural
+from .components import confirm, csrf_field, esc, options, plural
 
 SHORT_MESSAGE = 90  # a longer message, or one with a model or note, folds to its first line until opened
 # Links in a run's message (escaped already): PRs, and where to open one by hand.
@@ -87,7 +87,7 @@ def recent_panel(runs: RunPage, csrf: str) -> str:
     hidden = csrf_field(csrf)
     return f"""<section class="card">
   <div class="card-head"><h3>Recent runs</h3>
-    <form method="post" action="/runs/delete" id="delete-runs" data-confirm="Remove the selected runs from Recent runs? Their tickets and pull requests are not touched.">{hidden}
+    <form method="post" action="/runs/delete" id="delete-runs"{confirm("Delete the selected runs?", "They are removed from Recent runs, with their logs; queued and running ones are stopped first. Their tickets and pull requests are not touched.", "Delete runs")}>{hidden}
       <button class="danger small" id="delete-selected" disabled>Delete selected</button></form></div>
   {_filters(runs)}
   <p class="sr-only" id="runs-status" role="status"></p>
@@ -288,5 +288,7 @@ def _stop_button(run, hidden: str) -> str:
         return f'<a class="button small" href="/?tab=runs&amp;answer={esc(run["id"])}#run-form">Answer</a>'
     if run["status"] not in ("queued", "running"):
         return ""
-    return (f'<form method="post" action="/stop" class="stop">{hidden}'
+    ask = confirm(f"Stop {run['issue_key']}?", "A queued run never starts. A running one stops at once: Claude and the "
+                  "tests are stopped, nothing more is pushed or written to Jira, and the ticket is left as it was.", "Stop run")
+    return (f'<form method="post" action="/stop" class="stop"{ask}>{hidden}'
             f'<input type="hidden" name="run_id" value="{esc(run["id"])}"><button class="danger small">Stop</button></form>')

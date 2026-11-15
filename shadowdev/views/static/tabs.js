@@ -1,4 +1,4 @@
-// Tabs of the developer's page (WAI-ARIA tabs): a click or the arrow keys switch panels in place,
+// Tabs of the developer's page, in its sidebar (WAI-ARIA tabs): a click or the arrow keys switch panels in place,
 // and the address keeps ?tab=, so a reload or a shared link opens the same one. Without scripts
 // each tab is a plain link to its ?tab=.
 ShadowDev.mount(() => {
@@ -23,9 +23,16 @@ ShadowDev.mount(() => {
   }
   list.addEventListener("keydown", e => {
     const i = tabs.indexOf(document.activeElement);
-    const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
+    const next = { ArrowDown: i + 1, ArrowRight: i + 1, ArrowUp: i - 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
     if (i < 0 || next === undefined) return;
     e.preventDefault();
     select(tabs[(next + tabs.length) % tabs.length], true);
   });
+});
+
+// On a narrow screen the sidebar's sections are a row that scrolls: bring the current one into view.
+ShadowDev.mount(() => {
+  const nav = document.querySelector(".side-nav");
+  const current = nav && nav.querySelector('[aria-current="page"], [aria-selected="true"]');
+  if (current && nav.scrollWidth > nav.clientWidth) nav.scrollLeft = current.offsetLeft - nav.offsetLeft - 12;
 });

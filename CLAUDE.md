@@ -66,7 +66,10 @@ app.py builds everything (build_app); server.py dispatches to routes.ROUTES[(met
   which runs on each swap, and returns a function that stops its timers, streams and `document`
   listeners. A form that leaves the app (Atlassian, signing out) is marked `data-reload`. Every signed-in
   page includes all of `components.APP_SCRIPTS`. Recent runs hears of changes from `GET /runs/events`
-  (server-sent events, `routes/settings.run_events`); a running run's step comes from `Timings.step`
+  (server-sent events, `routes/settings.run_events`), and Overview (`views/overview.py`, its data from
+  `services/overview.py`) loads `GET /overview` again whenever Recent runs refreshes (`shadowdev:runs`).
+  Live logs asks `GET /logs/live` for what the developer's own working runs logged (`RunQueue.live`).
+  A form that deletes, stops, changes something or signs out asks first: `components.confirm`; a running run's step comes from `Timings.step`
   through `runlog`, and `models/run.PHASES` maps steps to its progress bar: a new step name needs a phase.
 
 Keep to these boundaries when adding code; docs/ARCHITECTURE.md "Adding things" lists where each kind of change goes.

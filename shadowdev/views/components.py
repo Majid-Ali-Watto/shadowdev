@@ -37,7 +37,7 @@ def script(name: str, nonce: str) -> str:
 
 # The signed-in pages' scripts. Every one of those pages has all of them, so moving between them
 # without a reload (static/app.js) finds each part's script there; each looks for its own elements.
-APP_SCRIPTS = ("app.js", "theme.js", "tabs.js", "runs.js", "project_editor.js", "statuses.js")
+APP_SCRIPTS = ("app.js", "theme.js", "tabs.js", "runs.js", "overview.js", "logs.js", "project_editor.js", "statuses.js")
 
 
 def app_scripts(nonce: str) -> str:
@@ -70,8 +70,17 @@ def options(items: list[tuple[object, str]], selected=None, empty: str = "") -> 
                            for v, label in items)
 
 
-def remove_form(action: str, field: str, value: int, hidden: str, what: str) -> str:
-    return (f'<form method="post" action="{action}" data-confirm="Remove {esc(what)}?">{hidden}'
+def confirm(title: str, message: str, action: str, danger: bool = True) -> str:
+    """Attributes that make a form, or one of its buttons, ask first in static/app.js's dialog: its
+    `title` (a question), `message` (what follows), and the button that goes ahead (`action`), red
+    when `danger` (it removes or stops something). Without scripts the form is sent as it is."""
+    return (f' data-confirm="{esc(message)}" data-confirm-title="{esc(title)}" data-confirm-action="{esc(action)}"'
+            + (" data-confirm-danger" if danger else ""))
+
+
+def remove_form(action: str, field: str, value: int, hidden: str, what: str, message: str) -> str:
+    """A Remove button, which asks first: "Remove `what`?", and `message`, what removing it does."""
+    return (f'<form method="post" action="{action}"{confirm(f"Remove {what}?", message, "Remove")}>{hidden}'
             f'<input type="hidden" name="{field}" value="{esc(value)}"><button class="secondary small">Remove</button></form>')
 
 

@@ -104,6 +104,15 @@ class Usage:
                     if (w := account.window(window, now))]
             return (" and ".join(used) + " used" if used else ""), False
 
+    def windows(self, key: str, now: float) -> dict[str, tuple[float, float]]:
+        """The account's usage windows as last reported and not reset since: {"five_hour" or
+        "seven_day": (utilization 0 to 1, when it resets)}; empty when unknown."""
+        with self._lock:
+            account = self._accounts.get(key)
+            if not account:
+                return {}
+            return {name: w for name in ("five_hour", "seven_day") if (w := account.window(name, now))}
+
     def admit(self, key: str, now: float) -> tuple[float, str] | float | None:
         """Start a run on the account: (until when, why) when it must wait, else the weekly
         utilization it starts at (None when unknown), to be given to done()."""

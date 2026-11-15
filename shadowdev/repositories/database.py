@@ -18,7 +18,7 @@ COPY_DAYS = 7  # how long copies of the database are kept: backups, and the one 
 # Every column encrypted with the key: (table, column).
 ENCRYPTED = (("jira_accounts", "access_token"), ("jira_accounts", "refresh_token"), ("github_accounts", "token"),
              ("claude_accounts", "token"), ("slack_accounts", "token"), ("projects", "webhook_secret"))
-VERSION = 19  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
+VERSION = 20  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -195,6 +195,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (  -- PRs ShadowDev opened, watched for
     reminders     INTEGER NOT NULL DEFAULT 0,
     conflict_key  TEXT NOT NULL DEFAULT '',  -- "head commit:base commit" of the newest conflict acted on
     conflict_rounds INTEGER NOT NULL DEFAULT 0,
+    review        TEXT NOT NULL DEFAULT '',  -- how its review stands, as last read: models.overview.PR_STATES
     UNIQUE (github, number)
 );
 CREATE TABLE IF NOT EXISTS reviews (  -- PRs a developer was asked in Slack to review
@@ -260,6 +261,7 @@ ADDED_COLUMNS = (
     ("projects", "bug_types", """TEXT NOT NULL DEFAULT '["Bug"]'"""),
     ("projects", "task_types", """TEXT NOT NULL DEFAULT '["Task", "Story", "Sub-task", "Subtask"]'"""),
     ("runs", "urgency", "INTEGER NOT NULL DEFAULT 2"),  # 19
+    ("pull_requests", "review", "TEXT NOT NULL DEFAULT ''"),  # 20
 )
 # What schema 18 used when nothing was stored, written down by the upgrade to 19 (whose defaults
 # fit any team): the status rules of a project that never set them, and the statuses that start by

@@ -1,6 +1,8 @@
 // The signed-in pages work as one app: their links to each other and their forms load the next page in
 // the background and swap it in, with a bar at the top meanwhile, instead of reloading the page. After a
-// form's error the fields keep what the developer typed. Forms with data-confirm ask first.
+// form's error the fields keep what the developer typed. Forms (or their buttons) with data-confirm ask
+// first, in a dialog: data-confirm-title is its question, data-confirm its message, data-confirm-action
+// the button that goes ahead (red with data-confirm-danger); see views/components.confirm.
 // Each part of a page has its script register with ShadowDev.mount(fn): fn runs now and after every
 // swap, and what it returns (a function) is called before the next swap, to stop its timers, streams and
 // listeners on document. Without scripts every link and form works as a plain one; pages outside the app
@@ -135,10 +137,49 @@
     load(url);
   });
 
+  // The dialog that asks before a form is sent: made once, outside <main>, so swaps keep it.
+  let dialog;
+  const ask = ({ confirm: message, confirmTitle: title, confirmAction: action, confirmDanger: danger }) => new Promise(resolve => {
+    if (!dialog) {
+      dialog = document.createElement("dialog");
+      dialog.className = "confirm";
+      dialog.setAttribute("aria-labelledby", "confirm-title");
+      dialog.setAttribute("aria-describedby", "confirm-message");
+      dialog.innerHTML = '<form method="dialog"><h3 id="confirm-title"></h3><p id="confirm-message"></p>'
+        + '<div class="actions"><button value="cancel" class="secondary" data-cancel>Cancel</button>'
+        + '<button value="ok" data-ok></button></div></form>';
+      dialog.addEventListener("click", e => { if (e.target === dialog) dialog.close("cancel"); });  // outside it
+      document.body.append(dialog);
+    }
+    dialog.querySelector("h3").textContent = title || "Are you sure?";
+    dialog.querySelector("p").textContent = message;
+    const ok = dialog.querySelector("[data-ok]");
+    ok.textContent = action || "Continue";
+    ok.className = danger === undefined ? "" : "danger-solid";
+    dialog.returnValue = "";
+    dialog.addEventListener("close", () => resolve(dialog.returnValue === "ok"), { once: true });
+    dialog.showModal();
+    dialog.querySelector("[data-cancel]").focus();  // Enter alone never goes ahead
+  });
+  let confirmed = null;  // the form being sent after its dialog said yes
+
   document.addEventListener("submit", e => {
     const form = e.target;
-    const ask = (e.submitter && e.submitter.dataset.confirm) || form.dataset.confirm;
-    if (ask && !confirm(ask)) return e.preventDefault();
+    const asker = e.submitter && e.submitter.dataset.confirm ? e.submitter : form.dataset.confirm ? form : null;
+    if (asker && confirmed !== form) {
+      e.preventDefault();
+      const submitter = e.submitter;
+      ask(asker.dataset).then(yes => {
+        if (!yes || !form.isConnected) return;
+        confirmed = form;
+        try {
+          if (submitter) form.requestSubmit(submitter); else form.requestSubmit();
+        } finally {
+          confirmed = null;
+        }
+      });
+      return;
+    }
     if (e.defaultPrevented || form.method !== "post" || form.hasAttribute("data-reload")) return;
     const url = new URL(form.action);
     if (url.origin !== location.origin) return;
