@@ -1,6 +1,6 @@
 // The theme switcher: light or dark. The choice is kept in a cookie so the server renders every page
 // in it (no flash of the other theme); until one is chosen, pages follow the system's setting.
-(() => {
+ShadowDev.mount(() => {
   const button = document.querySelector("[data-theme-toggle]");
   if (!button) return;
   const root = document.documentElement;
@@ -22,4 +22,5 @@
   system.addEventListener("change", show);
   show();
   button.hidden = false;
-})();
+  return () => system.removeEventListener("change", show);
+});

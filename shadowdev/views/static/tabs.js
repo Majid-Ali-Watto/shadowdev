@@ -1,8 +1,10 @@
 // Tabs of the developer's page (WAI-ARIA tabs): a click or the arrow keys switch panels in place,
 // and the address keeps ?tab=, so a reload or a shared link opens the same one. Without scripts
 // each tab is a plain link to its ?tab=.
-(() => {
-  const tabs = [...document.querySelectorAll('[role="tab"]')];
+ShadowDev.mount(() => {
+  const list = document.querySelector('[role="tablist"]');
+  if (!list) return;
+  const tabs = [...list.querySelectorAll('[role="tab"]')];
   const select = (tab, focus) => {
     for (const t of tabs) {
       const on = t === tab;
@@ -19,11 +21,11 @@
   for (const tab of tabs) {
     tab.addEventListener("click", e => { e.preventDefault(); select(tab, false); });
   }
-  document.querySelector('[role="tablist"]').addEventListener("keydown", e => {
+  list.addEventListener("keydown", e => {
     const i = tabs.indexOf(document.activeElement);
     const next = { ArrowRight: i + 1, ArrowLeft: i - 1, Home: 0, End: tabs.length - 1 }[e.key];
     if (i < 0 || next === undefined) return;
     e.preventDefault();
     select(tabs[(next + tabs.length) % tabs.length], true);
   });
-})();
+});

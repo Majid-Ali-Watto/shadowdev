@@ -1,4 +1,5 @@
-"""The developer's page: a header, their status, and a tab per area (runs, projects, accounts, settings).
+"""The developer's page: a header, their status, and a tab per area (run issues, recent runs,
+projects, accounts, settings, activity).
 Every tab is in the page, so switching is instant; ?tab= picks the one shown, so links, reloads and
 the page after a form all land on the right one, with scripts off too."""
 from ..config import Config
@@ -6,12 +7,14 @@ from ..models.project import Project
 from ..models.run import RunPage
 from ..models.user import User
 from .accounts import accounts_panel
-from .components import MARK, THEME_TOGGLE, alert, csrf_field, esc, page, plural, script
+from .activity import activity_panel
+from .components import MARK, THEME_TOGGLE, alert, app_scripts, csrf_field, esc, page, plural
 from .projects import projects_panel
-from .runs import runs_panel
+from .runs import recent_panel, runs_panel
 from .settings import settings_panel
 
-TABS = (("runs", "Runs"), ("projects", "Projects"), ("accounts", "Accounts"), ("settings", "Settings"))
+TABS = (("runs", "Run issues"), ("recent", "Recent runs"), ("projects", "Projects"), ("accounts", "Accounts"),
+        ("settings", "Settings"), ("activity", "Activity"))
 
 # Success messages are fixed strings chosen by key, so nothing from the request is echoed.
 # Each names the tab its form is on, where the page opens after it (or with its error).
@@ -28,13 +31,14 @@ NOTICES = {
     "project-deleted": ("projects", "Project deleted."),
     "joined": ("projects", "Project settings saved."),
     "left": ("projects", "You left the project."),
+    "test-sent": ("projects", "Test message sent: look in your Slack direct messages or your inbox."),
     "released": ("projects", "Tickets checked. What was moved, and what is missing, is under the project's status rules."),
     "queued": ("runs", "Queued. Progress shows up under Recent runs."),
     "paused": ("settings", "Automation paused. Nothing runs for you until you resume; a run in progress finishes."),
     "resumed": ("settings", "Automation resumed."),
     "limits": ("settings", "Timing and limits saved. Polls use them from their next round, runs from their start."),
-    "runs-deleted": ("runs", "Selected runs removed from Recent runs."),
-    "stopping": ("runs", "Stopping the run. Nothing more is pushed or written to Jira; the ticket is left as it was."),
+    "runs-deleted": ("recent", "Selected runs removed from Recent runs."),
+    "stopping": ("recent", "Stopping the run. Nothing more is pushed or written to Jira; the ticket is left as it was."),
 }
 
 
@@ -42,26 +46,28 @@ def first_tab(user: User) -> str:
     """Where a developer starts: the next setup step, or their runs once set up."""
     if not (user.github_accounts and user.claude_accounts):
         return "accounts"
-    return "runs" if user.ready_projects else "projects"
+    return "recent" if user.ready_projects else "projects"
 
 
 def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[int, str], runs: RunPage, csrf: str,
               nonce: str, theme: str = "", tab: str = "", error: str = "", notice: str = "", answering=None,
               claude_usage: dict[int, tuple[str, bool]] | None = None,
-              activity: list[tuple[float, str, str]] = ()) -> str:
+              activity: tuple[list[tuple[float, str, str]], int, int] = ([], 1, 1)) -> str:
     """`tab`: the one shown (a key of TABS; anything else means first_tab). `error` and `notice`
-    show at the top of that tab. `answering`: a run whose questions the Runs tab's form answers.
-    `claude_usage`: AccountService.claude_usage, per Claude account. `activity`: UserRepository.activity."""
+    show at the top of that tab. `answering`: a run whose questions the Run issues tab's form answers.
+    `claude_usage`: AccountService.claude_usage, per Claude account. `activity`: a page of UserRepository.activity."""
     claude_usage = claude_usage or {}
     hidden = csrf_field(csrf)
     if tab not in dict(TABS):
         tab = first_tab(user)
     joined = [p for p in projects if p.id in user.subscriptions]
     panels = {
-        "runs": runs_panel(user.limits.max_parallel_runs, joined, runs, csrf, answering),
+        "runs": runs_panel(user.limits.max_parallel_runs, joined, csrf, answering),
+        "recent": recent_panel(runs, csrf),
         "projects": projects_panel(cfg, user, projects, secrets, hidden, claude_usage),
         "accounts": accounts_panel(user, hidden, claude_usage),
-        "settings": settings_panel(user, hidden, activity),
+        "settings": settings_panel(user, hidden),
+        "activity": activity_panel(*activity),
     }
     nav = "".join(
         f'<a href="/?tab={key}" id="tab-{key}" role="tab" aria-controls="panel-{key}" data-tab="{key}"'
@@ -76,12 +82,12 @@ def home_page(cfg: Config, user: User, projects: list[Project], secrets: dict[in
   <div class="brand">{MARK}<div><h1>ShadowDev</h1>
     <p class="muted">Signed in as {esc(user.display_name)}{f" ({esc(user.email)})" if user.email else ""}</p></div></div>
   <div class="header-actions">{THEME_TOGGLE}
-    <form method="post" action="/logout">{hidden}<button class="secondary">Sign out</button></form></div>
+    <form method="post" action="/logout" data-reload>{hidden}<button class="secondary">Sign out</button></form></div>
 </header>
 {_status(user)}
 <nav class="tabs" role="tablist" aria-label="Sections">{nav}</nav>
 {sections}
-{script("theme.js", nonce)}{script("tabs.js", nonce)}{script("confirm.js", nonce)}{script("runs.js", nonce)}""", theme)
+{app_scripts(nonce)}""", theme, app=True)
 
 
 def _status(user: User) -> str:

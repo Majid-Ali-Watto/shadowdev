@@ -24,6 +24,12 @@ class Jira:
         """Raises HTTPError 404 if the account cannot browse the project."""
         return self._request("GET", f"/rest/api/2/project/{project_key}")
 
+    def project_statuses(self, project_key: str) -> list[str]:
+        """Names of every status in the project's workflows, across its issue types. Raises
+        HTTPError 404 if the account cannot browse the project."""
+        types = self._request("GET", f"/rest/api/2/project/{project_key}/statuses") or []
+        return list(dict.fromkeys(s["name"] for t in types for s in t.get("statuses") or [] if s.get("name")))
+
     def get_issue(self, key: str) -> dict:
         return self._request(
             "GET", f"/rest/api/2/issue/{key}?fields=summary,description,issuetype,assignee,reporter,project,status,comment,attachment"

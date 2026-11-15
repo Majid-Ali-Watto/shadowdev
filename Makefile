@@ -4,10 +4,11 @@ PY := .venv/bin/python
 PID := data/shadowdev.pid
 
 .DEFAULT_GOAL := help
-.PHONY: help install up start upd down stop dev test lint fix check dry key rotate backup logs
+.PHONY: help install up start upd down stop dev test lint fix check dry key rotate backup logs service service-remove \
+	docker-up docker-down docker-logs docker-test docker-shell docker-service docker-service-remove
 
 help:  ## list these commands
-	@grep -E '^[a-z]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-8s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F ':.*## ' '{printf "  make %-12s %s\n", $$1, $$2}'
 
 install:  ## create .venv with the dependencies (and ruff)
 	uv sync
@@ -60,3 +61,42 @@ backup:  ## copy the database to data/backups/ (kept 7 days), safe while the ser
 
 logs:  ## follow today's server log
 	tail -f data/logs/shadowdev.log
+
+service:  ## Linux: install the systemd service (starts on boot, restarts after a crash); asks for sudo
+	@bash deploy/service.sh install native
+
+service-remove:  ## stop and remove the systemd service (runs in progress finish first)
+	@bash deploy/service.sh remove native
+
+# Docker: the same server on Linux, macOS and Windows (deploy/README.md, Docker). The commands above
+# that use $(PY) run inside it as: docker compose exec shadowdev python -m shadowdev <command>.
+COMPOSE := HOST_UID=$$(id -u) HOST_GID=$$(id -g) docker compose
+# What bwrap needs inside a container, as docker-compose.yml gives it, for docker-test.
+SANDBOX_OPTS := --cap-drop ALL --security-opt no-new-privileges --security-opt seccomp=unconfined \
+	--security-opt apparmor=unconfined --security-opt systempaths=unconfined
+
+docker-up:  ## build and start ShadowDev in Docker, detached (needs .env; data/ is created)
+	@test -f .env || { echo "no .env: copy .env.example to .env and fill it in (INSTALL.md, step 2)"; exit 1; }
+	@mkdir -p -m 700 data
+	$(COMPOSE) up -d --build
+	@echo "started: open the PUBLIC_URL of .env; make docker-logs follows the log"
+
+docker-down:  ## stop it in Docker: runs in progress finish first (up to 15 min)
+	$(COMPOSE) stop
+	$(COMPOSE) down
+
+docker-logs:  ## follow its log in Docker
+	$(COMPOSE) logs -f
+
+docker-test:  ## run the tests in the Docker image, with the sandbox as it runs there
+	$(COMPOSE) build
+	docker run --rm $(SANDBOX_OPTS) shadowdev python -m unittest $(T)
+
+docker-service:  ## macOS, Windows (WSL2), Linux: start it in Docker, and again whenever Docker starts (at login or boot)
+	@bash deploy/service.sh install docker
+
+docker-service-remove:  ## undo docker-service, and stop it (runs in progress finish first)
+	@bash deploy/service.sh remove docker
+
+docker-shell:  ## a shell in the running container (dry runs, backup, rotate: python -m shadowdev ...)
+	$(COMPOSE) exec shadowdev bash

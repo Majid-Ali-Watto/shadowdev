@@ -1,7 +1,9 @@
+import dataclasses
 import unittest
 
 from shadowdev.automation import rules
 from shadowdev.models.issue import Issue
+from shadowdev.models.project import Project, Repo
 
 ME = "acc-majid"  # the developer a run posts as: "Majid" and "M" below
 
@@ -9,6 +11,10 @@ ME = "acc-majid"  # the developer a run posts as: "Majid" and "M" below
 def comments(*bodies):
     return {"comment": {"comments": [{"author": {"displayName": who, "accountId": ME if who in ("Majid", "M") else f"acc-{who}"},
                                       "body": body} for who, body in bodies]}}
+
+
+def repos_of(*names: str) -> list[Repo]:
+    return [Repo(name, f"acme/{name}", "", "release/", None, None) for name in names]
 
 
 class RulesTest(unittest.TestCase):
@@ -27,13 +33,14 @@ class RulesTest(unittest.TestCase):
                 rules.parse_keys(bad)
 
     def test_the_repos_a_run_may_change(self):
-        repos = ["fe", "market-place-services", "docs"]
-        self.assertEqual(rules.chosen_repos(repos, "all"), ())  # Claude decides
-        self.assertEqual(rules.chosen_repos(repos, "fe"), ("fe",))
-        self.assertEqual(rules.chosen_repos(repos, "be"), ("market-place-services",))
-        for change, names in (("be", ["web", "docs"]), ("everything", repos)):
-            with self.assertRaisesRegex(ValueError, "has no .* repo among"):
-                rules.chosen_repos(names, change)
+        repos = repos_of("fe", "auth", "notification", "documents")
+        self.assertEqual(rules.chosen_repos(repos, ["auth", "documents"]), ("auth", "documents"))
+        self.assertEqual(rules.chosen_repos(repos, ["documents", "fe", "other"]), ("fe", "documents"))  # in the project's order
+        self.assertEqual(rules.chosen_repos(repos, ["fe", "auth", "notification", "documents"]), ())  # all: Claude decides
+        self.assertEqual(rules.chosen_repos(repos_of("app"), []), ())  # a project's only repo needs no choosing
+        for chosen in ([], ["other"]):
+            with self.assertRaisesRegex(ValueError, "choose the repos to change: fe, auth, notification, documents"):
+                rules.chosen_repos(repos, chosen)
 
     def test_issues_left_out_of_a_range(self):
         ten = [f"MAR-{n}" for n in range(1, 11)]
@@ -93,7 +100,7 @@ class RulesTest(unittest.TestCase):
         self.assertTrue(rules.awaiting_answer(old, ME))
 
     def test_an_issue_is_reopened_when_sent_back_with_a_comment_after_its_prs(self):
-        prs = rules.pr_links_comment([("fe", "release/15", "https://github.com/acme/fe/pull/1")], [])
+        prs = rules.pr_links_comment([(*repos_of("fe"), "release/15", "https://github.com/acme/fe/pull/1")], [])
 
         def fields(status, category, *bodies):
             return {"status": {"name": status, "statusCategory": {"key": category}}, **comments(*bodies)}
@@ -119,37 +126,46 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(rules.latest_release_branch(["release/0.12", "release/14", "release/v13"], "release/"), "release/14")
         self.assertIsNone(rules.latest_release_branch(["main"], "release/"))
 
-    def test_repos_are_named_fe_or_be_on_tickets_and_the_prs_are_a_table(self):
-        names = {"fe": "FE", "market-place-fe": "FE", "frontend": "FE", "services": "BE", "market-place-services": "BE",
-                 "backend": "BE", "be": "BE", "api": "BE", "docs": "docs", "web-fe-services": "web-fe-services",
-                 "feature": "feature", "before": "before"}
-        self.assertEqual({n: rules.repo_label(n) for n in names}, names)
-        prs = [("fe", "release/15", "https://github.com/acme/market-place-fe/pull/123"),
-               ("services", "release/14", "https://github.com/acme/market-place-services/pull/456")]
+    def test_the_prs_are_a_table_by_repo_on_tickets(self):
+        fe, be = repos_of("fe", "services")
+        prs = [(fe, "release/15", "https://github.com/acme/market-place-fe/pull/123"),
+               (be, "release/14", "https://github.com/acme/market-place-services/pull/456")]
         self.assertEqual(rules.pr_links_comment(prs, ["MAR-2", "MAR-3"]),
                          "||Repo||Base branch||Pull request||\n"
-                         "|*FE*|release/15|[PR #123|https://github.com/acme/market-place-fe/pull/123]|\n"
-                         "|*BE*|release/14|[PR #456|https://github.com/acme/market-place-services/pull/456]|\n\n"
+                         "|*fe*|release/15|[PR #123|https://github.com/acme/market-place-fe/pull/123]|\n"
+                         "|*services*|release/14|[PR #456|https://github.com/acme/market-place-services/pull/456]|\n\n"
                          "Fixed together with MAR-2, MAR-3.")
         # The table is the run's own comment: not given back to Claude as a colleague's.
         issue = Issue("MAR-1", comments(("Sara", "Also with discounts."), ("Majid", rules.pr_links_comment(prs, []))),
                       "bug", me=ME)
         self.assertEqual(issue.comments, [("Sara", "Also with discounts.")])
 
-    def test_fix_version_is_the_highest_open_release(self):
+    def test_fix_version_by_the_projects_pick(self):
         # MAR's real versions: Rel 15 wins over Rel 14, "Rel 1 - MVP" and "Rel 0.10".
         names = ["Rel 0.5", "Rel 1 - MVP", "0.4", "Rel 0.6", "Rel 0.9", "Rel 10", "Rel 11", "Rel 0.10",
                  "Rel 12", "Rel 14", "Rel 13", "Rel 15"]
         versions = [{"name": n, "released": False} for n in names] + [{"name": "Rel 16", "released": True},
                                                                        {"name": "Rel 17", "archived": True}]
-        self.assertEqual(rules.latest_fix_version(versions), "Rel 15")
-        self.assertEqual(rules.latest_fix_version([{"name": "1.9.0"}, {"name": "1.10.0"}]), "1.10.0")
-        self.assertIsNone(rules.latest_fix_version([{"name": "Backlog"}, {"name": "1.0", "released": True}]))
+        self.assertEqual(rules.fix_version(versions, "highest"), "Rel 15")
+        self.assertEqual(rules.fix_version(versions), "0.4")  # the next release: the lowest
+        self.assertEqual(rules.fix_version(versions, "branch", ["release/13", "main"]), "Rel 13")
+        self.assertEqual(rules.fix_version(versions, "branch", ["main"]), "0.4")  # none numbered so: the next
+        self.assertEqual(rules.fix_version([{"name": "1.9.0"}, {"name": "1.10.0"}], "highest"), "1.10.0")
+        self.assertEqual(rules.fix_version([{"name": "1.10.0"}, {"name": "1.9.0"}]), "1.9.0")
+        self.assertIsNone(rules.fix_version([{"name": "Backlog"}, {"name": "1.0", "released": True}]))
+
+    def test_urgency_by_jira_priority(self):
+        urgency = lambda name: rules.urgency({"priority": {"name": name}} if name else {})
+        self.assertEqual([urgency(n) for n in ("Highest", "Blocker", "High", "Medium", "Low", "Trivial", "Custom", None)],
+                         [4, 4, 3, 2, 1, 0, 2, 2])
 
     def test_issue_kinds_and_modes(self):
-        kind = lambda name: rules.issue_kind({"issuetype": {"name": name}})
-        self.assertEqual([kind(n) for n in ("Bug", "Task", "Story", "Sub-task", "Epic")],
-                         ["bug", "task", "task", "task", None])
+        project = Project(1, "p", 1, "c", "u", frozenset({"MAR"}), None, ())
+        kind = lambda name, p=project: p.issue_kind({"issuetype": {"name": name}})
+        self.assertEqual([kind(n) for n in ("Bug", "Task", "Story", "Sub-task", "Epic", "Incident")],
+                         ["bug", "task", "task", "task", None, None])
+        ops = dataclasses.replace(project, bug_types=("Bug", "Incident"), task_types=("Service request",))
+        self.assertEqual([kind(n, ops) for n in ("incident", "Service Request", "Task")], ["bug", "task", None])
         self.assertTrue(rules.wanted("bug", "bugs"))
         self.assertFalse(rules.wanted("task", "bugs"))
         self.assertTrue(rules.wanted("task", "all"))

@@ -5,6 +5,7 @@ import shutil
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from .clients.mail import Smtp
 from .models.limits import Limits
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +85,7 @@ class Config:
     sandbox_caches: tuple[str, ...] = SANDBOX_CACHES
     data_dir: Path = PROJECT_ROOT / "data"  # database and per-developer Claude config; never in a sandbox
     worktree_root: Path = PROJECT_ROOT / "worktrees"
+    smtp: Smtp | None = None  # optional: the account developers' emails are sent from (SMTP_*)
 
     @property
     def oauth_redirect_uri(self) -> str:
@@ -121,6 +123,15 @@ class Config:
         if not public_url.startswith("https://") and not local:
             raise SystemExit("PUBLIC_URL must be https:// (session cookies would travel unencrypted); "
                              "plain http is only allowed for localhost")
+        smtp = None
+        if env.get("SMTP_HOST"):
+            smtp_port = env.get("SMTP_PORT", "587")
+            if not smtp_port.isdigit():
+                raise SystemExit("SMTP_PORT must be a number, e.g. 587")
+            smtp = Smtp(env["SMTP_HOST"], int(smtp_port), required("SMTP_FROM"), env.get("SMTP_USERNAME", ""),
+                        env.get("SMTP_PASSWORD", ""))
+            if smtp.username and not smtp.password:
+                raise SystemExit("Missing required environment variable: SMTP_PASSWORD (SMTP_USERNAME is set)")
         sites = env.get("JIRA_SITES") or env.get("JIRA_BASE_URL")  # JIRA_BASE_URL: the v1 name, one site
         if not sites:
             raise SystemExit("Missing required environment variable: JIRA_SITES (e.g. https://acme.atlassian.net)")
@@ -135,4 +146,5 @@ class Config:
             port=port,
             sandbox_tools=_home_paths(env.get("SANDBOX_HOME_TOOLS"), SANDBOX_TOOLS, "SANDBOX_HOME_TOOLS"),
             sandbox_caches=_home_paths(env.get("SANDBOX_HOME_CACHES"), SANDBOX_CACHES, "SANDBOX_HOME_CACHES"),
+            smtp=smtp,
         )

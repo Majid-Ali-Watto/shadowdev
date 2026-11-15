@@ -32,7 +32,7 @@ def _jira_card(user: User, hidden: str) -> str:
     return f"""<section class="card">
   {card_head(1, "Jira", True, _count_tag(len(user.jira_accounts)))}
   <ul class="items">{items}</ul>
-  <form method="post" action="/jira/connect">{hidden}<button class="secondary">Connect another Jira account</button></form>
+  <form method="post" action="/jira/connect" data-reload>{hidden}<button class="secondary">Connect another Jira account</button></form>
   <p class="hint">ShadowDev reads the issues assigned to you and comments as you. Access renews itself;
     if you revoke it at Atlassian, connect the account again.</p>
 </section>"""

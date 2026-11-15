@@ -4,6 +4,8 @@ import logging
 import time
 from contextlib import contextmanager
 
+from . import runlog
+
 log = logging.getLogger("shadowdev")
 
 END = "===== END ====="  # marks the last log line of a finished task
@@ -27,7 +29,9 @@ class Timings:
 
     @contextmanager
     def step(self, name: str):
-        """Time a step; it is recorded also when it raises or the run is stopped."""
+        """Time a step; it is recorded also when it raises or the run is stopped. The run's record
+        (runlog) is told it started, for the run's progress on the developer's page."""
+        runlog.step(name)
         started = time.monotonic()
         try:
             yield

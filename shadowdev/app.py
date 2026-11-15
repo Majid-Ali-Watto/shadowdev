@@ -1,15 +1,19 @@
 """Wires the layers together: repositories over one database, and the services using them."""
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 
 from .clients.atlassian import AtlassianOAuth
 from .config import ANY_SITE, LEGACY_PROJECTS_DIR, Config
 from .repositories.database import Database
+from .repositories.held import HeldRepository
 from .repositories.projects import ProjectRepository
 from .repositories.reviews import ReviewRepository
 from .repositories.runs import RunRepository
 from .repositories.sessions import SessionRepository
 from .repositories.users import UserRepository
 from .services.accounts import AccountService
+from .services.notifications import NotificationTests
+from .services.outbox import Outbox
 from .services.poller import Poller
 from .services.privacy import PrivacyReporter
 from .services.projects import ProjectService
@@ -38,6 +42,9 @@ class App:
     releases: ReleaseMover
     reviews: ReviewRepository
     watcher: ReviewWatcher
+    notification_tests: NotificationTests
+    outbox: Outbox
+    stopping: threading.Event = field(default_factory=threading.Event)  # set when the server stops: streams end
 
 
 def database(cfg: Config) -> Database:
@@ -51,8 +58,8 @@ def build_app(cfg: Config, oauth: AtlassianOAuth | None = None, queue: RunQueue 
     db = database(cfg)
     users, projects, sessions, runs = UserRepository(db), ProjectRepository(db), SessionRepository(db), RunRepository(db)
     oauth = oauth or AtlassianOAuth(cfg.atlassian_client_id, cfg.atlassian_client_secret, cfg.oauth_redirect_uri)
-    reviews = ReviewRepository(db)
-    queue = queue or RunQueue(cfg, users, projects, runs, oauth, reviews)
+    reviews, held = ReviewRepository(db), HeldRepository(db)
+    queue = queue or RunQueue(cfg, users, projects, runs, oauth, reviews, held=held)
     accounts = AccountService(cfg, users, oauth, queue)
     return App(
         cfg=cfg, oauth=oauth, users=users, projects=projects, sessions=sessions, runs=runs, queue=queue,
@@ -61,6 +68,8 @@ def build_app(cfg: Config, oauth: AtlassianOAuth | None = None, queue: RunQueue 
         run_service=RunService(users, projects, oauth, queue, runs),
         webhooks=WebhookService(cfg, users, projects, runs, queue),
         privacy=PrivacyReporter(users, oauth, accounts),
-        poller=Poller(users, projects, oauth, queue), releases=ReleaseMover(users, projects, oauth),
-        reviews=reviews, watcher=ReviewWatcher(cfg, users, projects, reviews, queue),
+        poller=Poller(users, projects, oauth, queue), releases=ReleaseMover(cfg, users, projects, oauth),
+        reviews=reviews, watcher=ReviewWatcher(cfg, users, projects, reviews, queue, held),
+        notification_tests=NotificationTests(cfg, users, projects),
+        outbox=Outbox(users, projects, runs, reviews, held, oauth),
     )

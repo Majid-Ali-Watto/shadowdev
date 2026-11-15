@@ -6,6 +6,7 @@ them. The key can be replaced: SHADOWDEV_SECRET_KEY then lists the new key and t
 ("new,old"), the first encrypts and both decrypt, and `rotate` re-encrypts what is stored.
 A new connection per call keeps it safe to use from the web threads and the run workers.
 """
+import json
 import sqlite3
 import time
 from contextlib import closing
@@ -17,7 +18,7 @@ COPY_DAYS = 7  # how long copies of the database are kept: backups, and the one 
 # Every column encrypted with the key: (table, column).
 ENCRYPTED = (("jira_accounts", "access_token"), ("jira_accounts", "refresh_token"), ("github_accounts", "token"),
              ("claude_accounts", "token"), ("slack_accounts", "token"), ("projects", "webhook_secret"))
-VERSION = 15  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
+VERSION = 19  # PRAGMA user_version. 0 with a `users.jira_cloud_id` column: the single-site layout (v1)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sites (
@@ -87,6 +88,11 @@ CREATE TABLE IF NOT EXISTS projects (
     webhook_secret   BLOB NOT NULL,
     slack_channel    TEXT,  -- channel ID for review requests
     status_rules     TEXT,  -- JSON list of models.release.StatusRule; NULL: the defaults
+    uses_sprints      INTEGER NOT NULL DEFAULT 1,  -- an active sprint can be a condition to start by itself
+    uses_fix_versions INTEGER NOT NULL DEFAULT 1,  -- bugs can get a fix version
+    fix_version_pick  TEXT NOT NULL DEFAULT 'highest',  -- models.project.FIX_VERSION_PICKS
+    bug_types         TEXT NOT NULL DEFAULT '["Bug"]',  -- JSON list of Jira issue type names worked on as bugs
+    task_types        TEXT NOT NULL DEFAULT '["Task", "Story", "Sub-task", "Subtask"]',  -- and as tasks
     UNIQUE (cloud_id, name)
 );
 CREATE TABLE IF NOT EXISTS project_keys (
@@ -122,6 +128,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     settings          TEXT NOT NULL DEFAULT '{}',  -- JSON models.settings.Settings: what is automated; missing = default
     released_at       REAL NOT NULL DEFAULT 0,  -- last check of its tickets against the project's status rules
     release_report    TEXT NOT NULL DEFAULT '',  -- JSON models.release.ReleaseReport of that check
+    tests_sent        TEXT NOT NULL DEFAULT '{}',  -- JSON: test messages sent, by way (services.notifications)
     PRIMARY KEY (user_id, project_id)
 );
 CREATE INDEX IF NOT EXISTS subscriptions_project ON subscriptions (project_id);
@@ -152,6 +159,8 @@ CREATE TABLE IF NOT EXISTS runs (
     seconds    REAL NOT NULL DEFAULT 0,   -- how long it worked, once it has ended
     cost       REAL NOT NULL DEFAULT 0,   -- US dollars, as Claude reported for its requests
     turns      INTEGER NOT NULL DEFAULT 0,  -- Claude's turns in them
+    step       TEXT NOT NULL DEFAULT '',  -- the step it is on while it works (models.run.PHASES)
+    urgency    INTEGER NOT NULL DEFAULT 2,  -- by its issue's Jira priority (rules.urgency): the more urgent run first
     updated    REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS runs_user ON runs (user_id, id);
@@ -182,6 +191,10 @@ CREATE TABLE IF NOT EXISTS pull_requests (  -- PRs ShadowDev opened, watched for
     rounds        INTEGER NOT NULL DEFAULT 0,
     ci_sha        TEXT NOT NULL DEFAULT '',  -- the newest head commit whose failing CI was acted on
     ci_rounds     INTEGER NOT NULL DEFAULT 0,
+    reminded_at   REAL NOT NULL DEFAULT 0,  -- when its reviewers were last reminded in its Slack thread
+    reminders     INTEGER NOT NULL DEFAULT 0,
+    conflict_key  TEXT NOT NULL DEFAULT '',  -- "head commit:base commit" of the newest conflict acted on
+    conflict_rounds INTEGER NOT NULL DEFAULT 0,
     UNIQUE (github, number)
 );
 CREATE TABLE IF NOT EXISTS reviews (  -- PRs a developer was asked in Slack to review
@@ -197,6 +210,17 @@ CREATE TABLE IF NOT EXISTS reviews (  -- PRs a developer was asked in Slack to r
     rounds     INTEGER NOT NULL DEFAULT 0,
     created    REAL NOT NULL,
     UNIQUE (user_id, github, number)
+);
+CREATE TABLE IF NOT EXISTS held (  -- what waits for its developer's working hours in the project (services/outbox.py)
+    id         INTEGER PRIMARY KEY,
+    user_id    INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
+    project_id INTEGER NOT NULL REFERENCES projects ON DELETE CASCADE,
+    kind       TEXT NOT NULL,  -- "prs": a run's models.publication.Publication; "slack": a reply in a Slack thread
+    branch     TEXT NOT NULL DEFAULT '',  -- its run's branch ("prs"): a later run of it replaces what is held
+    run_id     INTEGER,  -- the run whose PRs they are, whose message says how they went
+    batch      INTEGER,  -- runs started together: one review request for all their PRs
+    data       TEXT NOT NULL,  -- JSON
+    at         REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS webhook_events (
     id TEXT PRIMARY KEY,  -- hash of the signed event: each is accepted once, also across restarts
@@ -225,7 +249,37 @@ ADDED_COLUMNS = (
     ("jira_accounts", "lost", "INTEGER NOT NULL DEFAULT 0"), ("github_accounts", "expires", "REAL NOT NULL DEFAULT 0"),  # 15
     ("runs", "seconds", "REAL NOT NULL DEFAULT 0"), ("runs", "cost", "REAL NOT NULL DEFAULT 0"),
     ("runs", "turns", "INTEGER NOT NULL DEFAULT 0"),
+    ("pull_requests", "reminded_at", "REAL NOT NULL DEFAULT 0"), ("pull_requests", "reminders", "INTEGER NOT NULL DEFAULT 0"),  # 16
+    ("subscriptions", "tests_sent", "TEXT NOT NULL DEFAULT '{}'"),
+    ("pull_requests", "conflict_key", "TEXT NOT NULL DEFAULT ''"), ("pull_requests", "conflict_rounds", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "step", "TEXT NOT NULL DEFAULT ''"),  # 17
+    # 18: nothing added (repos.side was added then dropped again; databases that have it ignore it)
+    ("projects", "uses_sprints", "INTEGER NOT NULL DEFAULT 1"), ("projects", "uses_fix_versions", "INTEGER NOT NULL DEFAULT 1"),
+    ("projects", "fix_version_pick", "TEXT NOT NULL DEFAULT 'highest'"),
+    ("projects", "bug_types", """TEXT NOT NULL DEFAULT '["Bug"]'"""),
+    ("projects", "task_types", """TEXT NOT NULL DEFAULT '["Task", "Story", "Sub-task", "Subtask"]'"""),
+    ("runs", "urgency", "INTEGER NOT NULL DEFAULT 2"),  # 19
 )
+# What schema 18 used when nothing was stored, written down by the upgrade to 19 (whose defaults
+# fit any team): the status rules of a project that never set them, and the statuses that start by
+# themselves for a developer who never changed them.
+V18_STATUS_RULES = ('[{"from_status": "Ready for Release", "to_status": "Done", "checks": '
+                    '["root_cause", "fix_version", "parent", "original_estimate", "time_spent"]}]')
+V18_AUTO_STATUSES = "To Do, Backlog, Ready for Pickup, Reopened"
+
+
+def _keep_v18_defaults(db: sqlite3.Connection) -> None:
+    """Upgrading to 19: what relied on schema 18's defaults keeps working as it did."""
+    db.execute("UPDATE projects SET status_rules = ? WHERE status_rules IS NULL", (V18_STATUS_RULES,))
+    for row in db.execute("SELECT user_id, project_id, settings FROM subscriptions").fetchall():
+        try:
+            settings = json.loads(row["settings"] or "{}")
+        except ValueError:
+            settings = {}
+        if isinstance(settings, dict) and "auto_statuses" not in settings:
+            settings["auto_statuses"] = V18_AUTO_STATUSES
+            db.execute("UPDATE subscriptions SET settings = ? WHERE user_id = ? AND project_id = ?",
+                       (json.dumps(settings, sort_keys=True), row["user_id"], row["project_id"]))
 
 
 class Database:
@@ -258,6 +312,8 @@ class Database:
                     for table, column, definition in ADDED_COLUMNS:
                         if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
                             db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+                    if 0 < version < 19:
+                        _keep_v18_defaults(db)
                     db.execute(f"PRAGMA user_version = {VERSION}")
         path.chmod(0o600)
         self.forget_copies(older_than=time.time() - COPY_DAYS * 86400)

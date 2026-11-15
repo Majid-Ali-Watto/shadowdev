@@ -81,6 +81,7 @@ def serve(cfg: Config) -> None:
     app.watcher.start()  # review comments on its PRs, and review requests in Slack
     app.poller.start()  # Jira, for the developers who turned polling on in Settings
     app.releases.start()  # finished tickets moved by their projects' status rules, for those who switched it on
+    app.outbox.start()  # PRs and Slack replies that waited for their developers' working hours
     log.info("Jira sites: %s", ", ".join(cfg.jira_sites))
     server = Server((cfg.host, cfg.port), make_handler(app))
     log.info("listening on http://%s:%d; developers open %s (Jira webhook at /webhook)", cfg.host, cfg.port, cfg.public_url)
@@ -91,7 +92,9 @@ def serve(cfg: Config) -> None:
         signal.signal(sig, lambda *_: (hurry if stop.is_set() else stop).set())
     threading.Thread(target=server.serve_forever, daemon=True, name="http").start()
     stop.wait()
+    app.stopping.set()  # the pages' live updates end; their browsers find the server gone and stop asking
     server.shutdown()  # Jira sends again the events it could not deliver
     server.server_close()
     stopped = app.queue.drain(DRAIN_SECONDS, hurry)
+    app.outbox.drain(DRAIN_SECONDS)  # what was waiting and is being sent is finished; the rest waits in the database
     log.info("stopped%s", f"; {stopped} run(s) in progress were stopped" if stopped else "")

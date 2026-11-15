@@ -14,6 +14,12 @@ PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.-]{0,59}\Z")
 SLACK_CHANNEL_RE = re.compile(r"^[CG][A-Z0-9]{6,20}\Z")  # a channel's ID, not its name
 SLACK_MEMBER_RE = re.compile(r"^[UW][A-Z0-9]{6,20}\Z")
 CUSTOM_FIELD_RE = re.compile(r"^customfield_[0-9]{1,10}\Z")
+ISSUE_TYPE_RE = re.compile(r"^[\w .&'()/\-]{1,40}\Z")  # a Jira issue type name
+# Which open Jira version a bug gets: the next to be released (the lowest), the highest, or the
+# one numbered like the base branch its PRs go into (release/15 -> "Rel 15"), else the next.
+FIX_VERSION_PICKS = ("next", "highest", "branch")
+BUG_TYPES = ("Bug",)
+TASK_TYPES = ("Task", "Story", "Sub-task", "Subtask")
 _GITHUB_URL_RE = re.compile(r"^(?:https://github\.com/|git@github\.com:)?([^/\s]+/[^/\s]+?)(?:\.git)?/?\Z")
 
 
@@ -57,6 +63,21 @@ class Project:
     slack_channel: str | None = None  # channel ID where PRs are announced for review, and reviews are asked for
     # Finished tickets moved along once complete (Settings.release_moves), e.g. Ready for Release -> Done.
     status_rules: tuple[StatusRule, ...] = DEFAULT_RULES
+    # How its Jira projects work. Without sprints, an active sprint is never a condition to start;
+    # without fix versions, none is set.
+    uses_sprints: bool = True
+    uses_fix_versions: bool = True
+    fix_version_pick: str = "next"  # FIX_VERSION_PICKS
+    # Issue types worked on as bugs (root cause, regression test, fix version) and as tasks (a plan).
+    bug_types: tuple[str, ...] = BUG_TYPES
+    task_types: tuple[str, ...] = TASK_TYPES
+
+    def issue_kind(self, fields: dict) -> str | None:
+        """"bug", "task", or None for an issue type the project does not handle."""
+        name = ((fields.get("issuetype") or {}).get("name") or "").lower()
+        if name in {t.lower() for t in self.bug_types}:
+            return "bug"
+        return "task" if name in {t.lower() for t in self.task_types} else None
 
     def repo(self, name: str) -> Repo | None:
         return next((r for r in self.repos if r.name == name), None)

@@ -1,4 +1,6 @@
+
 """Watching pull requests in review: review comments on ShadowDev's PRs, and review requests in Slack."""
+import dataclasses
 import tempfile
 import time
 import unittest
@@ -83,6 +85,95 @@ class WatcherTest(unittest.TestCase):
         self.watcher.poll(NOW + 300, due_only=True)
         self.assertEqual(read(), (3, 2))  # both
 
+    def test_a_project_without_a_slack_channel_is_not_read_in_slack(self):
+        self.app.projects.save(dataclasses.replace(self.market, slack_channel=None))
+        self.assertEqual(self.poll(), [])
+        self.slack.history.assert_not_called()
+        self.app.users.remove_slack(self.me)  # nor, with a channel, a developer without Slack
+        self.app.projects.save(self.market)
+        self.assertEqual(self.poll(), [])
+        self.slack.history.assert_not_called()
+
+    def reminded(self, at: float) -> list[tuple]:
+        """Poll at `at`; the reminders posted then: (channel, text, thread)."""
+        self.slack.post.reset_mock()
+        self.watcher.poll(at)
+        return [c.args for c in self.slack.post.call_args_list]
+
+    def test_reviewers_are_reminded_of_a_pr_nobody_reviewed(self):
+        asked = NOW - 3 * 3600  # the review was asked for in Slack three hours ago
+        fe = dataclasses.replace(self.market.repos[0], reviewers=("U0SARA", "U0OMAR"))
+        self.app.projects.save(dataclasses.replace(self.market, repos=(fe, self.market.repos[1])))
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 7, "MAR-1", ("C0REVIEWS1", f"{asked:.6f}"))
+        self.assertEqual(self.reminded(NOW - 60), [])  # not three hours yet
+        [(channel, text, ts)] = self.reminded(NOW)
+        self.assertEqual((channel, ts), ("C0REVIEWS1", f"{asked:.6f}"))  # a reply in the thread that asked
+        self.assertEqual(text, "<@U0SARA> <@U0OMAR> A gentle reminder: this PR is still waiting for a review.\n"
+                               "• <https://github.com/acme/fe/pull/7>\nThanks")
+        self.assertEqual(self.reminded(NOW + 23 * 3600), [])  # at most once a day
+        self.assertEqual(len(self.reminded(NOW + 24 * 3600)), 1)
+        self.assertEqual(len(self.reminded(NOW + 48 * 3600)), 1)
+        self.assertEqual(self.reminded(NOW + 72 * 3600), [])  # three times in all
+        # Reviewed by someone: never reminded.
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 8, "MAR-2", ("C0REVIEWS1", f"{asked:.6f}"))
+        self.github.latest_reviews.return_value = [{"author": "sara", "association": "MEMBER", "state": "CHANGES_REQUESTED"}]
+        self.assertEqual(self.reminded(NOW), [])
+        self.github.latest_reviews.return_value = []
+        self.github.review_threads.return_value = ("OPEN", [thread(author=ME)])  # only the developer's own comments
+        self.assertEqual(len(self.reminded(NOW)), 1)
+        self.github.review_threads.return_value = ("OPEN", [thread(author="sara")])
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 9, "MAR-3", ("C0REVIEWS1", f"{asked:.6f}"))
+        self.assertEqual(self.reminded(NOW), [])
+
+    def test_prs_asked_for_together_get_one_reminder(self):
+        asked = f"{NOW - 4 * 3600:.6f}"
+        for number in (7, 8):
+            self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", number, f"MAR-{number}", ("C0REVIEWS1", asked))
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 9, "MAR-9", None)  # a draft: never asked for
+        [(_, text, _)] = self.reminded(NOW)
+        self.assertTrue(text.startswith("A gentle reminder: these PRs are still waiting for a review."))  # no reviewers set
+        self.assertIn("pull/7>\n• <https://github.com/acme/fe/pull/8>", text)
+        self.assertNotIn("pull/9", text)
+
+    def test_reminders_are_switched_off_or_wait_longer_as_chosen(self):
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 7, "MAR-1", ("C0REVIEWS1", f"{NOW - 5 * 3600:.6f}"))
+        join(self.app.users, self.me, self.market, ME, settings=Settings(remind_hours="6"))
+        self.assertEqual(self.reminded(NOW), [])  # five hours: not six yet
+        join(self.app.users, self.me, self.market, ME, settings=Settings(remind_reviewers=False))
+        self.assertEqual(self.reminded(NOW + 3600), [])
+        join(self.app.users, self.me, self.market, ME, settings=Settings(remind_hours="6"))
+        self.assertEqual(len(self.reminded(NOW + 3600)), 1)
+
+    def queued(self) -> list[str]:
+        """What each job queued by the last poll does: _conflict, _failing_ci, …"""
+        return [job[3].__qualname__.split(".")[1] for job in self.jobs]
+
+    def test_a_pr_conflicting_with_its_base_gets_a_merge_once_per_pair_of_commits(self):
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 7, "MAR-1", None)
+        self.github.ci_state.return_value = ("sha-1", "FAILURE")
+        self.github.check_runs.return_value = [{"id": 1, "name": "lint", "status": "completed", "conclusion": "failure"}]
+        pr = lambda mergeable, head="sha-1", base="base-1": {"mergeable": mergeable, "head": {"sha": head},
+                                                             "base": {"sha": base, "ref": "main"}}
+        self.github.pr.return_value = pr(None)  # GitHub still working it out: not a conflict yet, so CI as usual
+        self.poll()
+        self.assertEqual(self.queued(), ["_failing_ci"])
+        self.jobs[0][4]()  # that CI fix ended
+        self.github.pr.return_value = pr(False)
+        self.poll()
+        self.assertEqual(self.queued(), ["_conflict"])  # the conflict first; its CI is left alone
+        _, _, _, _, after = self.jobs[0]
+        after()  # the run ended
+        self.assertEqual(self.poll(), [])  # the same conflict is not tried again
+        self.github.pr.return_value = pr(False, base="base-2")  # the base moved again
+        self.poll()
+        self.assertEqual(self.queued(), ["_conflict"])
+        join(self.app.users, self.me, self.market, ME, settings=Settings(fix_conflicts=False))
+        self.github.ci_state.return_value = ("sha-2", "FAILURE")  # a new commit's CI fails
+        self.github.pr.reset_mock()
+        self.poll()
+        self.assertEqual(self.queued(), ["_failing_ci"])  # switched off: conflicts are left, CI is fixed as before
+        self.github.pr.assert_not_called()  # GitHub isn't even asked whether it conflicts
+
     def test_review_comments_on_a_tracked_pr_start_a_fix_once(self):
         self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 7, "MAR-1", ("C0REVIEWS1", "1.2"))
         self.assertEqual(self.poll(), [])  # no comments yet
@@ -153,7 +244,8 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(self.poll(), [("marketplace", ["acme/fe#7"])])
         self.assertEqual(self.jobs[0][3].__qualname__.split(".")[1], "_failing_ci")  # the CI, not the comments
         join(self.app.users, self.me, self.market, ME,
-             settings=Settings(fix_review_comments=False, fix_ci=False, review_for_me=False))
+             settings=Settings(fix_review_comments=False, fix_ci=False, fix_conflicts=False,
+                                     review_for_me=False))
         self.github.review_threads.reset_mock()
         self.slack.history.return_value = [{"ts": "1800000100.0", "user": "U0SARA", "text": f"<@{MY_SLACK}> please "
                                             "review https://github.com/acme/fe/pull/9"}]

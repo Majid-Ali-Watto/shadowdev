@@ -33,6 +33,28 @@ class RepositoriesTest(unittest.TestCase):
         self.me = self.users.save_jira_account(None, "acc-1", "Majid", "m@x", [OFFICE],
                                                Tokens("jira-access-token", "jira-refresh-token", 123.0))
 
+    def test_upgrade_to_19_keeps_what_relied_on_the_old_defaults(self):
+        add_developer(self.users, "acc-1", user_id=self.me)
+        old = add_project(self.projects, self.me, "market", ["MAR"])
+        join(self.users, self.me, old, "acc-1")
+        with closing(sqlite3.connect(self.path)) as conn, conn:  # as schema 18 left them
+            conn.execute("UPDATE projects SET status_rules = NULL")
+            conn.execute("UPDATE subscriptions SET settings = '{\"auto_sprint\": false}'")
+            conn.execute("ALTER TABLE projects DROP COLUMN fix_version_pick")
+            conn.execute("PRAGMA user_version = 18")
+        db = Database(self.path, self.key)
+        project = ProjectRepository(db).get(old.id)
+        self.assertEqual([str(r) for r in project.status_rules],
+                         ["Ready for Release -> Done: root cause, fix version, parent, original estimate, logged time"])
+        self.assertEqual((project.fix_version_pick, project.uses_sprints, project.bug_types), ("highest", True, ("Bug",)))
+        settings = UserRepository(db).get(self.me).subscriptions[old.id].settings
+        self.assertEqual((settings.auto_statuses, settings.auto_sprint), ("To Do, Backlog, Ready for Pickup, Reopened", False))
+        # A project added since gets the defaults that fit any team.
+        new = add_project(ProjectRepository(db), self.me, "ops", ["OPS"])
+        self.assertEqual((new.status_rules, new.fix_version_pick), ((), "next"))
+        Database(self.path, self.key)  # opening again changes nothing
+        self.assertEqual(ProjectRepository(db).get(new.id).status_rules, ())
+
     def test_tokens_are_encrypted_at_rest(self):
         self.users.save_github(self.me, "office", "github-secret-token", "majid", "Majid", "m@x")
         self.users.save_claude(self.me, "office", "sk-ant-oat01-secret", "k1")
@@ -201,8 +223,8 @@ class RepositoriesTest(unittest.TestCase):
         for page in ("-1", "x", "99999", ""):
             self.assertEqual(RunFilter.of(page=page).page, 1)
         self.assertEqual(len(RunFilter.of("x" * 500).text), 100)
-        self.assertEqual(RunFilter.of("a&b", "failed", page="3").query(), "tab=runs&q=a%26b&status=failed&page=3")
-        self.assertEqual(RunFilter(page=4).query(page=1), "tab=runs")
+        self.assertEqual(RunFilter.of("a&b", "failed", page="3").query(), "tab=recent&q=a%26b&status=failed&page=3")
+        self.assertEqual(RunFilter(page=4).query(page=1), "tab=recent")
 
     def test_webhook_events_are_accepted_once(self):
         self.assertTrue(self.runs.first_time("e1", 1000, 0))

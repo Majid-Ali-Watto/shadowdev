@@ -27,22 +27,27 @@ import logging
 import os
 import re
 import shutil
+import smtplib
+import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from pathlib import Path
 
 from ..clients.github import GitHub
 from ..clients.jira import Jira
+from ..clients.mail import send_mail
 from ..clients.rest import HTTPError
 from ..clients.slack import Slack, link, link_issues
 from ..clients.slack import escape as slack_escape
 from ..config import Config
 from ..models.issue import NO_CHANGE, PLAN_HEAD, PRS_UNOPENED, ROOT_CAUSE_HEAD, TESTS_FAILING, Issue
 from ..models.project import Project, Repo
+from ..models.publication import Change, Publication
 from ..models.user import Actor
-from . import gitops, guidance, rules
+from ..views import emails
+from . import gitops, guidance, limits, rules
 from .agent import (
     EDIT_TOOLS,
     FIXED_MODELS,
@@ -155,11 +160,14 @@ def fetch_attachments(jira: Jira, issues: list[Issue], workspace: Path, label: s
 
 
 def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tuple[Repo, str]], label: str,
-                   thread: tuple[str, str] | None = None, again: bool = False, done: str = "") -> tuple[str, str] | None:
+                   thread: tuple[str, str] | None = None, again: bool = False, done: str = "",
+                   later: Callable[[str, str, str], None] | None = None) -> tuple[str, str] | None:
     """Ask in the project's Slack channel, as the developer, for review of the PRs, mentioning
     each repo's reviewers (`thread`: as a reply to that earlier request): "Kindly review these PRs:
     <title>", the PRs, "Thanks". `done`: what changed since they last looked, said first. Returns
-    (channel, timestamp) of the message; None without Slack, or when it could not be posted: not fatal."""
+    (channel, timestamp) of the message; None without Slack, or when it could not be posted: not fatal.
+    `later(channel, text, thread timestamp)`: given, a reply outside the developer's working hours
+    is handed to it, to be posted in those hours, instead of now."""
     channel = thread[0] if thread else project.slack_channel
     if not (actor.slack and channel and opened):
         return None
@@ -168,8 +176,13 @@ def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tupl
     keys = rules.ISSUE_KEYS_RE.findall(title.partition(": ")[0])
     ask = f"{done} {ask}".lstrip() + (f": {link_issues(slack_escape(title), project.site_url, keys)}" if title else ".")
     lines = [f"• {repo.name}: {link(url)} {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip() for repo, url in opened]
+    text = "\n".join([ask, *lines, "Thanks"])
+    if later and thread and not actor.settings.at_work(time.time()):
+        later(channel, text, thread[1])
+        log.info("%s: outside working hours: the review request waits for them", label)
+        return thread
     try:
-        ts = Slack(actor.slack.token).post(channel, "\n".join([ask, *lines, "Thanks"]), thread and thread[1])
+        ts = Slack(actor.slack.token).post(channel, text, thread and thread[1])
     except HTTPError as e:
         log.warning("%s: could not ask for review in Slack: %s", label, e)
         return None
@@ -180,7 +193,7 @@ def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tupl
 def ask_for_reviews(actor: Actor, project: Project, entries: list[tuple[str, Repo, str]], label: str
                     ) -> tuple[str, str] | None:
     """One request, as the developer, for the PRs of several runs started together. `entries`:
-    (the run's title, the repo, its PR). A section per repo, headed by its name on tickets (FE, BE)
+    (the run's title, the repo, its PR). A section per repo, headed by its name
     and its reviewers, with each PR under its issue. Returns (channel, timestamp) of the message;
     None without Slack, or when it could not be posted."""
     if not (actor.slack and project.slack_channel and entries):
@@ -190,7 +203,7 @@ def ask_for_reviews(actor: Actor, project: Project, entries: list[tuple[str, Rep
         prs = [(title, url) for title, r, url in entries if r.name == repo.name]
         if not prs:
             continue
-        head = f"*{rules.repo_label(repo.name)}* {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip()
+        head = f"*{repo.name}* {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip()
         lines = [f"• {link_issues(slack_escape(title), project.site_url, rules.ISSUE_KEYS_RE.findall(title.partition(': ')[0]))}"
                  f"\n   {link(url)}" for title, url in prs]
         sections.append("\n".join([head, *lines]))
@@ -203,18 +216,50 @@ def ask_for_reviews(actor: Actor, project: Project, entries: list[tuple[str, Rep
     return project.slack_channel, ts
 
 
-def notify_developer(actor: Actor, text: str, label: str, site_url: str = "", keys=()) -> None:
-    """Tell the developer, in Slack, in their own direct messages (if they connected Slack), with
-    the issue `keys` in it linked to their issues on `site_url`. Not fatal: the run's message on
-    their page says the same."""
-    if not actor.slack:
-        return
+def notify_developer(actor: Actor, cfg: Config, kind: str, subject: str, text: str, label: str, site_url: str = "",
+                     keys=(), html: str = "") -> None:
+    """Tell the developer `kind` (Settings.tells) the ways they chose for it in the project:
+    in their own Slack direct messages (if they connected Slack), and by email (if the server can
+    send it), with the issue `keys` in it linked to their issues on `site_url`. Not fatal: the run's
+    message on their page says the same. `html`: the email's, beside its text."""
+    if actor.settings.tells(kind, "slack") and actor.slack:
+        try:
+            Slack(actor.slack.token).post(actor.slack.user_id, link_issues(slack_escape(text), site_url, keys) if site_url
+                                          else slack_escape(text))
+            log.info("%s: %s told in Slack", label, actor.display_name)
+        except HTTPError as e:
+            log.warning("%s: could not tell the developer in Slack: %s", label, e)
+    if actor.settings.tells(kind, "email"):
+        email_developer(actor, cfg, subject, text + issue_links(site_url, keys), label, html)
+
+
+def decision_message(for_developer: dict[str, list[str]]) -> tuple[str, str]:
+    """(subject, text) telling the developer a run needs their decision on these issues' questions."""
+    asked = "\n".join(f"{key}: {q}" for key, qs in for_developer.items() for q in qs)
+    return (f"{', '.join(for_developer)}: your decision is needed",
+            f"Your decision is needed before work on {', '.join(for_developer)} goes on:\n{asked}\n"
+            "Answer in a note (a line per issue, like the questions) when you run it again from Run issues now.")
+
+
+def email_developer(actor: Actor, cfg: Config, subject: str, text: str, label: str, html: str = "") -> bool:
+    """Email the developer at the address of the project's Jira account. False when it wasn't sent."""
+    if not (cfg.smtp and actor.email):
+        log.warning("%s: could not email %s: %s", label, actor.display_name,
+                    "the server has no SMTP account (SMTP_HOST)" if not cfg.smtp else "their Jira account shows no email")
+        return False
     try:
-        Slack(actor.slack.token).post(actor.slack.user_id, link_issues(slack_escape(text), site_url, keys) if site_url
-                                      else slack_escape(text))
-        log.info("%s: %s told in Slack", label, actor.display_name)
-    except HTTPError as e:
-        log.warning("%s: could not tell the developer in Slack: %s", label, e)
+        send_mail(cfg.smtp, actor.email, subject, text, html)
+    except (OSError, smtplib.SMTPException) as e:
+        log.warning("%s: could not email %s: %s", label, actor.display_name, e)
+        return False
+    log.info("%s: %s told by email", label, actor.display_name)
+    return True
+
+
+def issue_links(site_url: str, keys) -> str:
+    """The issues' addresses, for a plain-text message."""
+    lines = [f"{key}: {site_url}/browse/{key}" for key in keys] if site_url else []
+    return "\n\n" + "\n".join(lines) if lines else ""
 
 
 def compare_url(owner_repo: str, base: str, branch: str) -> str:
@@ -289,7 +334,7 @@ def select_issues(keys: list[str], project: Project, actor: Actor, jira: Jira) -
     issues, skipped = [], []
     for key in keys:
         fields = jira.get_issue(key)["fields"]
-        kind = rules.issue_kind(fields)
+        kind = project.issue_kind(fields)
         if (fields.get("project") or {}).get("key") not in project.jira_projects:
             skipped.append(f"{key}: not in a Jira project of {project.name}")
         elif rules.assignee(fields) != actor.jira_account_id:
@@ -475,7 +520,8 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
                    on_model: Callable[[str], None] = lambda models: None,
                    on_pr: Callable[..., None] = lambda *pr: None, asked: dict[str, list[str]] | None = None,
                    on_questions: Callable[[dict[str, list[str]]], None] = lambda questions: None,
-                   only: tuple[str, ...] = (), announce: Callable[..., None] | None = None) -> tuple[str, str]:
+                   only: tuple[str, ...] = (), announce: Callable[..., None] | None = None,
+                   hold: Callable[[Publication], None] | None = None) -> tuple[str, str]:
     """Work on the issues together, on one branch. `note`: the developer's own instructions for
     this run, given to Claude with the issues; `asked`: the questions an earlier run asked the
     developer, by issue key, which the note answers. `on_questions` is told the questions this run
@@ -483,6 +529,8 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     (none: the ones Claude finds the fix needs); when the fix needs another, they are asked once.
     `announce(title, [(repo, PR)], branch)`: given, it is told the PRs to ask review for, and no
     request is posted here (one is posted for all the runs started with this one).
+    `hold(publication)`: given, a run outside the developer's working hours pushes its branch and
+    hands it what to publish (open_prs) in those hours, instead of opening its PRs now.
     `on_model` is told which model(s) work on it,
     e.g. "haiku (high) → sonnet (high)"; `on_pr` of each PR opened: (repo, its number, the branch, and
     (channel, timestamp) of the Slack message that asked for its review, or None). Returns
@@ -497,7 +545,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
     outcome = "failed"
     try:
         outcome, message = _process(keys, project, actor, cfg, jira, github, publish, cancel, timings, note, on_model,
-                                    on_pr, asked or {}, on_questions, only, announce)
+                                    on_pr, asked or {}, on_questions, only, announce, hold)
         return outcome, message
     except Cancelled:
         outcome = "stopped"
@@ -508,7 +556,7 @@ def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config,
 
 def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
              publish: bool, cancel: CancelToken, timings: Timings, note: str, on_model, on_pr, asked,
-             on_questions, only: tuple[str, ...] = (), announce=None) -> tuple[str, str]:
+             on_questions, only: tuple[str, ...] = (), announce=None, hold=None) -> tuple[str, str]:
     with timings.step("Jira and GitHub checks"):
         issues, skipped = select_issues(keys, project, actor, jira)
         for issue in list(issues):
@@ -577,7 +625,7 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
         try:
             outcome = _work(issues, skipped, branch, targets, continued, reopened, workspace, scratch, envs,
                             project, actor, cfg, jira, github, publish, cancel, timings, note, on_model, on_pr, pushed,
-                            asked, on_questions, only, announce)
+                            asked, on_questions, only, announce, hold)
             put_back = outcome[0] in ("failed", "waiting", "question")
             return outcome
         except Cancelled:
@@ -605,7 +653,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
           continued: dict[str, dict | None], reopened: bool, workspace: Path, scratch: Path, envs: list[dict],
           project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub, publish: bool, cancel: CancelToken,
           timings: Timings, note: str, on_model, on_pr, pushed: list[str], asked: dict[str, list[str]],
-          on_questions, only: tuple[str, ...] = (), announce=None) -> tuple[str, str]:
+          on_questions, only: tuple[str, ...] = (), announce=None, hold=None) -> tuple[str, str]:
     """`targets`: (repo, the base branch its PR goes into). `continued`: the repos whose existing
     branch the run continues (see earlier_work); the others are cut from their base branch."""
     label = branch
@@ -670,7 +718,7 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     if beyond and settings.ask_developer and not any(i.key in asked for i in issues):
         for_developer.setdefault(issues[0].key, []).append(
             f"The fix needs changes in {', '.join(beyond)} too, but you chose to change only {', '.join(only)}. Run it "
-            f"again with Change set to FE and BE to change them all, or as it is to keep to {', '.join(only)}.")
+            f"again with {', '.join(beyond)} ticked too to change them, or as it is to keep to {', '.join(only)}.")
     elif beyond:
         target_repos = [r for r in target_repos if r in only] or list(only)
         assumptions = [*assumptions, f"Only {', '.join(target_repos)} was changed, as chosen; the fix also needs "
@@ -684,11 +732,10 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
                     jira.comment(issue.key, rules.questions_comment(questions[issue.key], issue.reporter))
                     log.info("%s: asked its reporter: %s", issue.key, " | ".join(questions[issue.key]))
     if for_developer:  # technical: for the developer alone, never on the ticket
-        asked = "\n".join(f"{key}: {q}" for key, qs in for_developer.items() for q in qs)
-        log.info("%s: asked %s: %s", label, actor.display_name, asked.replace("\n", " | "))
-        message = (f"Your decision is needed before work on {', '.join(for_developer)} goes on:\n{asked}\n"
-                   "Answer in a note (a line per issue, like the questions) when you run it again from Run issues now.")
-        notify_developer(actor, message, label, project.site_url, list(for_developer))
+        subject, message = decision_message(for_developer)
+        log.info("%s: asked %s: %s", label, actor.display_name, " | ".join(message.splitlines()[1:-1]))
+        notify_developer(actor, cfg, "decisions", subject, message, label,
+                         project.site_url, list(for_developer), emails.decision(for_developer, project.site_url))
         on_questions(for_developer)
         return "question", message + ("\nIts questions for the reporter are on the ticket too." if questions else "")
     if questions:
@@ -696,21 +743,21 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
                            "needs to know; it runs again once someone answers there")
     with timings.step("Jira analysis updates"):
         version = None
-        if settings.jira_fix_version and any(i.kind == "bug" for i in issues):
-            # The highest open release, replacing what the ticket had (e.g. a wrong one from an earlier run).
-            version = rules.latest_fix_version(jira.project_versions(issues[0].fields["project"]["key"]))
+        if settings.jira_fix_version and project.uses_fix_versions and any(i.kind == "bug" for i in issues):
+            # By the project's pick, replacing what the ticket had (e.g. a wrong one from an earlier run).
+            version = rules.fix_version(jira.project_versions(issues[0].fields["project"]["key"]),
+                                        project.fix_version_pick, [pr_base[r] for r in target_repos if r in pr_base])
             if not version:
                 log.warning("%s: no unreleased numbered Jira version found; fix version not set", label)
         for issue in issues:
             analysis = analyses[issue.key]
             log.info("%s: %s (repos: %s): %s", issue.key, "root cause" if issue.kind == "bug" else "plan",
                      ", ".join(target_repos), analysis)
-            if not settings.jira_comments:
-                pass
-            elif issue.kind == "bug" and project.root_cause_field:
-                jira.set_field(issue.key, project.root_cause_field, analysis)
-                log.info("%s: Jira %s (root cause) set", issue.key, project.root_cause_field)
-            else:
+            if issue.kind == "bug" and project.root_cause_field:
+                if settings.jira_root_cause:
+                    jira.set_field(issue.key, project.root_cause_field, analysis)
+                    log.info("%s: Jira %s (root cause) set", issue.key, project.root_cause_field)
+            elif settings.jira_comments:
                 heading = ROOT_CAUSE_HEAD if issue.kind == "bug" else PLAN_HEAD
                 jira.comment(issue.key, f"{heading}\n{analysis}")
                 log.info("%s: Jira comment with the %s posted", issue.key, heading.strip("*:").lower())
@@ -763,86 +810,130 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     if assumptions:  # what Claude decided that the issue left open: for the reviewers to check
         proven += "**Assumptions** (the issue left these open):\n" + "\n".join(
             f"- {a}" for a in assumptions) + "\n\n"
-    prs, unopened, opened, rows, new = [], [], [], [], []
+    changes = []
     for c in to_ship:
         cancel.check()  # last chance: nothing is pushed for a stopped run
         base, existing = pr_base[c.repo.name], continued.get(c.repo.name)
-        with timings.step(f"commit, push and PR {c.repo.name}"):
+        with timings.step(f"commit and push {c.repo.name}"):
             name, email = actor.github.git_name, actor.github.git_email
             gitops.commit_all(c.worktree, f"{title}\n\n{summary}\n\n{commit_details}", name, email)
             log.info("%s: %s committed as %s <%s>; pushing branch %s to %s", label, c.repo.name, name, email, branch,
                      c.repo.github)
             gitops.push(c.worktree, c.repo.github, branch, token)
             pushed.append(c.repo.name)
-            if existing:  # the issue was sent back while its PR is open: the push updated it
-                pr_url = existing["html_url"]
+        if existing:  # the issue was sent back while its PR is open: the push updated it
+            changes.append(Change(c.repo.name, base, "update", f"Pushed more changes for {', '.join(keys_here)} after it "
+                                  f"was reopened.\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}",
+                                  existing["number"], existing["html_url"]))
+        elif settings.publish == "branch":  # the developer opens the PR
+            changes.append(Change(c.repo.name, base, "branch", url=compare_url(c.repo.github, base, branch)))
+        else:
+            changes.append(Change(c.repo.name, base, "new",
+                                  f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}"))
+    cancel.check()
+    publication = Publication(tuple(keys_here), branch, title, tuple(changes), again=bool(continued))
+    skips = [f"skipped {s}" for s in skipped]
+    now = time.time()
+    if hold and publication.involves_others and not settings.at_work(now):
+        # PRs and their review request are for other people: they wait for the developer's working hours.
+        hold(publication)
+        when = limits.when(settings.work_starts(now))
+        log.info("%s: outside %s's working hours: branch %s pushed in %s; its PRs are opened at %s", label,
+                 actor.display_name, branch, ", ".join(pushed), when)
+        return "done", "; ".join([f"branch {branch} pushed in {', '.join(pushed)}; its PRs, and the review request, "
+                                  f"wait for your working hours: {when}", *skips])
+    status, message = open_prs(publication, project, actor, jira, github, label, on_pr, announce, timings)
+    return status, "; ".join([message, *skips]) if status == "done" else message
+
+
+def open_prs(pub: Publication, project: Project, actor: Actor, jira: Jira, github: GitHub, label: str,
+             on_pr: Callable[..., None] = lambda *pr: None, announce: Callable[..., None] | None = None,
+             timings: Timings | None = None) -> tuple[str, str]:
+    """Publish a run's pushed branch: open its PRs (comment on the open ones the push updated), ask
+    for their review in Slack, and comment their links on its tickets, moving them to review; at
+    the end of its run, or later, in its developer's working hours. `on_pr` and `announce` as for
+    process_issues. Returns (status, message): "failed" when a PR could not be opened (its
+    tickets stay in progress, with where to open it by hand)."""
+    settings = actor.settings
+    step = timings.step if timings else (lambda name: nullcontext())
+    prs, unopened, opened, rows, new = [], [], [], [], []
+    for c in pub.changes:
+        repo = project.repo(c.repo)
+        if not repo:  # removed from the project since its run
+            continue
+        kind = "branch" if c.kind == "new" and settings.publish == "branch" else c.kind
+        if kind == "branch":
+            url = c.url or compare_url(repo.github, c.base, pub.branch)
+            prs.append(f"{repo.name}: branch {pub.branch} pushed; open its PR into {c.base} at {url}")
+            rows.append((repo, c.base, url))
+            log.info("%s: %s branch %s pushed; no PR opened, as chosen", label, repo.name, pub.branch)
+            continue
+        with step(f"open PR {repo.name}"):
+            if kind == "update":
+                pr_url = c.url
                 try:
-                    github.comment(c.repo.github, existing["number"],
-                                   f"Pushed more changes for {', '.join(keys_here)} after it was reopened.\n\n"
-                                   f"{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}")
+                    github.comment(repo.github, c.pr, c.text)
                 except HTTPError as e:
                     log.warning("%s: could not comment on %s: %s", label, pr_url, e)
-            elif settings.publish == "branch":  # the developer opens the PR
-                pr_url = compare_url(c.repo.github, base, branch)
-                prs.append(f"{c.repo.name}: branch {branch} pushed; open its PR into {base} at {pr_url}")
-                rows.append((c.repo.name, base, pr_url))
-                log.info("%s: %s branch %s pushed; no PR opened, as chosen", label, c.repo.name, branch)
-                continue
             else:
                 try:
-                    pr_url = github.create_pr(
-                        c.repo.github,
-                        base=base,
-                        head=branch,
-                        title=title,
-                        body=f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}",
-                        draft=settings.publish == "draft",
-                    )
+                    pr_url = github.create_pr(repo.github, base=c.base, head=pub.branch, title=pub.title, body=c.text,
+                                              draft=settings.publish == "draft")
+                    new.append((repo, pr_url))
                 except HTTPError as e:  # the change is on GitHub: say where, so the PR can be opened by hand
-                    log.warning("%s: %s branch pushed, but the PR could not be opened: %s", label, c.repo.name, e)
-                    unopened.append(f"{c.repo.name}: branch {branch} is pushed, but its PR into {base} could not be "
-                                    f"opened (GitHub answered {e.status}); open it at "
-                                    f"{compare_url(c.repo.github, base, branch)}")
-                    continue
-                new.append((c.repo, pr_url))
-        prs.append(f"{c.repo.name} into {base}: {pr_url}{' (updated)' if existing else ''}")
-        opened.append((c.repo, pr_url))
-        rows.append((c.repo.name, base, pr_url))
-        log.info("%s: %s PR %s%s", label, c.repo.name, pr_url, " updated" if existing else "")
-    cancel.check()
+                    found = _open_pr(github, repo.github, pub.branch) if e.status == 422 else None
+                    if not found:
+                        log.warning("%s: %s branch pushed, but the PR could not be opened: %s", label, repo.name, e)
+                        unopened.append(f"{repo.name}: branch {pub.branch} is pushed, but its PR into {c.base} could not be "
+                                        f"opened (GitHub answered {e.status}); open it at "
+                                        f"{compare_url(repo.github, c.base, pub.branch)}")
+                        continue
+                    pr_url = found  # opened since, by a later run of the same branch
+        prs.append(f"{repo.name} into {c.base}: {pr_url}{' (updated)' if kind == 'update' else ''}")
+        opened.append((repo, pr_url))
+        rows.append((repo, c.base, pr_url))
+        log.info("%s: %s PR %s%s", label, repo.name, pr_url, " updated" if kind == "update" else "")
     if unopened:
         # Not in review until every PR is open: the issue stays in progress, for its developer.
-        with timings.step("Jira: PRs to open by hand"):
+        with step("Jira: PRs to open by hand"):
             lines = "\n".join(f"* {line}" for line in [*unopened, *(f"opened {p}" for p in prs)])
-            for issue in issues:
+            for key in pub.keys:
                 if settings.jira_comments:
                     try:
-                        jira.comment(issue.key, f"{PRS_UNOPENED}\n" + lines)
+                        jira.comment(key, f"{PRS_UNOPENED}\n" + lines)
                     except HTTPError as e:
-                        log.warning("%s: could not comment the branches to open PRs for: %s", issue.key, e)
+                        log.warning("%s: could not comment the branches to open PRs for: %s", key, e)
                 if settings.jira_status:
-                    move_issue(jira, issue.key, project.start_statuses)
+                    move_issue(jira, key, project.start_statuses)
         return "failed", "; ".join([*unopened, *(f"opened {p}" for p in prs)])
     asked = None
-    if settings.slack_review_request and settings.publish == "pr":  # a draft is not ready for review yet
-        with timings.step("Slack review request"):
+    if settings.slack_review_request and settings.publish == "pr" and opened:  # a draft is not ready for review yet
+        with step("Slack review request"):
             if announce:  # one request for all the runs started with this one, once the last has ended
-                announce(title, opened, branch)
+                announce(pub.title, opened, pub.branch)
             else:
-                asked = ask_for_review(actor, project, title, opened, label, again=bool(continued))
+                asked = ask_for_review(actor, project, pub.title, opened, label, again=pub.again)
     for repo, pr_url in new:  # an updated PR is watched already
-        on_pr(repo, int(pr_url.rstrip("/").rsplit("/", 1)[1]), branch, asked)
+        on_pr(repo, int(pr_url.rstrip("/").rsplit("/", 1)[1]), pub.branch, asked)
     unreported = []
-    with timings.step("Jira PR links and review status"):
-        for issue in issues:
-            others = [k for k in keys_here if k != issue.key]
+    with step("Jira PR links and review status"):
+        for key in pub.keys:
+            others = [k for k in pub.keys if k != key]
             if settings.jira_comments:
                 try:  # the work is pushed: a Jira error now must not make the run look failed
-                    jira.comment(issue.key, rules.pr_links_comment(rows, others))
-                    log.info("%s: Jira comment with the PR links posted", issue.key)
+                    jira.comment(key, rules.pr_links_comment(rows, others))
+                    log.info("%s: Jira comment with the PR links posted", key)
                 except HTTPError as e:
-                    log.warning("%s: could not comment the PR links: %s", issue.key, e)
-                    unreported.append(f"{issue.key}: the PR links could not be commented on the ticket")
+                    log.warning("%s: could not comment the PR links: %s", key, e)
+                    unreported.append(f"{key}: the PR links could not be commented on the ticket")
             if settings.jira_status and opened:  # in review once there is a PR to review
-                move_issue(jira, issue.key, project.review_statuses)
-    return "done", "; ".join([*prs, *unreported, *(f"skipped {s}" for s in skipped)])
+                move_issue(jira, key, project.review_statuses)
+    return "done", "; ".join([*prs, *unreported])
+
+
+def _open_pr(github: GitHub, owner_repo: str, branch: str) -> str | None:
+    """The URL of the open PR from `branch`, or None."""
+    try:
+        return next((p["html_url"] for p in github.prs_for_branch(owner_repo, branch) if p.get("state") == "open"), None)
+    except HTTPError:
+        return None

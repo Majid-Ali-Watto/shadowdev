@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 include = ["shadowdev*"]
 
 [tool.setuptools.package-data]
-"shadowdev.views" = ["static/*.css", "static/*.js"]
+"shadowdev.views" = ["static/*.css", "static/*.js", "assets/*"]
 
 [dependency-groups]
 dev = [

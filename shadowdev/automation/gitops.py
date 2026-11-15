@@ -74,11 +74,29 @@ def valid_branch_name(name: str) -> bool:
     return subprocess.run(["git", "check-ref-format", "--branch", name], capture_output=True, env=_env()).returncode == 0
 
 
-def clone(owner_repo: str, branch: str, dest: Path, token: str) -> str:
-    """Shallow clone of one branch (just its latest commit); returns that commit."""
-    _remote(token, "clone", "--quiet", "--depth", "1", "--single-branch", "--no-tags", "--branch", branch,
+def clone(owner_repo: str, branch: str, dest: Path, token: str, shallow: bool = True) -> str:
+    """Clone of one branch: by default shallow (just its latest commit); with `shallow` False its
+    whole history, which a merge needs to find where two branches met. Returns its commit."""
+    depth = ["--depth", "1"] if shallow else []
+    _remote(token, "clone", "--quiet", *depth, "--single-branch", "--no-tags", "--branch", branch,
             repo_url(owner_repo), str(dest))
     return git(dest, "rev-parse", "HEAD")
+
+
+def start_merge(worktree: Path, owner_repo: str, base: str, token: str, name: str, email: str) -> tuple[str, list[str]]:
+    """Merge the latest `base` into the clone's branch (a full clone), without committing: the merge
+    is left for its conflicts to be resolved, then committed by commit_all. Returns (the commit of
+    `base` merged, the files in conflict: none when git merged it all by itself)."""
+    _remote(token, "fetch", "--quiet", "--no-tags", repo_url(owner_repo), f"+refs/heads/{base}:refs/remotes/base/{base}",
+            cwd=worktree)
+    commit = git(worktree, "rev-parse", f"refs/remotes/base/{base}")
+    who = {"GIT_AUTHOR_NAME": name, "GIT_AUTHOR_EMAIL": email, "GIT_COMMITTER_NAME": name, "GIT_COMMITTER_EMAIL": email}
+    proc = subprocess.run(["git", *SAFE, "merge", "--no-commit", "--no-ff", "--no-edit", commit], cwd=worktree,
+                          env=_env(**who), capture_output=True, text=True)
+    conflicted = git(worktree, "diff", "--name-only", "--diff-filter=U").splitlines()
+    if proc.returncode != 0 and not conflicted:  # not a conflict: unrelated histories, a dirty clone, …
+        raise RuntimeError(f"git merge {base} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+    return commit, conflicted
 
 
 def commit_all(worktree: Path, message: str, name: str, email: str) -> None:

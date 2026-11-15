@@ -62,9 +62,9 @@ def matching_issue(payload: dict, projects: ProjectRepository, users: UserReposi
     user = users.get(user_id) if user_id else None
     actor = user.actor(project.id) if user and not user.paused else None
     if not actor or not actor.settings.auto_start or actor.jira_account_id != account_id \
-            or not rules.wanted(rules.issue_kind(fields), actor.mode):
+            or not rules.wanted(project.issue_kind(fields), actor.mode):
         return None
-    problem = actor.settings.start_problem(fields)
+    problem = actor.settings.start_problem(fields, project.uses_sprints)
     if problem:
         log.info("%s: not started by itself for %s: %s", key, user.display_name, problem)
         return None
@@ -110,7 +110,9 @@ class WebhookService:
         if not match:
             return 200, "ignored"
         key, project, user_id = match
-        refusal = self.queue.submit(project, [key], user_id, automatic=True)
+        # Its priority orders it among the developer's waiting runs; any other effect comes from Jira itself.
+        refusal = self.queue.submit(project, [key], user_id, automatic=True,
+                                    urgency=rules.urgency((payload.get("issue") or {}).get("fields") or {}))
         if refusal:
             return 200, refusal
         log.info("%s: queued for %s", key, project.name)

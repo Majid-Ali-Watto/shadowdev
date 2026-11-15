@@ -9,23 +9,27 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from ..automation import gitops
-from ..clients.atlassian import AtlassianOAuth, jira_client
+from ..clients.atlassian import AtlassianOAuth, JiraAccessLost, jira_client
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
 from ..models import settings as automation
 from ..models.project import (
+    BUG_TYPES,
     CUSTOM_FIELD_RE,
+    FIX_VERSION_PICKS,
+    ISSUE_TYPE_RE,
     JIRA_PROJECT_RE,
     PROJECT_NAME_RE,
     REPO_NAME_RE,
     SLACK_CHANNEL_RE,
     SLACK_MEMBER_RE,
+    TASK_TYPES,
     Project,
     Repo,
     default_repo_name,
     parse_github,
 )
-from ..models.release import DEFAULT_RULES, parse_rules
+from ..models.release import parse_rules
 from ..models.settings import Settings
 from ..models.user import MODES, Subscription, User
 from ..repositories.projects import ProjectRepository, Taken
@@ -38,6 +42,8 @@ MAX_REPOS = 10
 MAX_KEYS = 20
 MAX_COMMAND_CHARS = 4000
 MAX_REVIEWERS = 5
+MAX_LISTED_STATUSES = 40
+MAX_ISSUE_TYPES = 10
 
 
 @dataclass
@@ -61,7 +67,12 @@ class ProjectForm:
     start_statuses: str = ""  # "To Do, In Progress"
     review_statuses: str = ""
     slack_channel: str = ""  # channel ID
-    status_rules: str = ""  # one per line: "Ready for Release -> Done: fix version, parent"; empty: the defaults
+    status_rules: str = ""  # one per line: "Ready for Release -> Done: fix version, parent"; empty: none
+    uses_sprints: bool = True
+    uses_fix_versions: bool = True
+    fix_version_pick: str = "next"
+    bug_types: str = ""  # "Bug, Defect"; empty: Bug
+    task_types: str = ""  # "Task, Story"; empty: Task, Story, Sub-task
     repos: list[RepoForm] = field(default_factory=list)
 
 
@@ -74,6 +85,29 @@ def statuses(text: str, default: tuple[str, ...], what: str) -> tuple[str, ...]:
     if len(names) > 8 or any(len(n) > 60 for n in names):
         raise UserError(f"{what}: at most 8 Jira status names, separated by commas.")
     return tuple(names)
+
+
+def issue_types(text: str, default: tuple[str, ...], what: str) -> tuple[str, ...]:
+    names = split_list(text) or list(default)
+    if len(names) > MAX_ISSUE_TYPES or not all(ISSUE_TYPE_RE.match(n) for n in names):
+        raise UserError(f"{what}: at most {MAX_ISSUE_TYPES} Jira issue type names, separated by commas.")
+    return tuple(names)
+
+
+def unknown_statuses(known: list[str], typed: list[tuple[str, tuple[str, ...]]], keys: list[str]) -> list[str]:
+    """A line for each field (what, status names) naming the statuses no workflow of the Jira projects
+    has, then the ones they do have; none: all are known."""
+    lower = {k.lower() for k in known}
+    lines = []
+    for what, names in typed:
+        missing = [n for n in dict.fromkeys(names) if n.lower() not in lower]
+        if missing:
+            lines.append(f"{what}: {', '.join(missing)} {'is' if len(missing) == 1 else 'are'} not a status of "
+                         f"{', '.join(keys)}.")
+    if lines:
+        lines.append(f"Their statuses: {', '.join(known[:MAX_LISTED_STATUSES]) or 'none'}"
+                     + (", …" if len(known) > MAX_LISTED_STATUSES else "") + ".")
+    return lines
 
 
 def slack_members(text: str, what: str) -> tuple[str, ...]:
@@ -148,9 +182,16 @@ class ProjectService:
         start = statuses(form.start_statuses, Project.start_statuses, "Start statuses")
         review = statuses(form.review_statuses, Project.review_statuses, "Review statuses")
         try:
-            status_rules = parse_rules(form.status_rules) or DEFAULT_RULES
+            status_rules = parse_rules(form.status_rules)
         except ValueError as e:
             raise UserError(f"Status rules: {e}.") from None
+        bug_types = issue_types(form.bug_types, BUG_TYPES, "Bug issue types")
+        task_types = issue_types(form.task_types, TASK_TYPES, "Task issue types")
+        if {t.lower() for t in bug_types} & {t.lower() for t in task_types}:
+            raise UserError("An issue type is either worked on as a bug or as a task, not both.")
+        fix_version_pick = form.fix_version_pick or "next"
+        if fix_version_pick not in FIX_VERSION_PICKS:
+            raise UserError("Choose which fix version bugs get.")
         channel = form.slack_channel.strip() or None
         if channel and not SLACK_CHANNEL_RE.match(channel):
             raise UserError("Slack channel: the channel's ID like C012ABC3DE (in Slack: the channel's details, at the "
@@ -186,9 +227,16 @@ class ProjectService:
 
         jira_account, jira = self._jira_for(user, cloud_id)
         github = GitHub(github_account.token)
-        problems = [p for p in run_all(
-            [lambda k=k: self._jira_problem(jira, k, site.name) for k in keys]
-            + [lambda r=r: self._push_problem(github, github_account.login, r.github) for r in repos]) if p]
+        results = run_all([lambda k=k: self._jira_statuses(jira, k, site.name) for k in keys]
+                          + [lambda r=r: self._push_problem(github, github_account.login, r.github) for r in repos])
+        found, pushes = results[:len(keys)], results[len(keys):]
+        problems = [p for p, _ in found if p] + [p for p in pushes if p]
+        if not problems:
+            # Status rules are checked only as typed: the defaults matter only to members who switch the moves on.
+            rule_statuses = tuple(s for r in status_rules for s in (r.from_status, r.to_status))
+            problems = unknown_statuses(list(dict.fromkeys(n for _, names in found for n in names)),
+                                        [("Start statuses", start), ("Review statuses", review)]
+                                        + ([("Status rules", rule_statuses)] if form.status_rules.strip() else []), keys)
         if problems:
             raise UserError("Not saved:\n" + "\n".join(problems))
         # A repo without a description gets GitHub's, which tells Claude what lives there.
@@ -198,7 +246,8 @@ class ProjectService:
                                               or f"The {r.github.split('/')[1]} repository", r.release_prefix,
                                               r.setup, r.test, r.reviewers) for r in repos]
         project = Project(existing.id if existing else 0, name, existing.owner_id if existing else user.id, cloud_id,
-                          site.url, frozenset(keys), root_cause, tuple(repos), start, review, channel, status_rules)
+                          site.url, frozenset(keys), root_cause, tuple(repos), start, review, channel, status_rules,
+                          form.uses_sprints, form.uses_fix_versions, fix_version_pick, bug_types, task_types)
         try:
             pid = self.projects.save(project)
         except Taken as e:
@@ -211,12 +260,38 @@ class ProjectService:
         return pid
 
     @staticmethod
-    def _jira_problem(jira, key: str, site: str) -> str | None:
+    def _jira_statuses(jira, key: str, site: str) -> tuple[str | None, list[str]]:
+        """(problem, the Jira project's status names)."""
         try:
-            jira.project(key)
+            return None, jira.project_statuses(key)
         except HTTPError:
-            return f"Your Jira account cannot see Jira project {key} on {site}."
-        return None
+            return f"Your Jira account cannot see Jira project {key} on {site}.", []
+
+    def project_statuses(self, user: User, project_id: str) -> list[str]:
+        """The statuses of a visible project's Jira projects, read with the developer's Jira account in
+        it (else any of theirs on its site), suggested in its automation settings."""
+        project = self.visible_project(user, project_id)
+        sub = user.subscriptions.get(project.id)
+        return self.jira_statuses(user, project.cloud_id, ", ".join(sorted(project.jira_projects)),
+                                  sub.jira_account_id if sub else None)
+
+    def jira_statuses(self, user: User, cloud_id: str, jira_keys: str, jira_account_id: int | None = None) -> list[str]:
+        """The statuses of these Jira projects (as typed, e.g. "MAR, MARS") on the site, suggested by the
+        project editor and the automation settings. Best effort: what can't be read is left out."""
+        keys = [k for k in (k.upper() for k in split_list(jira_keys)) if JIRA_PROJECT_RE.match(k)][:MAX_KEYS]
+        if not keys or cloud_id not in user.sites:
+            return []
+        try:
+            jira = self._jira_for(user, cloud_id, jira_account_id)[1]
+        except UserError:
+            return []
+
+        def names(key: str) -> list[str]:
+            try:
+                return jira.project_statuses(key)
+            except (HTTPError, JiraAccessLost):
+                return []
+        return sorted({n for found in run_all([lambda k=k: names(k) for k in keys]) for n in found}, key=str.lower)
 
     @staticmethod
     def _push_problem(github: GitHub, login: str, owner_repo: str) -> str | None:
@@ -278,14 +353,24 @@ class ProjectService:
             return (f"Approve without review: no branch of {', '.join(r.github for r in project.repos)} matches "
                     f"{', '.join(missing)}.") if missing else None
 
-        problems = [p for p in run_all(
-            [lambda k=k: self._jira_problem(jira, k, site) for k in sorted(project.jira_projects)]
-            + [lambda r=r: self._push_problem(github, github_account.login, r.github) for r in project.repos]
-            + [lambda r=r: branch_problem(r) for r in project.repos] + [approval_problem]) if p]
+        keys = sorted(project.jira_projects)
+        results = run_all([lambda k=k: self._jira_statuses(jira, k, site) for k in keys]
+                          + [lambda r=r: self._push_problem(github, github_account.login, r.github) for r in project.repos]
+                          + [lambda r=r: branch_problem(r) for r in project.repos] + [approval_problem])
+        found, others = results[:len(keys)], results[len(keys):]
+        problems = [p for p, _ in found if p] + [p for p in others if p]
+        # Start by itself only in these statuses: checked once changed (from the default, or from what was
+        # saved), as the default lists statuses many workflows lack, and an issue in a status no workflow
+        # has would never start.
+        saved = user.subscriptions[project.id].settings if project.id in user.subscriptions else Settings()
+        if not problems and chosen.auto_statuses not in (Settings.auto_statuses, saved.auto_statuses):
+            problems = unknown_statuses(list(dict.fromkeys(n for _, names in found for n in names)),
+                                        [("In one of these statuses", tuple(split_list(chosen.auto_statuses)))], keys)
         if problems:
             raise UserError("Not saved:\n" + "\n".join(problems))
         self.users.subscribe(user.id, Subscription(project.id, jira_account.id, github_account.id, claude_account.id,
                                                    mode, bases, chosen))
+        self.queue.limits_changed()  # its runs at the same time or priority may have changed
         self.users.record(user.id, "Saved the settings of a project", project.name)
 
     def leave(self, user: User, project_id: str) -> None:

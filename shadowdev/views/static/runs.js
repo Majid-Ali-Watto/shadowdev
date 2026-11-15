@@ -1,9 +1,11 @@
 // Recent runs: searches as the developer types (once they pause), filters (from a popup) and pages without a reload,
-// and keeps what is shown up to date: every 5 seconds while a run is queued or running, else every 30,
-// keeping the runs the developer ticked and the details they opened. Also the select-all box and the
-// Delete selected button. Without scripts the filter is a plain form and the pages plain links.
-(() => {
+// and keeps what is shown up to date, keeping the runs the developer ticked and the details they opened:
+// as the server says a run changed (live updates from /runs/events), else every 5 seconds while a run is
+// queued or running and every 30 otherwise. Also the select-all box and the Delete selected button.
+// Without scripts the filter is a plain form and the pages plain links.
+ShadowDev.mount(() => {
   const results = document.getElementById("runs-results");
+  if (!results) return;
   const filter = document.getElementById("run-filter");
   const said = document.getElementById("runs-status");
   const deleteSelected = document.getElementById("delete-selected");
@@ -95,7 +97,8 @@
     menu.open = false;
     menu.querySelector("summary").focus();
   });
-  document.addEventListener("click", e => { if (menu.open && !menu.contains(e.target)) menu.open = false; });
+  const outside = e => { if (menu.open && !menu.contains(e.target)) menu.open = false; };
+  document.addEventListener("click", outside);
   results.addEventListener("click", e => {  // the pages, and the filters in use (removing one)
     const link = e.target.closest("a[data-nav]");
     if (!link || e.ctrlKey || e.metaKey || e.shiftKey) return;
@@ -103,10 +106,41 @@
     load(new URL(link.href).search.slice(1), true);
   });
 
+  // Live updates: the server says when a run changed. Refused (too many open) or unsupported, the page
+  // asks itself; while they work, it still asks once a minute, in case one was missed.
+  let live = window.EventSource ? new EventSource("/runs/events") : null;
+  if (live) {
+    live.addEventListener("runs", () => load(wanted, unsettled));
+    live.addEventListener("error", () => { if (live && live.readyState === EventSource.CLOSED) live = null; });
+  }
   let tick = 0;
-  setInterval(() => {
-    const busy = results.querySelector(".badge.queued, .badge.running, .badge.stopping");
-    if (document.hidden || (++tick % 6 && !busy)) return;
+  const timer = setInterval(() => {
+    ++tick;
+    if (document.hidden) return;
+    if (live && live.readyState === EventSource.OPEN) {
+      if (tick % 12) return;
+    } else if (tick % 6 && !results.querySelector(".badge.queued, .badge.running, .badge.stopping")) return;
     load(wanted, unsettled);
   }, 5000);
-})();
+
+  return () => {  // the page is replaced (static/app.js)
+    latest++;  // an answer on its way is not shown
+    clearInterval(timer);
+    clearTimeout(typing);
+    document.removeEventListener("click", outside);
+    if (live) live.close();
+  };
+});
+
+// Run issues now: the repos to change are the picked project's; before one is picked, every project's.
+ShadowDev.mount(() => {
+  const form = document.getElementById("run-form");
+  const project = form && form.elements.project_id;
+  if (!project) return;
+  const show = () => form.querySelectorAll("#run-repos [data-project]").forEach(group => {
+    group.hidden = !!project.value && group.dataset.project !== project.value;
+  });
+  show();
+  project.addEventListener("change", show);
+  return () => project.removeEventListener("change", show);
+});

@@ -9,6 +9,10 @@ fix_ci: the CI checks of a PR ShadowDev opened failed. Claude reads their output
 in the PR makes them fail, on the PR's branch; the tests run as for any change, and the fix is
 pushed. A failure that is not the PR's (flaky, infrastructure) is left, and the PR says so.
 
+fix_conflicts: the PR's base branch moved on, and the PR conflicts with it. Its latest base is
+merged into the PR's branch, Claude resolves the conflicts git could not, the tests run as for any
+change, and the merge is pushed: never a rebase, so nothing anyone pushed is rewritten.
+
 review_pr: the developer was asked in Slack to review a colleague's PR. Claude reads the diff
 and the code (read-only); its findings are posted as a review with comments, or the PR is
 approved, and the Slack thread is told. A PR someone approved already, or that another reviewer
@@ -18,6 +22,7 @@ Like any run, both work in their own folders, which are deleted when they end.
 """
 import logging
 import re
+import time
 
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
@@ -34,9 +39,11 @@ from .prompts import (
     REVIEW_SCHEMA,
     ask_usable,
     ci_prompt,
+    conflict_prompt,
     fix_problem,
     fix_prompt,
     fix_schema,
+    markers_left,
     review_problem,
     review_prompt,
     summary_problem,
@@ -89,9 +96,11 @@ def reviewed_by_others(pr: dict, reviews: list[dict], threads: list[dict], login
 
 
 def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] | None, project: Project, actor: Actor,
-                   cfg: Config, github: GitHub, cancel: CancelToken = NEVER, on_model=lambda models: None) -> tuple[str, str]:
+                   cfg: Config, github: GitHub, cancel: CancelToken = NEVER, on_model=lambda models: None,
+                   later=None) -> tuple[str, str]:
     """`slack`: (channel, timestamp) of the message that asked for the PR's review; the reviewers
-    are asked there to look again. Returns (status, message) like process_issues."""
+    are asked there to look again (outside the developer's working hours, handed to `later`, as by
+    ask_for_review). Returns (status, message) like process_issues."""
     label = f"{repo.github}#{number}"
     url = f"https://github.com/{repo.github}/pull/{number}"
     timings = Timings(label)
@@ -147,7 +156,8 @@ def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] 
             outcome = "done"
             if not to_ship:
                 return outcome, f"answered the review comments on {url}; no code needed changing"
-            ask_for_review(actor, project, "", [(repo, url)], label, slack, again=True, done="Review comments addressed.")
+            ask_for_review(actor, project, "", [(repo, url)], label, slack, again=True, done="Review comments addressed.",
+                           later=later)
             return outcome, f"review comments addressed on {url}"
     finally:
         timings.report(outcome)
@@ -249,6 +259,62 @@ def fix_ci(repo: Repo, number: int, branch: str, sha: str, project: Project, act
         timings.report(outcome)
 
 
+def fix_conflicts(repo: Repo, number: int, branch: str, project: Project, actor: Actor, cfg: Config, github: GitHub,
+                  cancel: CancelToken = NEVER, on_model=lambda models: None) -> tuple[str, str]:
+    """The PR conflicts with its base branch. Returns (status, message) like process_issues."""
+    label = f"{repo.github}#{number}"
+    url = f"https://github.com/{repo.github}/pull/{number}"
+    timings = Timings(label)
+    outcome = "skipped"
+    try:
+        pr = github.pr(repo.github, number)
+        if pr["state"] != "open":
+            return outcome, f"{url} is closed"
+        if pr.get("mergeable") is not False:
+            return outcome, f"{url} no longer conflicts with {pr['base']['ref']}"
+        outcome, base = "failed", pr["base"]["ref"]
+        envs = claude_envs(cfg, actor)
+        token, who = actor.github.token, (actor.github.git_name, actor.github.git_email)
+        with run_folders(cfg, project, f"merge-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
+            worktree = workspace / repo.name
+            with timings.step(f"clone {repo.name} and merge {base}"):
+                gitops.clone(repo.github, branch, worktree, token, shallow=False)
+                base_commit, files = gitops.start_merge(worktree, repo.github, base, token, *who)
+            log.info("%s: %s merged in; %d file(s) in conflict for %s", label, base, len(files), actor.display_name)
+            # Tested like a change cut from the new base: only failures that base doesn't have count.
+            checkout = Checkout(label, repo, base, base_commit, worktree, cancel=cancel)
+            model, effort = MODELS["standard"]
+            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
+                                   spares=envs[1:])
+            stronger = escalating(claude, on_model, label)
+            summary = ""
+            if files:
+                with timings.step("Claude resolves conflicts"):
+                    summary = ask_usable(claude, conflict_prompt(repo, pr, base, files, guidance.find(worktree, repo.name)),
+                                         EDIT_TOOLS, CHANGE_SCHEMA,
+                                         lambda r: summary_problem(r) or markers_left(worktree, files), "summary")["summary"]
+            to_ship, summary, left = heal(claude, [checkout], scratch, cfg, label, timings, cancel, summary, stronger)
+            if left:
+                github.comment(repo.github, number, f"This conflicts with {base} now. I merged {base} in and worked on "
+                                                    "the conflicts, but the result doesn't pass the tests yet, so nothing "
+                                                    "is pushed. I'll follow up.")
+                return outcome, f"the merge of {base} into {url} still fails the tests; nothing pushed"
+            cancel.check()
+            if not to_ship:  # the branch has everything of base already
+                outcome = "skipped"
+                return outcome, f"{url} already has everything of {base}"
+            with timings.step("commit and push"):
+                gitops.commit_all(worktree, f"Merge {base} into {branch}" + (f"\n\n{summary}" if summary else ""), *who)
+                gitops.push(worktree, repo.github, branch, token)
+            log.info("%s: %s merged into %s and pushed", label, base, branch)
+            outcome = "done"
+            resolved = f" and resolved the conflicts in {', '.join(files)}: {summary}" if files else "."
+            github.comment(repo.github, number, f"{base} had moved on and conflicted with this. Merged it in{resolved}")
+            return outcome, f"{base} merged into {url}" + (f", {len(files)} conflict(s) resolved" if files else "")
+    finally:
+        timings.report(outcome)
+
+
 def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project, actor: Actor, cfg: Config,
               github: GitHub, cancel: CancelToken = NEVER, on_model=lambda models: None) -> tuple[str, str, str]:
     """`thread`: (channel, timestamp) of the Slack message that asked; ShadowDev answers there, as
@@ -259,6 +325,9 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
     outcome = "failed"
 
     def say(text: str) -> None:
+        if not actor.settings.at_work(time.time()):  # outside working hours only the reactions say how it went
+            log.info("%s: outside working hours: not answering in the Slack thread", label)
+            return
         try:
             Slack(actor.slack.token).post(thread[0], text, thread[1])
         except HTTPError as e:

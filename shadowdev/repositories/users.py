@@ -13,6 +13,7 @@ from ..models.user import MODES, ClaudeAccount, GitHubAccount, JiraAccount, Site
 from .database import Database
 
 KEPT_ACTIVITY = 200  # entries of a developer's activity; older ones are dropped
+ACTIVITY_PAGE = 25  # entries on a page of the Activity tab
 
 
 class AccountInUse(Exception):
@@ -212,7 +213,8 @@ class UserRepository:
                        for c in conn.execute("SELECT * FROM claude_accounts WHERE user_id = ? ORDER BY id", (uid,)))
         subs = {s["project_id"]: Subscription(s["project_id"], s["jira_account_id"], s["github_account_id"],
                                               s["claude_account_id"], s["mode"], json.loads(s["base_branches"]),
-                                              Settings.from_json(s["settings"]), ReleaseReport.from_json(s["release_report"]))
+                                              Settings.from_json(s["settings"]), ReleaseReport.from_json(s["release_report"]),
+                                              _json_object(s["tests_sent"]))
                 for s in conn.execute("SELECT * FROM subscriptions WHERE user_id = ?", (uid,))}
         s = conn.execute("SELECT * FROM slack_accounts WHERE user_id = ?", (uid,)).fetchone()
         slack = SlackAccount(self.db.decrypt(s["token"]), s["slack_user_id"], s["team"]) if s else None
@@ -232,6 +234,19 @@ class UserRepository:
                 "mode = excluded.mode, base_branches = excluded.base_branches, settings = excluded.settings",
                 (user_id, sub.project_id, sub.jira_account_id, sub.github_account_id, sub.claude_account_id, sub.mode,
                  json.dumps(sub.base_branches), sub.settings.to_json()))
+
+    def settings(self, user_id: int, project_id: int) -> Settings:
+        """A subscription's settings alone, without loading (and decrypting) the developer's accounts;
+        the defaults when they left the project."""
+        with closing(self.db.connect()) as conn:
+            row = conn.execute("SELECT settings FROM subscriptions WHERE user_id = ? AND project_id = ?",
+                               (user_id, project_id)).fetchone()
+        return Settings.from_json(row[0] if row else None)
+
+    def save_tests_sent(self, user_id: int, project_id: int, sent: dict) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("UPDATE subscriptions SET tests_sent = ? WHERE user_id = ? AND project_id = ?",
+                         (json.dumps(sent), user_id, project_id))
 
     def polled_at(self, user_id: int, project_id: int) -> float:
         with closing(self.db.connect()) as conn:
@@ -273,7 +288,7 @@ class UserRepository:
             row = conn.execute("SELECT limits FROM users WHERE id = ?", (user_id,)).fetchone()
         return Limits.from_json(row[0] if row else None)
 
-    # What the developer did (services record it; shown on their Settings tab)
+    # What the developer did (services record it; shown on their Activity tab)
 
     def record(self, user_id: int, action: str, detail: str = "") -> None:
         """`detail`: a label, login or project name. Never a secret, and nothing about a Jira account,
@@ -284,11 +299,17 @@ class UserRepository:
             conn.execute("DELETE FROM activity WHERE user_id = ? AND id NOT IN "
                          "(SELECT id FROM activity WHERE user_id = ? ORDER BY id DESC LIMIT ?)", (user_id, user_id, KEPT_ACTIVITY))
 
-    def activity(self, user_id: int, limit: int = 30) -> list[tuple[float, str, str]]:
-        """(when, what, detail) of what the developer did last, newest first."""
+    def activity(self, user_id: int, page: int = 1) -> tuple[list[tuple[float, str, str]], int, int]:
+        """One page of (when, what, detail) of what the developer did, newest first, with that page and
+        how many there are. A page past the last gives the last."""
         with closing(self.db.connect()) as conn:
-            return [tuple(r) for r in conn.execute(
-                "SELECT at, action, detail FROM activity WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit))]
+            total = conn.execute("SELECT COUNT(*) FROM activity WHERE user_id = ?", (user_id,)).fetchone()[0]
+            pages = max(1, -(-total // ACTIVITY_PAGE))
+            page = min(max(1, page), pages)
+            rows = [tuple(r) for r in conn.execute(
+                "SELECT at, action, detail FROM activity WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+                (user_id, ACTIVITY_PAGE, (page - 1) * ACTIVITY_PAGE))]
+        return rows, page, pages
 
     def delete(self, user_id: int) -> list[str]:
         """Removes the developer with their accounts, sessions, subscriptions and runs. Each project
@@ -302,3 +323,11 @@ class UserRepository:
             conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         self.db.forget_copies()
         return keys
+
+
+def _json_object(text: str | None) -> dict:
+    try:
+        value = json.loads(text or "{}")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}

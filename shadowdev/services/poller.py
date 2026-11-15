@@ -78,7 +78,7 @@ class Poller:
         keys = ", ".join(sorted(project.jira_projects))  # validated: letters, digits and _
         # Starting a sprint changes none of its issues: with an active sprint required, its issues
         # are asked for too, and those not updated since the last poll start only if never run before.
-        sprint = " OR sprint in openSprints()" if actor.settings.auto_sprint else ""
+        sprint = " OR sprint in openSprints()" if actor.settings.auto_sprint and project.uses_sprints else ""
         jql = (f'project in ({keys}) AND assignee = currentUser() AND statusCategory != Done '
                f'AND (updated >= "-{minutes}m"{sprint}) ORDER BY updated ASC')
         jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
@@ -87,13 +87,13 @@ class Poller:
         for issue in issues:
             key, fields = issue.get("key") or "", issue.get("fields") or {}
             if not (rules.ISSUE_KEY_RE.match(key) and project.handles(key) and rules.assignee(fields) == actor.jira_account_id
-                    and rules.wanted(rules.issue_kind(fields), actor.mode)):
+                    and rules.wanted(project.issue_kind(fields), actor.mode)):
                 continue
-            problem = actor.settings.start_problem(fields)
+            problem = actor.settings.start_problem(fields, project.uses_sprints)
             if problem:
                 log.info("%s: not started by itself for %s: %s", key, user.display_name, problem)
                 continue
-            if self.queue.submit(project, [key], user.id, automatic=True,
+            if self.queue.submit(project, [key], user.id, automatic=True, urgency=rules.urgency(fields),
                                  never_run=_updated(fields) < now - minutes * 60) is None:
                 log.info("%s: queued for %s by polling", key, project.name)
                 queued += 1

@@ -7,9 +7,12 @@ from pathlib import Path
 from unittest import mock
 
 from shadowdev.app import build_app
+from shadowdev.automation import pipeline
 from shadowdev.clients import slack
+from shadowdev.clients.mail import Smtp
 from shadowdev.clients.rest import HTTPError
 from shadowdev.models import release
+from shadowdev.models.project import Project, Repo
 from shadowdev.models.release import DEFAULT_RULES, ReleaseReport, StatusRule
 from shadowdev.models.settings import Settings
 from shadowdev.services import releases
@@ -18,6 +21,14 @@ from tests.helpers import add_developer, add_project, join, make_cfg
 
 ME, SARA = "acc-majid", "acc-sara"
 ROOT_CAUSE = "customfield_10201"
+RULE = StatusRule("Ready for Release", "Done", ("root_cause", "fix_version", "parent", "original_estimate", "time_spent"))
+
+
+def project(root_cause_field=ROOT_CAUSE, repos=(), **chosen):
+    return Project(1, "marketplace", 1, "c", "u", frozenset({"MAR"}), root_cause_field,
+                   tuple(Repo(r.split("/")[1], r, "", "release/", None, None) for r in repos), **chosen)
+
+
 COMPLETE = {"fixVersions": [{"name": "1.4"}], "parent": {"key": "MAR-100"}, "timeoriginalestimate": 3600,
             "timespent": 1800}
 
@@ -30,7 +41,7 @@ def ticket(key, type_="Bug", status="Ready for Release", assignee=ME, **fields):
 class RulesTest(unittest.TestCase):
     def test_typed_rules(self):
         self.assertEqual(release.parse_rules(""), ())
-        self.assertEqual(release.parse_rules(release.rules_text(DEFAULT_RULES)), DEFAULT_RULES)
+        self.assertEqual(release.parse_rules(release.rules_text((RULE,))), (RULE,))
         self.assertEqual(release.parse_rules("Merged  →  Ready for QA\n\n In QA -> Ready for Release: Parent ticket, time tracking"),
                          (StatusRule("Merged", "Ready for QA"),
                           StatusRule("In QA", "Ready for Release", ("parent", "time_spent"))))
@@ -39,26 +50,46 @@ class RulesTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, message):
                 release.parse_rules(bad)
         self.assertEqual(release.rules_from_json(None), DEFAULT_RULES)  # never set: the defaults
+        self.assertEqual(DEFAULT_RULES, ())  # workflows differ: none until the owner writes them
         self.assertEqual(release.rules_from_json(release.rules_to_json(())), ())
 
     def test_checks_root_cause_only_on_bugs(self):
-        rule = DEFAULT_RULES[0]
+        rule = RULE
         story = ticket("MAR-1", "Story")["fields"]
-        self.assertEqual(release.missing(rule, story, ROOT_CAUSE), [])
+        self.assertEqual(release.missing(rule, story, project()), [])
         bug = ticket("MAR-2")["fields"]
-        self.assertEqual(release.missing(rule, bug, ROOT_CAUSE), ["root cause"])
+        self.assertEqual(release.missing(rule, bug, project()), ["root cause"])
         # Text, an Atlassian document or an option: filled unless blank.
         for value, ok in (("  ", False), ("The cache", True), ({"type": "doc", "content": []}, False),
                           ({"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "x"}]}]}, True),
                           ({"value": "Config"}, True)):
-            self.assertEqual(release.missing(rule, {**bug, ROOT_CAUSE: value}, ROOT_CAUSE) == [], ok, value)
+            self.assertEqual(release.missing(rule, {**bug, ROOT_CAUSE: value}, project()) == [], ok, value)
         # Without a root cause field: a comment giving it.
-        self.assertEqual(release.missing(rule, bug, None), ["root cause"])
-        self.assertEqual(release.missing(rule, {**bug, "comment": {"comments": [{"body": "*Root cause:* x"}]}}, None), [])
+        self.assertEqual(release.missing(rule, bug, project(None)), ["root cause"])
+        self.assertEqual(release.missing(rule, {**bug, "comment": {"comments": [{"body": "*Root cause:* x"}]}}, project(None)), [])
         empty = {"issuetype": {"name": "Task"}, "fixVersions": [], "parent": None, "timeoriginalestimate": None, "timespent": 0}
-        self.assertEqual(release.missing(rule, empty, ROOT_CAUSE),
+        self.assertEqual(release.missing(rule, empty, project()),
                          ["fix version", "parent", "original estimate", "logged time"])
-        self.assertEqual(release.missing(StatusRule("A", "B"), empty, ROOT_CAUSE), [])
+        self.assertEqual(release.missing(StatusRule("A", "B"), empty, project()), [])
+        # A bug is what the project works on as one.
+        incident = {**bug, "issuetype": {"name": "Incident"}}
+        self.assertEqual(release.missing(rule, incident, project()), [])
+        self.assertEqual(release.missing(rule, incident, project(bug_types=("Incident",))), ["root cause"])
+
+    def test_pr_link_check(self):
+        rules = release.parse_rules("Ready for Release -> Done: root cause, fix version, parent, original estimate, "
+                                    "logged time\nIn Progress -> PR Review: ticket comment has PR link")
+        self.assertEqual(rules, (RULE, StatusRule("In Progress", "PR Review", ("pr_link",))))
+        self.assertEqual(release.parse_rules(release.rules_text(rules)), rules)
+        rule, repos = rules[1], ("Acme/market-place-fe",)
+
+        def linked(url):
+            return {"comment": {"comments": [{"body": {"type": "doc", "content": [
+                {"type": "inlineCard", "attrs": {"url": url}}]}}]}}
+        self.assertEqual(release.missing(rule, {}, project(None, repos)), ["PR link"])
+        self.assertEqual(release.missing(rule, linked("https://github.com/acme/market-place-fe/pull/12"), project(None, repos)), [])
+        for other in ("https://github.com/acme/other/pull/12", "https://github.com/acme/market-place-fe/compare/a...b"):
+            self.assertEqual(release.missing(rule, linked(other), project(None, repos)), ["PR link"], other)
 
 
 class SlackLinkTest(unittest.TestCase):
@@ -82,7 +113,8 @@ class ReleaseMoverTest(unittest.TestCase):
         users, projects = self.app.users, self.app.projects
         self.me = add_developer(users, ME)
         market = add_project(projects, self.me, "marketplace", ["MAR"])
-        self.market = projects.get(projects.save(dataclasses.replace(market, root_cause_field=ROOT_CAUSE)))
+        self.market = projects.get(projects.save(dataclasses.replace(market, root_cause_field=ROOT_CAUSE,
+                                                                     status_rules=(RULE,))))
         join(users, self.me, self.market, ME, settings=Settings(release_moves=True))
         self.sara = add_developer(users, SARA)
         join(users, self.sara, self.market, SARA)  # the default: off
@@ -99,7 +131,7 @@ class ReleaseMoverTest(unittest.TestCase):
 
     def test_off_by_default(self):
         self.assertEqual(Settings().release_moves, False)
-        self.assertEqual(self.app.projects.get(self.market.id).status_rules, DEFAULT_RULES)  # the project's defaults
+        self.assertEqual(self.app.projects.get(self.market.id).status_rules, (RULE,))
         self.app.users.save_release_report(self.me, self.market.id, ReleaseReport(0))
         join(self.app.users, self.me, self.market, ME)  # switched off
         self.found = [ticket("MAR-1", **{ROOT_CAUSE: "x"})]
@@ -159,6 +191,29 @@ class ReleaseMoverTest(unittest.TestCase):
         self.found = [ticket("MAR-6", assignee=SARA)]
         self.assertEqual(len(self.app.releases.check_now(self.app.users.get(self.sara), str(self.market.id)).held), 1)
         slack.post.assert_not_called()
+
+    def test_incomplete_tickets_by_email_as_chosen(self):
+        slack = mock.Mock()
+        for patch in (mock.patch.object(releases, "Slack", return_value=slack),
+                      mock.patch.object(pipeline, "send_mail")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.app.releases.cfg = dataclasses.replace(self.app.releases.cfg, smtp=Smtp("mail.x", 587, "dev@x"))
+        self.app.users.save_slack(self.me, "xoxp-1", "U0000MEME0", "acme")
+        join(self.app.users, self.me, self.market, ME, settings=Settings(release_moves=True, notify_missing="email"))
+        self.found = [ticket("MAR-3")]
+        report = self.app.releases.check_now(self.app.users.get(self.me), str(self.market.id))
+        slack.post.assert_not_called()
+        (_, to, subject, text, html), _ = pipeline.send_mail.call_args
+        self.assertIn('<a href="https://office.atlassian.net/browse/MAR-3"', html)
+        self.assertIn("until it has <b>root cause</b>", html)
+        self.assertEqual((to, subject), (f"{ME}@x", "marketplace: tickets not complete yet"))
+        self.assertIn("• MAR-3 stays in Ready for Release, missing root cause (needed for Done): "
+                      "https://office.atlassian.net/browse/MAR-3", text)
+        self.assertEqual(report.failed, ())
+        pipeline.send_mail.side_effect = OSError("connection refused")
+        report = self.app.releases.check_now(self.app.users.get(self.me), str(self.market.id))
+        self.assertEqual(report.failed, ("Could not email you the missing fields: see the server log.",))
 
     def test_every_few_hours_as_chosen(self):
         now = time.time()
