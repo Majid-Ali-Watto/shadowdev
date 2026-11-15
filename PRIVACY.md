@@ -36,7 +36,7 @@ and `worktrees/` are created with permissions `700`, the database and log files 
 "Encrypted" means encrypted with Fernet using `SHADOWDEV_SECRET_KEY` from `.env`. A copy of the
 database alone does not reveal those values. Anyone who can read both the database and `.env`
 on that machine can decrypt them, so the machine account is what protects them. The key can be
-replaced without developers reconnecting their accounts (README, *Backups and the key*). Rows that are
+replaced without developers reconnecting their accounts ([docs/ADMIN.md](docs/ADMIN.md), *Backups and the key*). Rows that are
 deleted are overwritten in the database file (`PRAGMA secure_delete`).
 
 Issue text (summaries, descriptions) is **not** stored in the database, except what a run's result,

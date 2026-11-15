@@ -26,7 +26,7 @@ Installed as a service, systemd looks after it:
 |---|---|
 | Starts on boot | once the network is up |
 | Restarts after a crash | 10 seconds later |
-| Runs as a dedicated user | `shadowdev`, not you or root (see the main README, *Deployment checklist*) |
+| Runs as a dedicated user | `shadowdev`, not you or root (see [docs/ADMIN.md](../docs/ADMIN.md#deployment-checklist)) |
 | Stops gracefully | `systemctl stop` sends SIGTERM to the server only: runs in progress get up to 15 minutes to finish, queued runs start again with the server. Whatever is left after 16 minutes is killed |
 | Private files | `UMask=0077`: everything it creates is readable only by its user |
 | Logs | in the journal (`journalctl -u shadowdev`), and as always in `data/logs/` |
@@ -77,7 +77,7 @@ After changing `shadowdev.service`, run `make service` again.
 
 `make backup` works while the service runs. Schedule it, e.g. a daily cron job of the `shadowdev`
 user (`cd /home/shadowdev/ShadowDev && make backup`), and copy the backups off the machine with the
-key kept separately (see the main README, *Backups and the key*).
+key kept separately (see [docs/ADMIN.md](../docs/ADMIN.md#backups-and-the-key)).
 
 ## Don't mix it with `make upd`
 

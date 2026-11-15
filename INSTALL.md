@@ -216,8 +216,8 @@ On the ShadowDev page:
 6. **Run a real issue**: on the **Run issues** tab, **Run issues now** with an issue assigned to you. Its
    row on the **Recent runs** tab shows its progress, and its PR link when it is done.
 
-From then on, issues assigned to you in your projects are worked on as they come in. README's
-*For developers* explains the rest: notes for Claude, automation switches, Slack reviews.
+From then on, issues assigned to you in your projects are worked on as they come in. The
+[User guide](docs/USER-GUIDE.md) explains the rest: notes for Claude, automation switches, Slack reviews.
 
 ## 5. Share it with the team
 
@@ -229,7 +229,7 @@ From then on, issues assigned to you in your projects are worked on as they come
    turns on *Poll Jira* in Settings). Per project, in Jira: **Settings → System → WebHooks → Create
    a WebHook**, with the URL and secret its owner sees on the ShadowDev page, and the events
    *Issue created* and *Issue updated*.
-3. **For a permanent server**, go through README's *Deployment checklist*: a dedicated machine and
+3. **For a permanent server**, go through the [Deployment checklist](docs/ADMIN.md#deployment-checklist): a dedicated machine and
    user, backups, and `make service` or `make docker-service` so it starts by itself
    ([deploy/README.md](deploy/README.md)).
 
