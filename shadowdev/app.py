@@ -14,6 +14,7 @@ from .repositories.users import UserRepository
 from .services.accounts import AccountService
 from .services.notifications import NotificationTests
 from .services.outbox import Outbox
+from .services.overview import OverviewService
 from .services.poller import Poller
 from .services.privacy import PrivacyReporter
 from .services.projects import ProjectService
@@ -44,6 +45,7 @@ class App:
     watcher: ReviewWatcher
     notification_tests: NotificationTests
     outbox: Outbox
+    overview: OverviewService
     stopping: threading.Event = field(default_factory=threading.Event)  # set when the server stops: streams end
 
 
@@ -72,4 +74,5 @@ def build_app(cfg: Config, oauth: AtlassianOAuth | None = None, queue: RunQueue 
         reviews=reviews, watcher=ReviewWatcher(cfg, users, projects, reviews, queue, held),
         notification_tests=NotificationTests(cfg, users, projects),
         outbox=Outbox(users, projects, runs, reviews, held, oauth),
+        overview=OverviewService(cfg, runs, reviews, held, projects),
     )

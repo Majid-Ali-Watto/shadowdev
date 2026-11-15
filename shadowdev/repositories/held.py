@@ -40,6 +40,12 @@ class HeldRepository:
         with closing(self.db.connect()) as conn:
             return conn.execute("SELECT * FROM held ORDER BY id").fetchall()
 
+    def of_user(self, user_id: int) -> list[sqlite3.Row]:
+        """What waits for the developer, without its data (comments' text): kind, project and branch."""
+        with closing(self.db.connect()) as conn:
+            return conn.execute("SELECT id, project_id, kind, branch, at FROM held WHERE user_id = ? ORDER BY id",
+                                (user_id,)).fetchall()
+
     def done(self, held_ids: list[int]) -> None:
         with closing(self.db.connect()) as conn, conn:
             conn.executemany("DELETE FROM held WHERE id = ?", [(i,) for i in held_ids])

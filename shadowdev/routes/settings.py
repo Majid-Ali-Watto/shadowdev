@@ -1,4 +1,5 @@
 """The developer's page: their accounts, projects, recent runs, and the actions on them."""
+import json
 import secrets
 import threading
 import time
@@ -10,6 +11,7 @@ from ..models.user import User
 from ..services.errors import UserError
 from ..views.auth import login_page
 from ..views.home import NOTICES, home_page
+from ..views.overview import overview_panel
 from ..views.runs import run_results
 from .request import COOKIE, FormPost, Request, form_action
 
@@ -17,6 +19,7 @@ STREAM_SECONDS = 300  # a live update stream ends after this, and the browser op
 CHECK_SECONDS = 1  # how often a stream looks for changes
 BEAT_SECONDS = 15  # with no change for this long, it sends a comment
 MAX_STREAMS = 16  # of all developers at once
+MAX_LIVE_RUNS = 50  # runs one Live logs request may say it has seen; more are ignored
 MAX_STREAMS_EACH = 3  # of one developer (their open tabs): browsers allow 6 connections to a server
 
 
@@ -28,7 +31,8 @@ def render(req: Request, user: User, csrf: str, tab: str = "", error: str = "", 
     activity = req.app.users.activity(user.id, _page(req.arg("activity_page")))
     page = home_page(req.app.cfg, user, projects, hooks, req.app.runs.search(user.id, run_filter or RunFilter()), csrf, nonce,
                      theme=req.theme(), tab=tab, error=error, notice=notice, answering=answering,
-                     claude_usage=req.app.accounts.claude_usage(user), activity=activity)
+                     claude_usage=req.app.accounts.claude_usage(user), activity=activity,
+                     overview=req.app.overview.of(user))
     req.html(page, nonce, status=status, cookies=cookies)
 
 
@@ -54,6 +58,30 @@ def runs(req: Request) -> None:
     if not session:
         return req.json(401, "signed out")
     req.html(run_results(req.app.runs.search(session[1], _run_filter(req)), session[2]))
+
+
+def overview(req: Request) -> None:
+    """The Overview tab's contents: the page fetches it as its runs change, to keep itself up to date."""
+    session = req.session(renew=False)
+    user = req.app.users.get(session[1]) if session else None
+    if not user:
+        return req.json(401, "signed out")
+    req.html(overview_panel(user, req.app.overview.of(user)))
+
+
+def live_logs(req: Request) -> None:
+    """Live logs: what the developer's working runs logged since the page last asked. `seen` says how
+    many lines of each run it has: "12:340,15:20" (run id: lines)."""
+    session = req.session(renew=False)
+    if not session:
+        return req.json(401, "signed out")
+    seen = {}
+    for pair in req.arg("seen").split(",")[:MAX_LIVE_RUNS]:
+        run, _, count = pair.partition(":")
+        if run.isdigit() and count.isdigit() and len(run) < 12 and len(count) < 12:
+            seen[int(run)] = int(count)
+    body = json.dumps({"runs": req.app.run_service.live(session[1], seen)}).encode()
+    req.send(200, body, "application/json", [("Cache-Control", "no-store")])
 
 
 def run_events(req: Request) -> None:
@@ -153,6 +181,8 @@ def delete_account(req: Request, post: FormPost) -> None:
 ROUTES = {
     ("GET", "/"): show,
     ("GET", "/runs"): runs,
+    ("GET", "/overview"): overview,
+    ("GET", "/logs/live"): live_logs,
     ("GET", "/runs/log"): run_log,
     ("GET", "/runs/events"): run_events,
     ("POST", "/jira/remove"): action("jira-removed", lambda req, p: req.app.accounts.remove_jira(

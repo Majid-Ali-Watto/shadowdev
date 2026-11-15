@@ -365,6 +365,14 @@ class RunQueue:
             return record.log
         return self.runs.log(user_id, run_id)
 
+    def live(self, user_id: int, seen: dict[int, int]) -> list[tuple[int, int, list[str]]]:
+        """The developer's runs that are working now, each as (run id, lines logged so far, the lines
+        after the `seen[run id]` first ones): what Live logs shows next. Never another developer's."""
+        with self._lock:
+            records = [(run_id, record) for run_id, record in self._records.items()
+                       if (job := self._jobs.get(run_id)) and job[0] == user_id]
+        return [(run_id, *record.since(seen.get(run_id, 0))) for run_id, record in records]
+
     def stop_run(self, run_id: int, user_id: int) -> bool:
         """Stop one of the developer's queued or running jobs. False if there is no such job of
         theirs (finished, or someone else's)."""

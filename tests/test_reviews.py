@@ -304,6 +304,24 @@ class WatcherTest(unittest.TestCase):
         self.github.latest_reviews.return_value = [{"author": "sara", "association": "MEMBER", "state": "CHANGES_REQUESTED"}]
         self.assertEqual(self.poll(), [("marketplace", ["acme/fe#7"])])
 
+    def test_how_a_watched_pr_stands_is_kept_for_the_overview(self):
+        self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 7, "MAR-1", None)
+        review = lambda: self.poll() and None or self.reviews.prs_of(self.me)[0]["review"]
+        self.assertEqual(review(), "waiting")
+        self.github.latest_reviews.return_value = [{"author": ME, "association": "MEMBER", "state": "APPROVED"}]
+        self.assertEqual(review(), "waiting")  # the developer's own approval is not a review
+        self.github.review_threads.return_value = ("OPEN", [thread(seconds_ago=10)])  # still being written
+        self.assertEqual(review(), "comments:1")
+        self.github.review_threads.return_value = ("OPEN", [])
+        self.github.latest_reviews.return_value = [{"author": "sara", "association": "MEMBER", "state": "APPROVED"},
+                                                   {"author": "outsider", "association": "NONE", "state": "APPROVED"}]
+        self.assertEqual(review(), "approved:1")  # only reviewers with access to the repo count
+        self.github.latest_reviews.return_value = [{"author": "sara", "association": "MEMBER", "state": "CHANGES_REQUESTED"}]
+        self.assertEqual(review(), "changes")
+        self.github.ci_state.return_value = ("sha-1", "FAILURE")
+        self.assertEqual(review(), "ci")
+        self.assertEqual(review(), "ci")  # acted on already, and still failing
+
     def test_a_mention_in_slack_with_a_pr_of_the_project_starts_a_review_and_again_when_asked(self):
         self.assertEqual(self.poll(), [])  # the first look only notes where the channel is
         self.slack.history.assert_not_called()

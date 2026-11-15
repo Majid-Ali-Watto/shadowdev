@@ -1,7 +1,8 @@
 // Recent runs: searches as the developer types (once they pause), filters (from a popup) and pages without a reload,
 // and keeps what is shown up to date, keeping the runs the developer ticked and the details they opened:
 // as the server says a run changed (live updates from /runs/events), else every 5 seconds while a run is
-// queued or running and every 30 otherwise. Also the select-all box and the Delete selected button.
+// queued or running and every 30 otherwise. Each of those refreshes says so to the page (a "shadowdev:runs"
+// event), so Overview (static/overview.js) follows. Also the select-all box and the Delete selected button.
 // Without scripts the filter is a plain form and the pages plain links.
 ShadowDev.mount(() => {
   const results = document.getElementById("runs-results");
@@ -106,11 +107,13 @@ ShadowDev.mount(() => {
     load(new URL(link.href).search.slice(1), true);
   });
 
+  const changed = () => document.dispatchEvent(new Event("shadowdev:runs"));
+
   // Live updates: the server says when a run changed. Refused (too many open) or unsupported, the page
   // asks itself; while they work, it still asks once a minute, in case one was missed.
   let live = window.EventSource ? new EventSource("/runs/events") : null;
   if (live) {
-    live.addEventListener("runs", () => load(wanted, unsettled));
+    live.addEventListener("runs", () => { load(wanted, unsettled); changed(); });
     live.addEventListener("error", () => { if (live && live.readyState === EventSource.CLOSED) live = null; });
   }
   let tick = 0;
@@ -121,6 +124,7 @@ ShadowDev.mount(() => {
       if (tick % 12) return;
     } else if (tick % 6 && !results.querySelector(".badge.queued, .badge.running, .badge.stopping")) return;
     load(wanted, unsettled);
+    changed();
   }, 5000);
 
   return () => {  // the page is replaced (static/app.js)

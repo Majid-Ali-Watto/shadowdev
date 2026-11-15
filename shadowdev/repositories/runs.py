@@ -103,6 +103,31 @@ class RunRepository:
         with closing(self.db.connect()) as conn:
             return tuple(conn.execute("SELECT COUNT(*), MAX(updated) FROM runs WHERE user_id = ?", (user_id,)).fetchone())
 
+    def active(self, user_id: int) -> list[sqlite3.Row]:
+        """The developer's runs that are queued, running or stopping: running ones first, then the oldest."""
+        with closing(self.db.connect()) as conn:
+            return conn.execute(
+                "SELECT r.*, EXISTS (SELECT 1 FROM run_logs l WHERE l.run_id = r.id) AS has_log FROM runs r "
+                "WHERE r.user_id = ? AND r.status IN ('queued', 'running', 'stopping') "
+                "ORDER BY r.status = 'queued', r.id", (user_id,)).fetchall()
+
+    def needing(self, user_id: int, since: float) -> list[sqlite3.Row]:
+        """The developer's runs since `since` that asked them questions or failed, and are still the
+        latest run of their issues (or PR): nothing ran them again since."""
+        with closing(self.db.connect()) as conn:
+            return conn.execute(
+                "SELECT r.*, EXISTS (SELECT 1 FROM run_logs l WHERE l.run_id = r.id) AS has_log FROM runs r "
+                "WHERE r.user_id = ? AND r.status IN ('question', 'failed') AND r.updated >= ? AND NOT EXISTS "
+                "(SELECT 1 FROM runs n WHERE n.user_id = r.user_id AND n.issue_key = r.issue_key AND n.id > r.id) "
+                "ORDER BY r.id DESC", (user_id, since)).fetchall()
+
+    def totals(self, user_id: int, since: float) -> dict[str, tuple[int, float, float]]:
+        """Per status, of the developer's runs updated since `since`: (how many, their cost, their seconds)."""
+        with closing(self.db.connect()) as conn:
+            return {row[0]: (row[1], row[2], row[3]) for row in conn.execute(
+                "SELECT status, COUNT(*), SUM(cost), SUM(seconds) FROM runs WHERE user_id = ? AND updated >= ? "
+                "GROUP BY status", (user_id, since))}
+
     def set_model(self, run_id: int, model: str) -> None:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("UPDATE runs SET model = ?, updated = ? WHERE id = ?", (model[:200], time.time(), run_id))

@@ -52,6 +52,34 @@ same key is in two of yours), and choose whether several are fixed separately or
 branch. An optional **note for Claude** says what the tickets don't (where to look, what to
 leave alone); it is given to Claude with the issues, and is not posted to Jira or GitHub. A line starting
 with a key (`MAR-123: ...`) begins a note for that issue only; the lines before those are for all.
+**Overview**, where your page opens once you are set up, is your dashboard (the sections are in the
+sidebar on the left; on a phone, in a row along the top):
+
+- **Needs you**: runs that ask you questions (with **Answer**), runs that failed (with their **Log**),
+  and accounts to mend (lost Jira access, a GitHub token that expires within a week). The sidebar's
+  Overview shows how many. A run counts until the issue runs again, for 7 days
+- **Numbers**: runs working now and queued, your PRs in review and how many need attention, runs done
+  in the last 7 days (and failed, and asking you), and Claude's cost and time in them
+- **Running now**: each running run's progress through its phases, and what queued ones wait for
+- **Claude usage**: per Claude account, how much of its 5-hour and weekly limits is used, when each
+  resets, and whether it is at its limit (amber from 90%)
+- **PRs in review**: the PRs your runs opened, until they close, and how each stands as last read
+  from GitHub: waiting for review, comments to answer, changes requested, CI failing, conflicts, or
+  approved; *fixing* or *queued* while a run works on it
+- **Waiting for your working hours**: per project, the PRs, comments and Slack replies held, and
+  when your hours begin
+
+It updates itself along with Recent runs.
+
+**Live logs** follows your runs as they work, like a terminal: what Claude reads, says and changes,
+and the commands and their results, each line marked with its run. It shows only your own runs
+(the server's own log, with everyone's, stays in the server's terminal: `make logs`). **Pause** stops
+it, **Clear** empties it; scrolled up, it stops following until you scroll back down. A finished
+run's whole log stays under Recent runs.
+
+Deleting, removing, stopping, leaving, saving changes and signing out ask first, in a dialog that
+says what follows.
+
 **Recent runs** shows what happened, with the model and your note. It updates itself as runs
 change (the server tells the page), and a running run shows a progress bar of its phases (checking,
 cloning, analysing, changing, testing, publishing) with the step it is on, and a link to its log so far;
@@ -272,8 +300,8 @@ status changes and PR comment. An issue fixed in a group counts as handled after
 Under **Recent runs**, a finished run's details say how long it worked, Claude's turns and the cost
 Claude reported (for a subscription, what that use would cost on the API), and link to its **Log**:
 what the server logged while it worked (what Claude read, said and changed, the commands and their
-results). The log is yours alone, and is deleted with the run. The page also warns you, above the
-tabs, when Jira access of one of your accounts was lost or a GitHub token expires within a week, and
+results). The log is yours alone, and is deleted with the run. When Jira access of one of your
+accounts was lost or a GitHub token expires within a week, **Overview** says so under *Needs you*.
 The **Activity** tab lists sign-ins and changes to your accounts and projects.
 
 ## It is you, everywhere

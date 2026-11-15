@@ -27,6 +27,17 @@ class RunService:
         self.oauth = oauth
         self.queue = queue
 
+    def live(self, user_id: int, seen: dict[int, int]) -> list[dict]:
+        """What the developer's working runs logged since the Live logs page last asked (RunQueue.live),
+        each run with its issue key (or PR) and project."""
+        found = []
+        for run_id, total, lines in self.queue.live(user_id, seen):
+            run = self.runs.get(user_id, run_id)
+            if run:
+                found.append({"id": run_id, "label": run["issue_key"], "project": run["project"], "total": total,
+                              "lines": lines})
+        return found
+
     def request(self, user: User, issue_keys: str, together: bool, project_id: str = "", note: str = "",
                 repos: list[str] = (), one_message: bool = False, sequence: bool = False, delay_minutes: str = "") -> None:
         """Queue one or more issues (`issue_keys`: separated by spaces, commas or semicolons, and
