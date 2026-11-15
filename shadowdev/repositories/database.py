@@ -215,7 +215,8 @@ CREATE TABLE IF NOT EXISTS held (  -- what waits for its developer's working hou
     id         INTEGER PRIMARY KEY,
     user_id    INTEGER NOT NULL REFERENCES users ON DELETE CASCADE,
     project_id INTEGER NOT NULL REFERENCES projects ON DELETE CASCADE,
-    kind       TEXT NOT NULL,  -- "prs": a run's models.publication.Publication; "slack": a reply in a Slack thread
+    kind       TEXT NOT NULL,  -- "prs": a run's models.publication.Publication; "slack": a reply in a Slack thread;
+                               -- "jira", "github": a comment, {op, args} of that client (services.outbox.HELD_CALLS)
     branch     TEXT NOT NULL DEFAULT '',  -- its run's branch ("prs"): a later run of it replaces what is held
     run_id     INTEGER,  -- the run whose PRs they are, whose message says how they went
     batch      INTEGER,  -- runs started together: one review request for all their PRs

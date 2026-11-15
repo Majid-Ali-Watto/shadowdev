@@ -29,6 +29,12 @@ class HeldRepository:
                          (user_id, project_id, json.dumps({"channel": channel, "text": text, "ts": thread_ts}),
                           time.time()))
 
+    def hold_call(self, user_id: int, project_id: int, service: str, op: str, args: list) -> None:
+        """A comment to make as the developer: `op` of the Jira or GitHub client (`service`), with its arguments."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("INSERT INTO held (user_id, project_id, kind, data, at) VALUES (?, ?, ?, ?, ?)",
+                         (user_id, project_id, service, json.dumps({"op": op, "args": args}), time.time()))
+
     def waiting(self) -> list[sqlite3.Row]:
         """Everything held, the oldest first."""
         with closing(self.db.connect()) as conn:

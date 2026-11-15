@@ -228,9 +228,9 @@ def _settings_fields(settings: Settings, project: Project, mail: bool = False,
       Run issues now starts any issue of yours.</p>{start}</fieldset>
   <fieldset class="settings how"><legend>Working hours</legend>
     <p class="hint">Runs work at any time. Outside these hours, what other people see waits for them: PRs open (with
-      their review request in Slack and their links on the ticket) once they begin, and so do replies and reminders
-      to reviewers; a review you are asked for is still done, and answered with a reaction only. Messages to you are
-      never held. Leave the times empty for any time.</p>
+      their review request in Slack) once they begin, and so do comments on Jira tickets and GitHub PRs, and replies
+      and reminders to reviewers in Slack; a review you are asked for is still done, and answered in Slack with a
+      reaction only. Messages to you are never held. Leave the times empty for any time.</p>
     {_work_hours(settings, project)}</fieldset>
   <fieldset class="settings how"><legend>Approve without review</legend>
     <p class="hint">A PR between these two branches is approved as you without being read, for changes that were

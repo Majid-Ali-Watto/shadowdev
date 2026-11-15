@@ -1,7 +1,8 @@
 """What waits for a developer's working hours in a project (Settings.work_starts), sent once they
-begin: the PRs a run pushed its branch for, with their review request and PR links on the tickets
-(pipeline.open_prs), and replies to reviewers in Slack. Only what other people see waits: runs
-work at any time, and direct messages and emails to the developer go at once."""
+begin, in the order it was held: the PRs a run pushed its branch for, with their review request and
+PR links on the tickets (pipeline.open_prs), replies to reviewers in Slack, and comments on Jira
+tickets and GitHub PRs (Holding). Only what other people see waits: runs work at any time, reviews
+asked for are posted, and direct messages and emails to the developer go at once."""
 import json
 import logging
 import random
@@ -26,6 +27,31 @@ from ..repositories.users import UserRepository
 log = logging.getLogger("shadowdev")
 
 TICK_SECONDS = 60
+# The calls of a run's clients that wait outside working hours: comments, as people read them.
+HELD_CALLS = {"jira": ("comment",), "github": ("comment", "reply_to_thread", "resolve_thread")}
+
+
+class Holding:
+    """A run's Jira or GitHub client whose comments (HELD_CALLS), outside its developer's working
+    hours in the project, are handed to `hold(service, call, args)` to be made in those hours;
+    every other call goes through at once."""
+
+    def __init__(self, client, service: str, settings, hold: Callable[[str, str, list], None]):
+        self._client, self._service, self._settings, self._hold = client, service, settings, hold
+
+    def __getattr__(self, name: str):
+        found = getattr(self._client, name)
+        if name not in HELD_CALLS[self._service]:
+            return found
+
+        def call(*args):
+            if self._settings.at_work(time.time()):
+                return found(*args)
+            self._hold(self._service, name, list(args))
+            log.info("outside working hours: the %s %s (%s) waits for them", self._service.replace("jira", "Jira")
+                     .replace("github", "GitHub"), name.replace("_", " "), args[0])
+            return None
+        return call
 
 
 class Outbox:
@@ -90,8 +116,27 @@ class Outbox:
         return sent
 
     def _send(self, user: User, project: Project, actor: Actor, rows: list) -> None:
+        clients = {}
+
+        def client(service: str):
+            if service not in clients:
+                clients[service] = GitHub(actor.github.token) if service == "github" else jira_client(
+                    self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
+            return clients[service]
+
         for row in rows:
-            if row["kind"] == "slack" and actor.slack:
+            if row["kind"] in HELD_CALLS:
+                data = json.loads(row["data"])
+                if data["op"] not in HELD_CALLS[row["kind"]]:
+                    continue
+                try:
+                    getattr(client(row["kind"]), data["op"])(*data["args"])
+                    log.info("%s: a %s %s that waited for %s's working hours made", project.name, row["kind"],
+                             data["op"].replace("_", " "), user.display_name)
+                except HTTPError as e:
+                    log.warning("%s: a %s %s that waited for working hours failed: %s", project.name, row["kind"],
+                                data["op"].replace("_", " "), e)
+            elif row["kind"] == "slack" and actor.slack:
                 data = json.loads(row["data"])
                 try:
                     Slack(actor.slack.token).post(data["channel"], data["text"], data["ts"])
@@ -102,8 +147,7 @@ class Outbox:
         publications = [(row, Publication.from_json(row["data"])) for row in rows if row["kind"] == "prs"]
         if not publications:
             return
-        jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
-        github = GitHub(actor.github.token)
+        jira, github = client("jira"), client("github")
         together: list[tuple[str, object, str]] = []  # (title, repo, PR) of runs started together
         announce: Callable | None = ((lambda title, opened, branch: together.extend((title, r, url) for r, url in opened))
                                      if len(publications) > 1 else None)

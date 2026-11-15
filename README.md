@@ -123,8 +123,12 @@ by hand or by themselves; outside the hours, only what other people see waits:
   (services/outbox.py, every minute);
 - **replies to reviewers in Slack** (*Review comments addressed. Kindly review this PR again*) wait
   the same way, and **reminders** are due once the hours begin;
-- a **review you are asked for** in Slack is still done, and on GitHub as ever, but answered in the
-  thread only with its reactions (👀, then how it went): no message.
+- **comments on Jira tickets** (root cause or plan, questions to the reporter, failures) and **on
+  GitHub PRs** (answers to review comments and resolving their threads, CI and conflict notes) are
+  made once the hours begin, in the order they were held. The work itself (commits, pushes, the root
+  cause field, the fix version, the ticket's status) happens at once;
+- a **review you are asked for** in Slack is still done, and posted on GitHub as ever, but answered in
+  the thread only with its reactions (👀, then how it went): no message.
 
 Direct messages and emails to the developer (decisions a run needs, tickets not complete yet) are
 never held. *Only push the branch* involves nobody else, so nothing of it waits.
@@ -231,7 +235,7 @@ ShadowDev/
 │   │   ├── projects.py    projects: Jira site and keys, repos, workflow, webhook secret
 │   │   ├── sessions.py    web sessions (hashed)
 │   │   ├── runs.py        run history shown on the page (with each run's log and cost), accepted webhook events
-│   │   ├── held.py        PRs and Slack replies waiting for their developer's working hours
+│   │   ├── held.py        PRs, Slack replies and Jira/GitHub comments waiting for their developer's working hours
 │   │   └── reviews.py     PRs in review: the ones ShadowDev opened, and the ones asked for in Slack
 │   ├── services/          business logic; raise UserError for problems shown to the developer
 │   │   ├── accounts.py    sign-in, connect/remove Jira, GitHub and Claude accounts, pause, delete
@@ -242,7 +246,7 @@ ShadowDev/
 │   │   ├── privacy.py     Atlassian's personal data reporting: erase closed accounts, refresh changed ones
 │   │   ├── poller.py      Poll Jira (Settings): ask Jira for new assignments, each developer at their interval
 │   │   ├── releases.py    move complete tickets by the project's status rules, tell the developer in Slack what others miss
-│   │   ├── outbox.py      once a developer's working hours begin: open the PRs and post the Slack replies that waited
+│   │   ├── outbox.py      once a developer's working hours begin: open the PRs, post the replies and comments that waited
 │   │   └── reviews.py     at each developer's interval: review comments and CI on its PRs (GitHub), review requests (Slack)
 │   ├── routes/            HTTP only: parse the request, call a service, respond
 │   │   ├── request.py     Request helpers, security headers, the signed-in form guard

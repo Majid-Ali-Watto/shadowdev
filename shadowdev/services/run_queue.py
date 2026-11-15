@@ -28,6 +28,7 @@ from ..repositories.projects import ProjectRepository
 from ..repositories.reviews import ReviewRepository
 from ..repositories.runs import RunRepository
 from ..repositories.users import UserRepository
+from .outbox import Holding
 
 log = logging.getLogger("shadowdev")
 
@@ -472,6 +473,10 @@ class RunQueue:
             log.info("%s: its Claude account is at its limit; working with %s", label, actor.claude.label)
         self.runs.update(run_id, "running")
         jira = jira_client(self.oauth, self.users, user.subscriptions[project.id].jira_account_id, project.cloud_id)
+        github = GitHub(actor.github.token)
+        if self.held:  # comments on tickets and PRs, as people read them, wait for the developer's working hours
+            held = lambda service, call, args: self.held.hold_call(user_id, project_id, service, call, args)
+            jira, github = Holding(jira, "jira", actor.settings, held), Holding(github, "github", actor.settings, held)
         cfg = self.cfg.for_run(user.limits)
         on_model = lambda models: self.runs.set_model(run_id, models)
         # A note after a run that asked the developer answers its questions: Claude gets them together.
@@ -481,9 +486,9 @@ class RunQueue:
             {"title": title, "repo": repo.name, "url": url, "branch": branch} for repo, url in opened])) if batch else None
         try:
             if work:
-                status, message = work(project, actor, cfg, GitHub(actor.github.token), cancel=token, on_model=on_model)
+                status, message = work(project, actor, cfg, github, cancel=token, on_model=on_model)
             else:
-                status, message = process_issues(keys, project, actor, cfg, jira, GitHub(actor.github.token),
+                status, message = process_issues(keys, project, actor, cfg, jira, github,
                                                  cancel=token, note=note, on_model=on_model,
                                                  on_pr=lambda repo, number, branch, slack: self._track(
                                                      user_id, project_id, repo, number, branch, slack),
