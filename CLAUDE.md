@@ -134,8 +134,10 @@ Keep to these boundaries when adding code; README "Adding things" lists where ea
   only where the project has it (`views/projects.applies`). Defaults must fit any team.
 - Runs work at any time. Outside the developer's working hours in the project (`Settings.at_work`)
   only what other people see waits: a run's PRs and what follows them (`pipeline.open_prs`, held as a
-  `models/publication.Publication`), Slack replies to reviewers (`ask_for_review(later=)`) and
-  reminders; a review asked for in Slack answers only with reactions. They wait in `held`
+  `models/publication.Publication`), Slack replies to reviewers (`ask_for_review(later=)`),
+  reminders, and comments on Jira tickets and GitHub PRs (`RunQueue` wraps a run's clients in
+  `outbox.Holding`; a new comment call goes in `outbox.HELD_CALLS`); a review asked for in Slack is
+  posted on GitHub but answers in its thread only with reactions. They wait in `held`
   (`repositories/held.py`) and `services/outbox.py` sends them once the hours begin. Direct messages
   and emails to the developer are never held. A new message that other people see checks the hours too.
 - Issue keys become branch and directory names, so validate them with `rules.ISSUE_KEY_RE`.

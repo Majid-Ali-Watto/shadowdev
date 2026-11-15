@@ -61,6 +61,33 @@ class OutboxTest(unittest.TestCase):
         self.assertEqual(self.held.waiting(), [])
         self.assertEqual(self.app.outbox.flush(), 0)  # sent once
 
+    def test_comments_on_tickets_and_prs_wait_and_are_made_in_order(self):
+        jira, github, held = mock.Mock(), mock.Mock(), []
+        hold = lambda service, call, args: held.append((service, call, args))
+        jira, github = (outbox.Holding(jira, "jira", self.closed, hold), outbox.Holding(github, "github", self.closed, hold))
+        with self.assertLogs("shadowdev", "INFO") as logs:
+            jira.comment("MAR-1", "*Root cause:* the cache")
+            github.reply_to_thread("T1", "Done.")
+            github.resolve_thread("T1")
+        self.assertIn("the Jira comment (MAR-1) waits for them", logs.output[0])
+        jira.set_fix_versions("MAR-1", ["Rel 2"])  # not a comment: at once
+        github.create_review("acme/fe", 3, "APPROVE", "")  # a review asked for: at once
+        self.assertEqual(held, [("jira", "comment", ["MAR-1", "*Root cause:* the cache"]),
+                                ("github", "reply_to_thread", ["T1", "Done."]), ("github", "resolve_thread", ["T1"])])
+        jira._client.comment.assert_not_called()
+        jira._client.set_fix_versions.assert_called_once()
+        github._client.create_review.assert_called_once()
+        within = outbox.Holding(mock.Mock(), "github", Settings(), hold)
+        within.comment("acme/fe", 3, "CI fixed")
+        within._client.comment.assert_called_once_with("acme/fe", 3, "CI fixed")
+
+        for service, call, args in held:
+            self.held.hold_call(self.me, self.market.id, service, call, args)
+        self.settings(Settings())
+        self.assertEqual(self.app.outbox.flush(), 5)
+        self.jira.comment.assert_called_with("MAR-1", "*Root cause:* the cache")
+        self.assertEqual([c[0] for c in self.github.method_calls if c[0] != "create_pr"], ["reply_to_thread", "resolve_thread"])
+
     def test_dropped_when_the_developer_leaves_the_project(self):
         self.app.users.unsubscribe(self.me, self.market.id)
         self.app.outbox.flush()
