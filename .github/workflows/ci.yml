@@ -1,11 +1,29 @@
-# Lint and the test suite, on every push and pull request. The tests run the sandbox for real (bwrap,
-# prlimit), so the runner needs those tools, and Ubuntu 24.04 blocks unprivileged user namespaces
+# Lint and the test suite, on every push and pull request that changes code. The tests run the sandbox for
+# real (bwrap, prlimit), so the runner needs those tools, and Ubuntu 24.04 blocks unprivileged user namespaces
 # unless AppArmor's restriction is switched off. No secrets are used: the tests fake GitHub, Jira and Claude.
+#
+# A push touching only the files below skips CI: nothing here is read by the tests or run by this job
+# (it builds no Docker image and uses no Makefile). A push that also changes anything else runs it.
+# If a file in this list starts being tested or run here, take it out.
 name: CI
 
 on:
   push:
+    paths-ignore: &docs
+      - "**.md"
+      - "docs/**"
+      - "LICENSE"
+      - ".env.example"
+      - ".gitignore"
+      - ".dockerignore"
+      - ".claudeignore"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "deploy/**"
+      - "Makefile"
   pull_request:
+    paths-ignore: *docs
+  workflow_dispatch:
 
 permissions:
   contents: read
