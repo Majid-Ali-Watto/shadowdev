@@ -176,6 +176,10 @@ Keep to these boundaries when adding code; docs/ARCHITECTURE.md "Adding things" 
   `tempfile.mkdtemp()` in tests, never a fixed path.
 - Don't name a module under `shadowdev/` `test*.py`: unittest discovery would import it as a test.
 - Run the full suite after any change. It is fast and covers the security checks.
+- CI (`.github/workflows/ci.yml`) has git, bwrap and prlimit but no `claude`: a test must not need it
+  installed (patch `shadowdev.config.shutil.which` around `Config.from_env`). CI skips pushes that change
+  only docs, Docker, deploy files or the Makefile (its `paths-ignore`); a test that starts reading one of
+  those takes it off that list.
 
 ## Don't touch
 
