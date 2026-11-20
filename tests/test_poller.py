@@ -156,7 +156,8 @@ class LimitsTest(unittest.TestCase):
                                                                 max_fix_attempts=4))
         self.assertEqual((cfg.claude_timeout_seconds, cfg.command_timeout_seconds, cfg.max_fix_attempts), (3600, 630, 4))
 
-    def test_env_keys_moved_to_settings_are_ignored_with_a_warning(self):
+    @mock.patch("shadowdev.config.shutil.which", return_value="/usr/bin/tool")  # as if installed: CI has no claude
+    def test_env_keys_moved_to_settings_are_ignored_with_a_warning(self, _which):
         env = {"JIRA_SITES": "https://a.atlassian.net", "ATLASSIAN_CLIENT_ID": "a", "ATLASSIAN_CLIENT_SECRET": "b",
                "SHADOWDEV_SECRET_KEY": "d", "MAX_PARALLEL_RUNS": "9", "JIRA_POLLING": "true"}
         with self.assertLogs("shadowdev", "WARNING") as logs:

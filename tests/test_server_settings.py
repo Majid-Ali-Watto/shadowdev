@@ -83,11 +83,16 @@ class LimitsTest(Env):
         status, _ = build_app(cfg, mock.Mock(), mock.Mock()).webhooks.handle(b"{}", "sha256=x")
         self.assertEqual(status, 401)
 
-    def test_config(self):
+    @mock.patch("shadowdev.config.shutil.which", return_value="/usr/bin/tool")  # as if installed: CI has no claude
+    def test_config(self, which):
         env = {"JIRA_SITES": "https://office.atlassian.net, https://home.atlassian.net/", "ATLASSIAN_CLIENT_ID": "a",
                "ATLASSIAN_CLIENT_SECRET": "b", "SHADOWDEV_SECRET_KEY": "d"}
         cfg = Config.from_env(env)
         self.assertEqual((cfg.jira_sites, cfg.webhook_secret), ((OFFICE.url, HOME.url), None))
+        which.side_effect = lambda tool: None if tool == "claude" else "/usr/bin/" + tool
+        with self.assertRaisesRegex(SystemExit, "claude is not installed"):
+            Config.from_env(env)
+        which.side_effect = None
         self.assertTrue(cfg.allows_site(HOME.url + "/"))
         self.assertFalse(cfg.allows_site("https://other.atlassian.net"))
         legacy = {**env, "JIRA_SITES": "", "JIRA_BASE_URL": "https://acme.atlassian.net"}
