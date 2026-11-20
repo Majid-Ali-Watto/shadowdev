@@ -136,11 +136,16 @@ class GitHub:
         self._graphql("mutation($thread: ID!) { resolveReviewThread(input: {threadId: $thread}) { clientMutationId } }",
                       thread=thread_id)
 
-    def create_review(self, owner_repo: str, number: int, event: str, body: str, comments: list[dict] = ()) -> None:
-        """Submit a review: event APPROVE or COMMENT; `comments`: [{path, line, body}] on lines of the diff."""
-        self._request("POST", f"/repos/{owner_repo}/pulls/{number}/reviews", {
-            "event": event, "body": body,
-            "comments": [{"path": c["path"], "line": c["line"], "side": "RIGHT", "body": c["body"]} for c in comments]})
+    def create_review(self, owner_repo: str, number: int, event: str, body: str, comments: list[dict] = (),
+                      commit_id: str | None = None) -> None:
+        """Submit a review: event APPROVE or COMMENT; `comments`: [{path, line, body}] on lines of the diff.
+        `commit_id`: the head commit that was reviewed. GitHub then holds the review to that commit, so a
+        push after the review is not approved with it."""
+        review = {"event": event, "body": body,
+                  "comments": [{"path": c["path"], "line": c["line"], "side": "RIGHT", "body": c["body"]} for c in comments]}
+        if commit_id:
+            review["commit_id"] = commit_id
+        self._request("POST", f"/repos/{owner_repo}/pulls/{number}/reviews", review)
 
     # CI
 

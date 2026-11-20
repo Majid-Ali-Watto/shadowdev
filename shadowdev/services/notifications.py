@@ -68,7 +68,7 @@ class NotificationTests:
         if way == "email" and sent.get("email_to") != address_key(actor.email):
             sent.update(email=0, email_to=address_key(actor.email))  # a new address: counted again
         sent.update({way: int(sent.get(way, 0)) + 1, "at": now})
-        self.users.save_tests_sent(user.id, project.id, sent)
+        self.users.subscriptions.save_tests_sent(user.id, project.id, sent)
         self.users.record(user.id, f"Sent a test {WAYS[way]}", project.name)
 
 

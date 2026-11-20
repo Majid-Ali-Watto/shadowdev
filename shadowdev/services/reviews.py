@@ -14,13 +14,14 @@ the developer asked (Limits.github_poll_minutes and slack_poll_minutes, a minute
   Mentioned later in the thread of a message that asked others, and asked to review there, the
   developer reviews the PRs of that first message, unless someone it asked has started (👀).
 
-GitHub and Slack are asked, not listened to, so this works on a machine neither can reach.
+GitHub and Slack are asked, not listened to, so this works on a machine neither can reach. What
+the Slack messages say is read by services/review_requests.py.
 """
 import logging
 import random
-import re
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime
 
 from ..automation.review import (
@@ -37,12 +38,15 @@ from ..clients.github import GitHub
 from ..clients.rest import HTTPError
 from ..clients.slack import Slack, link
 from ..config import Config
+from ..models.limits import Limits
 from ..models.project import Project
 from ..models.user import User
 from ..repositories.held import HeldRepository
 from ..repositories.projects import ProjectRepository
 from ..repositories.reviews import ReviewRepository
 from ..repositories.users import UserRepository
+from .errors import UserError
+from .review_requests import REVIEWING, asked_in_reply, asked_prs, asks_again, claimed_by
 from .run_queue import RunQueue
 
 log = logging.getLogger("shadowdev")
@@ -53,69 +57,32 @@ MAX_CONFLICT_ROUNDS = 3  # of merges of the base branch per pull request
 MAX_REMINDERS = 3  # of a PR's reviewers, in its Slack thread
 REMIND_EVERY = 24 * 3600  # seconds between two reminders of the same PR
 CI_FAILED = {"FAILURE", "ERROR"}
-PR_URL_RE = re.compile(r"https://github\.com/([A-Za-z0-9-]+/[A-Za-z0-9_.-]+)/pull/([0-9]{1,9})")
-MENTION_OR_PR_RE = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>|" + PR_URL_RE.pattern)
 # Reactions on the message that asked for reviews: while they run, and once all are done.
-REVIEWING, ALL_APPROVED, SOME_COMMENTED, SOME_FAILED = "eyes", "white_check_mark", "memo", "warning"
+ALL_APPROVED, SOME_COMMENTED, SOME_FAILED = "white_check_mark", "memo", "warning"
 TICK_SECONDS = 15  # how often it looks for developers due a poll: the shortest interval allowed
 RECENT_MESSAGES = 20  # the channel's last messages read each poll, with their threads; older ones are not looked at
-AGAIN_RE = re.compile(r"re-?review|review\s+(it\s+)?again", re.IGNORECASE)
-# A reply in a thread that mentions the developer without linking PRs asks them to review the
-# thread's PRs only with words that ask for it, and none that say not to.
-REVIEW = r"(?:re-?review|review|approve)"
-REVIEW_ASK_RE = re.compile(
-    rf"\b(?:can|could|would|will)\s+you\b[^.?!\n]*\b(?:{REVIEW}|look|check)\b"  # can you review / take a look
-    rf"|\b(?:please|pls|plz|kindly)\b[^.?!\n]*\b(?:{REVIEW}|look|check)\b"  # please review / please check these
-    rf"|\b{REVIEW}\s+(?:this|these|it|them|the\s+prs?|pls|plz|please)\b"  # review these
-    rf"|^\s*(?:<@[^>]+>[\s,:]*)+{REVIEW}\b"  # "@majid review"
-    r"|\bptal\b|\b(?:take|have)\s+a\s+look\b", re.IGNORECASE)
-NOT_ASKED_RE = re.compile(r"\b(?:no\s+need|not\s+needed|don'?t|do\s+not|doesn'?t\s+need|never\s?mind|nvm)\b", re.IGNORECASE)
 
 
-def mention_groups(text: str) -> list[tuple[set[str], list[tuple[str, int]]]]:
-    """Who a Slack message asks to review which PRs: [(members, [(owner/name, number)])]. One message
-    can ask several people about different PRs ("@a @b: <fe PRs> @c @d: <services PRs>"), so a PR
-    belongs to the mentions just before it, or to the first ones when it comes before any mention."""
-    groups: list[tuple[set[str], list[tuple[str, int]]]] = []
-    before: list[tuple[str, int]] = []
-    for mentioned, github, number in MENTION_OR_PR_RE.findall(text):
-        if mentioned:
-            if not groups or groups[-1][1]:
-                groups.append((set(), []))
-            groups[-1][0].add(mentioned)
-        else:
-            (groups[-1][1] if groups else before).append((github, int(number)))
-    if groups:
-        groups[0][1][:0] = before
-    return groups
+def _guarded(what: str, do: Callable, *args) -> None:
+    """One PR, channel or thread that fails doesn't stop the rest. What is expected (a refused token,
+    a deleted channel, a message the developer should read) is logged as a warning; anything else
+    with its traceback, so a bug is not hidden."""
+    try:
+        do(*args)
+    except (HTTPError, UserError) as e:
+        log.warning("%s failed: %s", what, e)
+    except Exception:
+        log.exception("%s failed", what)
 
 
-def asked_prs(text: str, member: str) -> list[tuple[str, int]]:
-    """The PRs (owner/name, number) a Slack message asks the member to review."""
-    asked = [pr for members, prs in mention_groups(text) if member in members for pr in prs]
-    return list(dict.fromkeys(asked))
+def _watched(user: User, project_id: int) -> bool:
+    actor = user.actor(project_id)
+    return bool(actor and actor.settings.watches_prs)
 
 
-def asked_in_reply(text: str, parent: str, member: str) -> list[tuple[str, int]]:
-    """The PRs a reply in the thread of the message `parent` asks the member to review when it
-    links none itself ("@majid can you review these?"): those `parent` asked them about, else all
-    it links. Only when the reply mentions them and asks for a review in words, and none say not to."""
-    mentioned = {m for members, _ in mention_groups(text) for m in members}
-    if member not in mentioned or PR_URL_RE.search(text) or not REVIEW_ASK_RE.search(text) or NOT_ASKED_RE.search(text):
-        return []
-    return asked_prs(parent, member) or list(dict.fromkeys((g, int(n)) for g, n in PR_URL_RE.findall(parent)))
-
-
-def claimed_by(message: dict, member: str, github: str, number: int) -> str | None:
-    """Who, of those this message asks about the PR, reacted 👀 on it before the member (reviewing
-    it), or None. The first 👀 of those asked wins, so when two developers' ShadowDevs both react,
-    one of them reviews."""
-    pr = (github.lower(), number)
-    asked = set().union(*(members for members, prs in mention_groups(str(message.get("text") or ""))
-                          if pr in {(g.lower(), n) for g, n in prs}))
-    eyes = next((r.get("users") or [] for r in message.get("reactions") or [] if r.get("name") == REVIEWING), [])
-    first = next((u for u in eyes if u in asked or u == member), None)
-    return first if first and first != member else None
+def _reviews_for(user: User, project_id: int) -> bool:
+    actor = user.actor(project_id)
+    return bool(actor and actor.settings.review_for_me)
 
 
 class ReviewWatcher:
@@ -143,57 +110,42 @@ class ReviewWatcher:
 
     def poll(self, now: float | None = None, due_only: bool = False) -> None:
         """Read GitHub and Slack for every active developer; `due_only`: each only for the developers
-        whose own interval for it has passed."""
+        whose own interval for it has passed. A developer not due is not even loaded."""
         now = now or time.time()
-        active = [u for u in self.users.all() if not u.paused]
+        timings = self.users.timings()
+        github = self._due("github", timings, now, due_only, lambda limits: limits.github_poll_minutes * 60)
+        slack = self._due("slack", timings, now, due_only, lambda limits: limits.slack_poll_minutes * 60)
+        self._watch_prs(github, now)
+        self._read_slack(slack, now)
 
-        def due(service: str, interval) -> dict[int, User]:
-            polled = self._polled[service]
-            users = {u.id: u for u in active if not due_only or now - polled.get(u.id, 0) >= interval(u.limits)}
-            polled.update((uid, now) for uid in users)
-            return users
+    def _due(self, service: str, timings: dict[int, tuple[bool, Limits]], now: float, due_only: bool,
+             interval: Callable[[Limits], float]) -> dict[int, User]:
+        """The active developers whose `service` is due now, loaded; their poll is recorded."""
+        polled = self._polled[service]
+        due = [uid for uid, (paused, limits) in timings.items()
+               if not paused and (not due_only or now - polled.get(uid, 0) >= interval(limits))]
+        polled.update((uid, now) for uid in due)
+        loaded = {uid: self.users.loadable(uid) for uid in due}
+        return {uid: user for uid, user in loaded.items() if user}
 
-        github = due("github", lambda limits: limits.github_poll_minutes * 60)
-        slack = due("slack", lambda limits: limits.slack_poll_minutes * 60)
+    # The PRs ShadowDev opened: review comments and failing CI
+
+    def _watch_prs(self, github: dict[int, User], now: float) -> None:
         projects: dict[int, Project | None] = {}
-        project = lambda project_id: projects.setdefault(project_id, self.projects.get(project_id))
 
-        def watched(user: User, project_id: int) -> bool:
-            actor = user.actor(project_id)
-            return bool(actor and actor.settings.watches_prs)
-
-        def reviews_for(user: User, project_id: int) -> bool:
-            actor = user.actor(project_id)
-            return bool(actor and actor.settings.review_for_me)
-
-        def each(what: str, do, *args) -> None:  # one that fails (revoked access, a deleted channel) doesn't stop the rest
-            try:
-                do(*args)
-            except Exception as e:
-                log.warning("%s failed: %s", what, e)
+        def project(project_id: int) -> Project | None:
+            if project_id not in projects:
+                projects[project_id] = self.projects.get(project_id)
+            return projects[project_id]
 
         reminding: dict[tuple[int, str, str], list] = {}  # (developer, Slack thread) -> its PRs to remind of
         for row in self.reviews.tracked_prs():
-            if row["user_id"] in github and project(row["project_id"]) and watched(github[row["user_id"]], row["project_id"]):
-                each(f"checking {row['github']}#{row['number']} for review comments", self._check_pr, row,
-                     github[row["user_id"]], project(row["project_id"]), now, reminding)
+            user = github.get(row["user_id"])
+            if user and project(row["project_id"]) and _watched(user, row["project_id"]):
+                _guarded(f"checking {row['github']}#{row['number']} for review comments", self._check_pr, row, user,
+                         project(row["project_id"]), now, reminding)
         for (user_id, channel, ts), rows in reminding.items():
-            each(f"reminding the reviewers of {len(rows)} PR(s)", self._remind, github[user_id], channel, ts, rows, now)
-        for user in slack.values():
-            if user.slack:
-                for p in self.projects.on_sites(list(user.sites)):
-                    if p.slack_channel and reviews_for(user, p.id):
-                        each(f"reading the Slack channel of {p.name} for {user.display_name}", self._read_channel, user, p, now)
-        for row in self.reviews.in_state("commented", "failed"):
-            if row["user_id"] in slack and slack[row["user_id"]].slack and row["rounds"] < MAX_ROUNDS \
-                    and reviews_for(slack[row["user_id"]], row["project_id"]):
-                each(f"reading the Slack thread of {row['github']}#{row['number']}", self._read_thread, row, slack[row["user_id"]])
-        for row in self.reviews.in_state("requested"):  # asked in Slack: started as Slack is read
-            if row["user_id"] in slack:
-                each(f"starting the review of {row['github']}#{row['number']}", self._start_review, row,
-                     slack[row["user_id"]], project(row["project_id"]))
-
-    # The PRs ShadowDev opened: review comments and failing CI
+            _guarded(f"reminding the reviewers of {len(rows)} PR(s)", self._remind, github[user_id], channel, ts, rows, now)
 
     def _check_pr(self, row, user: User, project: Project, now: float, reminding: dict | None = None) -> None:
         """`reminding`: where a PR whose reviewers are to be reminded goes, by its Slack thread."""
@@ -341,12 +293,30 @@ class ReviewWatcher:
 
     # Review requests in Slack
 
+    def _read_slack(self, slack: dict[int, User], now: float) -> None:
+        """The Slack channels of the projects, the threads of PRs asked again, and the review requests
+        that were read, started: each for the developers whose Slack is due."""
+        for user in slack.values():
+            if user.slack:
+                for p in self.projects.on_sites(list(user.sites)):
+                    if p.slack_channel and _reviews_for(user, p.id):
+                        _guarded(f"reading the Slack channel of {p.name} for {user.display_name}", self._read_channel, user, p, now)
+        for row in self.reviews.in_state("commented", "failed"):
+            user = slack.get(row["user_id"])
+            if user and user.slack and row["rounds"] < MAX_ROUNDS and _reviews_for(user, row["project_id"]):
+                _guarded(f"reading the Slack thread of {row['github']}#{row['number']}", self._read_thread, row, user)
+        for row in self.reviews.in_state("requested"):  # asked in Slack: started as Slack is read
+            user = slack.get(row["user_id"])
+            if user:
+                _guarded(f"starting the review of {row['github']}#{row['number']}", self._start_review, row, user,
+                         self.projects.get(row["project_id"]))
+
     def _read_channel(self, user: User, project: Project, now: float) -> None:
         """The channel's last messages and the replies in their threads, each acted on once: only
         those after `seen`, the newest one read before, count."""
-        seen = self.users.slack_seen(user.id, project.id)
+        seen = self.users.subscriptions.slack_seen(user.id, project.id)
         if not seen:  # the first look: only what is said from now on counts
-            return self.users.mark_slack_seen(user.id, project.id, f"{now:.6f}")
+            return self.users.subscriptions.mark_slack_seen(user.id, project.id, f"{now:.6f}")
         slack, channel = Slack(user.slack.token), project.slack_channel
         new = []  # all read before any is acted on: if Slack fails halfway, the next look reads them again
         recent = slack.history(channel, RECENT_MESSAGES)
@@ -375,13 +345,13 @@ class ReviewWatcher:
                                              channel, str(message.get("thread_ts") or ts), ts)
                         log.info("%s#%s: %s was asked in Slack to review it", github, number, user.display_name)
             seen = max(seen, ts, key=float)
-        self.users.mark_slack_seen(user.id, project.id, seen)
+        self.users.subscriptions.mark_slack_seen(user.id, project.id, seen)
 
     def _read_thread(self, row, user: User) -> None:
         """Asked again in the thread of an earlier review: by mentioning the developer, or with words."""
         for reply in Slack(user.slack.token).replies(row["channel"], row["ts"], row["last_ts"]):
             text = str(reply.get("text") or "")
-            if reply.get("user") != user.slack.user_id and (f"<@{user.slack.user_id}>" in text or AGAIN_RE.search(text)):
+            if reply.get("user") != user.slack.user_id and (f"<@{user.slack.user_id}>" in text or asks_again(text)):
                 self.reviews.request(user.id, row["project_id"], row["github"], row["number"], row["channel"], row["ts"],
                                      str(reply["ts"]))
                 log.info("%s#%d: %s was asked to review it again", row["github"], row["number"], user.display_name)

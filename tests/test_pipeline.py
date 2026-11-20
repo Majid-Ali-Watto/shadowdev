@@ -17,8 +17,10 @@ from unittest import mock
 
 from cryptography.fernet import Fernet
 
-from shadowdev.automation import dryrun, pipeline, prompts, review, verify
+from shadowdev import dryrun
+from shadowdev.automation import gitops, pipeline, prompts, review, verify
 from shadowdev.automation.cancel import Cancelled
+from shadowdev.automation.workspace import delete_tree
 from shadowdev.clients.mail import Smtp
 from shadowdev.models.issue import ROOT_CAUSE_HEAD, RUN_COMMENT_STARTS
 from shadowdev.models.project import Project, Repo
@@ -330,7 +332,7 @@ class PipelineTest(unittest.TestCase):
         (locked / "inner" / "secret.py").write_text("x = 1\n")
         (locked / "inner").chmod(0)
         locked.chmod(0o500)
-        pipeline.delete_tree(self.tmp / "ws")
+        delete_tree(self.tmp / "ws")
         self.assertFalse((self.tmp / "ws").exists())
 
     def test_only_plain_report_files_of_a_sane_size_are_read(self):
@@ -569,10 +571,15 @@ class PipelineTest(unittest.TestCase):
         self.assertIsNone(review.reviewed_by_others(pr, [], said("Sara"), "Majid"))  # the author answering
         self.assertIsNone(review.reviewed_by_others(pr, [], said("ci-bot", "NONE"), "Majid"))  # no access: a bot, a passer-by
 
-    def review(self, answer, author="sara", head="PROJ-1", base="release/1.10"):
+    def pr_head(self, branch="PROJ-1"):
+        """The commit the PR's branch is at on GitHub: what a review must be pinned to."""
+        return sh(self.app_origin, "git", "rev-parse", branch)
+
+    def review(self, answer, author="sara", head="PROJ-1", base="release/1.10", sha=None):
         self.github.pr.return_value = {
             "number": 1, "state": "open", "user": {"login": author}, "title": "PROJ-1: totals", "body": "Fixes add().",
-            "html_url": "https://github.com/acme/app/pull/1", "head": {"ref": head, "repo": {"full_name": "acme/app"}},
+            "html_url": "https://github.com/acme/app/pull/1",
+            "head": {"ref": head, "sha": sha or sh(self.app_origin, "git", "rev-parse", head), "repo": {"full_name": "acme/app"}},
             "base": {"ref": base}}
         self.github.pr_diff.return_value = "--- a/calc.py\n+++ b/calc.py\n-    return a - b\n+    return a + b\n"
         self.github.review_threads.return_value = ("OPEN", self.THREADS[1:2])
@@ -651,7 +658,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((status, state), ("done", "approved"))
         self.assertEqual(message, "approved https://github.com/acme/app/pull/1 without a review: release/1.10 into main "
                                   "needs approval only")
-        self.github.create_review.assert_called_once_with("acme/app", 1, "APPROVE", "")
+        self.github.create_review.assert_called_once_with("acme/app", 1, "APPROVE", "", commit_id=self.pr_head("release/1.10"))
         slack.post.assert_not_called()  # the message that asked only gets its tick
 
         # The rules of every review still hold: never the developer's own, nor one already approved.
@@ -683,7 +690,8 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual((status, state), ("done", "approved"))  # nothing more to do for it
         self.assertIn("not approved, as chosen", message)
         self.github.create_review.assert_called_once_with("acme/app", 1, "COMMENT",
-                                                          "Nothing that must change. Correct, and its test covers the case.")
+                                                          "Nothing that must change. Correct, and its test covers the case.",
+                                                          commit_id=self.pr_head())
         self.assertEqual(slack.post.call_args.args[1],
                          "Reviewed <https://github.com/acme/app/pull/1|PR 1>, nothing blocking")
 
@@ -715,7 +723,8 @@ class PipelineTest(unittest.TestCase):
         summary = "Fixes the sign in add(); one case is not handled."
         result = self.review({"verdict": "comment", "comments": comments, "summary": summary})
         self.assertEqual(result, ("done", "1 review comment(s) on https://github.com/acme/app/pull/1", "commented"))
-        self.github.create_review.assert_called_once_with("acme/app", 1, "COMMENT", summary, comments)
+        self.github.create_review.assert_called_once_with("acme/app", 1, "COMMENT", summary, comments,
+                                                          commit_id=self.pr_head())
         self.assertEqual([c.args for c in slack.post.call_args_list],
                          [("C0REVIEWS1", "Reviewing <https://github.com/acme/app/pull/1|PR 1>", "333.444"),
                           ("C0REVIEWS1", "Comments added on <https://github.com/acme/app/pull/1|PR 1> (1)", "333.444")])
@@ -1472,7 +1481,7 @@ Thanks"""))
         me = add_developer(users, ME, github="gh-tok", claude="sk-ant-oat01-x")
         pid = projects.save(dataclasses.replace(self.project, id=0, owner_id=me))
         user = users.get(me)
-        users.subscribe(me, Subscription(pid, user.jira_accounts[0].id, user.github_accounts[0].id,
+        users.subscriptions.subscribe(me, Subscription(pid, user.jira_accounts[0].id, user.github_accounts[0].id,
                                          user.claude_accounts[0].id, "bugs", {"app": "main"}))
 
         def run(fixes):
@@ -1490,14 +1499,16 @@ Thanks"""))
         worktree = self.cfg.worktree_root / f"{pid}-PROJ-0" / "app"
         self.assertEqual((worktree / "calc.py").read_text(), RIGHT_FIX)
         # Cut from the developer's base branch, and nothing committed or pushed.
-        self.assertEqual(sh(worktree, "git", "rev-parse", "HEAD"), sh(self.app_origin, "git", "rev-parse", "main"))
+        gitdir = self.cfg.worktree_root / f"{pid}-PROJ-0.git" / "app"
+        self.assertEqual(sh(self.tmp, "git", "--git-dir", str(gitdir), "--work-tree", str(worktree), "rev-parse", "HEAD"),
+                         sh(self.app_origin, "git", "rev-parse", "main"))
         self.assertEqual(sh(self.app_origin, "git", "ls-remote", "--heads", ".", "PROJ-0"), "")
         self.assertEqual(len(FakeClaude.instances[0].prompts), 3)  # analyse, change, retry after the wrong fix
 
         # Only the change is kept (no baseline, reports or transcript); the next dry run replaces it.
-        self.assertEqual([p.name for p in self.code_left_on_server()], [f"{pid}-PROJ-0"])
+        self.assertEqual(sorted(p.name for p in self.code_left_on_server()), [f"{pid}-PROJ-0", f"{pid}-PROJ-0.git"])
         self.assertIn("Result: done", run([RIGHT_FIX]))
-        self.assertEqual([p.name for p in self.code_left_on_server()], [f"{pid}-PROJ-0"])
+        self.assertEqual(sorted(p.name for p in self.code_left_on_server()), [f"{pid}-PROJ-0", f"{pid}-PROJ-0.git"])
 
     def with_repos(self, **changes):
         self.project = dataclasses.replace(self.project, repos=tuple(
@@ -1541,35 +1552,116 @@ Thanks"""))
         self.assertIn("No such file or directory", lines[4])
         self.assertEqual((mine / "new.py").read_text(), "y\n")  # its own files are writable
 
-    def test_planted_git_hooks_and_config_never_run(self):
-        # Code run by tests (or a commit) could plant these; ShadowDev runs git there outside the sandbox.
-        repo = self.tmp / "planted"
-        sh(self.tmp, "git", "init", "-q", str(repo))
+    def test_a_test_command_that_exits_zero_without_the_base_reports_fails_the_change(self):
+        # The base branch's tests write a JUnit report. A change whose tests exit 0 without one may have
+        # skipped its suite, so nothing shows it passed.
+        _, clone = self.clone_app()
+        repo = Repo(name="app", github="acme/app", description="the app repo", release_prefix="release/",
+                    setup=None, test="true")
+        head = gitops.head(clone)
+        scratch = self.cfg.worktree_root / f"{self.project.id}-PROJ-1.shadowdev"  # the run's: its reports are writable
+        with_report = verify.Checkout("PROJ-1", repo, "main", head, clone,
+                                      baseline=verify.TestRun(True, "", {"run.xml"}, set()))
+        ok, output = verify.check(with_report, scratch, self.cfg)
+        self.assertFalse(ok)
+        self.assertIn("No test report from: run.xml", output)
+
+        repo_writes = dataclasses.replace(repo, test='printf "<testsuite/>" > "$SHADOWDEV_REPORT_DIR/run.xml"')
+        writes = verify.Checkout("PROJ-1", repo_writes, "main", head, clone,
+                                 baseline=verify.TestRun(True, "", {"run.xml"}, set()))
+        self.assertTrue(verify.check(writes, scratch, self.cfg)[0])  # the same report: it passes
+
+        nothing_to_report = verify.Checkout("PROJ-1", repo, "main", head, clone,
+                                            baseline=verify.TestRun(True, "", set(), set()))
+        self.assertTrue(verify.check(nothing_to_report, scratch, self.cfg)[0])  # the base wrote none either
+
+    def test_a_review_is_refused_when_the_branch_moved_since_the_pr_was_read(self):
+        self.with_slack()
+        status, message, state = self.review({"verdict": "approve", "comments": [], "summary": "x"}, sha="0" * 40,
+                                             head="release/1.10", base="main")
+        self.assertEqual((status, state), ("skipped", "closed"))
+        self.assertIn("updated while it was read", message)
+        self.github.create_review.assert_not_called()
+
+    def test_an_issue_that_is_not_yours_is_skipped_without_naming_you(self):
+        self.jira.get_issue.return_value = {"fields": {
+            "summary": "Totals are wrong", "issuetype": {"name": "Bug"}, "assignee": {"accountId": "acc-someone"},
+            "project": {"key": "PROJ"},
+        }}
+        issues, skipped = pipeline.select_issues(["PROJ-1"], self.project, self.actor, self.jira)
+        self.assertEqual((issues, skipped), ([], ["PROJ-1: not assigned to you"]))
+        status, message = self.run_pipeline([])
+        self.assertEqual((status, message), ("skipped", "PROJ-1: not assigned to you"))
+        self.assertNotIn("Majid", message)
+
+    def clone_app(self, name="app"):
+        """A clone of the app repo laid out as a run's: work tree in the workspace, git dir beside it."""
+        workspace = self.cfg.worktree_root / f"{self.project.id}-PROJ-1"
+        workspace.mkdir(parents=True)
+        with self.local_github():
+            clone = gitops.clone("acme/app", "main", workspace / name, gitops.gitdirs_of(workspace) / name, "token")
+        return workspace, clone
+
+    def test_a_planted_dot_git_in_the_work_tree_is_never_read(self):
+        # A test command, or a commit, could plant a repository in the clone: its hooks, filter and config
+        # must never run, since ShadowDev names the clone's git dir itself and never reads the work tree's .git.
+        _, clone = self.clone_app()
         marker = self.tmp / "pwned"
-        hook = f"#!/bin/sh\ntouch {marker}\n"
-        for name in ("pre-commit", "post-commit", "commit-msg"):
-            (repo / ".git" / "hooks" / name).write_text(hook)
-            (repo / ".git" / "hooks" / name).chmod(0o755)
-        (self.tmp / "fsmonitor.sh").write_text(hook)
-        (self.tmp / "fsmonitor.sh").chmod(0o755)
-        sh(repo, "git", "config", "core.fsmonitor", str(self.tmp / "fsmonitor.sh"))
-        (repo / "a.txt").write_text("a\n")
-        pipeline.gitops.git(repo, "status", "--porcelain")
-        pipeline.gitops.commit_all(repo, "msg", "Majid", "m@x")
+        planted = clone.path / ".git"
+        planted.rmdir()
+        sh(self.tmp, "git", "init", "-q", "--bare", str(planted))
+        for name in ("pre-commit", "post-commit"):
+            (planted / "hooks" / name).write_text(f"#!/bin/sh\ntouch {marker}\n")
+            (planted / "hooks" / name).chmod(0o755)
+        sh(planted, "git", "config", "filter.x.clean", f"touch {marker}; cat")
+        (clone.path / ".gitattributes").write_text("* filter=x\n")
+        (clone.path / "a.txt").write_text("a\n")
+        gitops.git(clone, "status", "--porcelain")
+        gitops.commit_all(clone, "msg", "Majid", "m@x")
         self.assertFalse(marker.exists())
-        self.assertEqual(sh(repo, "git", "log", "-1", "--format=%an"), "Majid")
+        self.assertEqual(sh(self.tmp, "git", "--git-dir", str(clone.gitdir), "log", "-1", "--format=%an"), "Majid")
+
+    def test_a_moved_work_tree_stops_git_before_it_runs(self):
+        # The sandbox renames the clone aside and puts a new folder in its place: git must not run in it.
+        _, clone = self.clone_app()
+        clone.path.rename(clone.path.with_name("app.moved"))
+        clone.path.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "moved or replaced"):
+            gitops.git(clone, "status", "--porcelain")
+        with self.assertRaisesRegex(RuntimeError, "moved or replaced"):
+            gitops.commit_all(clone, "msg", "Majid", "m@x")
+
+    def test_a_command_that_renames_the_clone_and_plants_a_repo_never_gets_its_filter_run(self):
+        # The attack: move the clone (its read-only git dir moves with it), git init a repo in its place
+        # with a clean filter, and let ShadowDev's git add -A run. The filter must never run; the run fails.
+        workspace, clone = self.clone_app()
+        marker = self.tmp / "filter-ran"
+        attack = (
+            f"cd .. && mv app app.x && mkdir -p app/.git && cd app && git init -q . && "
+            f"git config filter.x.clean 'touch {marker}; cat' && echo '* filter=x' > .gitattributes && "
+            "echo planted > planted.txt && echo attacked"
+        )
+        repo = Repo(name="app", github="acme/app", description="the app repo", release_prefix="release/",
+                    setup=None, test=attack)
+        baseline = verify.TestRun(True, "", set(), set())
+        c = verify.Checkout("PROJ-1", repo, "main", gitops.head(clone), clone, baseline=baseline)
+        scratch = workspace.with_name(f"{workspace.name}.shadowdev")
+        with self.assertRaisesRegex(RuntimeError, "moved or replaced"):
+            verify.check(c, scratch, self.cfg)
+        self.assertFalse(marker.exists())  # the filter never ran
+        self.assertEqual(sh(self.app_origin, "git", "ls-remote", "--heads", ".", "PROJ-1"), "")
 
     def test_a_clones_git_dir_is_read_only_in_the_sandbox(self):
-        clone = self.cfg.worktree_root / "PROJ-1" / "app"
-        clone.mkdir(parents=True)
-        sh(clone, "git", "init", "-q")
+        _, clone = self.clone_app()
         ok, output = verify.run_command(
-            clone, "touch .git/hooks/pre-commit 2>&1; echo x > .git/config 2>&1; touch ok.txt && echo wrote-file",
+            clone.path, "touch .git/hooks/pre-commit 2>&1; echo x > .git/config 2>&1; touch ok.txt && echo wrote-file; "
+                        "git rev-parse --is-inside-work-tree 2>&1",
             self.cfg, "test command")
         self.assertIn("Read-only file system", output)
         self.assertIn("wrote-file", output)
-        self.assertFalse((clone / ".git" / "hooks" / "pre-commit").exists())
-        self.assertTrue((clone / "ok.txt").exists())
+        self.assertIn("true", output.splitlines()[-1])  # tools that use git see the clone
+        self.assertFalse((clone.gitdir / "hooks" / "pre-commit").exists())
+        self.assertTrue((clone.path / "ok.txt").exists())
 
     def test_a_stopped_run_writes_nothing_and_leaves_no_code(self):
         token = verify.CancelToken()

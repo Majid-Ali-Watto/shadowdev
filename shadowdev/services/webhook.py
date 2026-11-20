@@ -80,12 +80,12 @@ class WebhookService:
         self.runs = runs
         self.queue = queue
 
-    def handle(self, body: bytes, signature: str | None, project_param: str = "") -> tuple[int, str]:
-        """(HTTP status, message) for a webhook request body, its X-Hub-Signature and the
-        `project` query parameter of its URL."""
+    def handle(self, body: bytes, signature: str | None, project_id: int | None = None) -> tuple[int, str]:
+        """(HTTP status, message) for a webhook request body, its X-Hub-Signature, and the project
+        its URL names (None: the shared webhook)."""
         project = None
-        if project_param:
-            project = self.projects.get(int(project_param)) if project_param.isdigit() else None
+        if project_id is not None:
+            project = self.projects.get(project_id)
             secret = self.projects.webhook_secret(project.id) if project else None
         else:
             secret = self.cfg.webhook_secret
@@ -103,16 +103,22 @@ class WebhookService:
         if not isinstance(stamp, int) or not now - WEBHOOK_MAX_AGE_MS < stamp < now + 5 * 60 * 1000:
             return 400, "stale or missing timestamp"
         event_id = hashlib.sha256(json.dumps(
-            [project_param, payload.get("webhookEvent"), (payload.get("issue") or {}).get("key"), stamp]).encode()).hexdigest()
+            ["" if project_id is None else str(project_id), payload.get("webhookEvent"),
+             (payload.get("issue") or {}).get("key"), stamp]).encode()).hexdigest()
         if not self.runs.first_time(event_id, stamp, now - WEBHOOK_MAX_AGE_MS):
             return 200, "duplicate event"
-        match = matching_issue(payload, self.projects, self.users, project)
-        if not match:
-            return 200, "ignored"
-        key, project, user_id = match
-        # Its priority orders it among the developer's waiting runs; any other effect comes from Jira itself.
-        refusal = self.queue.submit(project, [key], user_id, automatic=True,
-                                    urgency=rules.urgency((payload.get("issue") or {}).get("fields") or {}))
+        try:
+            match = matching_issue(payload, self.projects, self.users, project)
+            if not match:
+                return 200, "ignored"
+            key, project, user_id = match
+            # Its priority orders it among the developer's waiting runs; any other effect comes from Jira itself.
+            refusal = self.queue.submit(project, [key], user_id, automatic=True,
+                                        urgency=rules.urgency((payload.get("issue") or {}).get("fields") or {}))
+        except BaseException:
+            # Not processed: Jira's retry must be, not answered as a duplicate (a concurrent copy still is).
+            self.runs.forget_event(event_id)
+            raise
         if refusal:
             return 200, refusal
         log.info("%s: queued for %s", key, project.name)

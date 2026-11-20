@@ -4,9 +4,12 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from shadowdev.automation import agent
 from shadowdev.automation.agent import ClaudeSession
 from shadowdev.clients.jira import Jira
+from tests.helpers import make_cfg
 
 
 class FakeWorkflowJira(Jira):
@@ -58,13 +61,21 @@ class MoveAlongTest(unittest.TestCase):
 class StreamingClaudeTest(unittest.TestCase):
     """ClaudeSession against a stand-in `claude` that prints stream-json events."""
 
+    def setUp(self):
+        # The stand-in claude lives in a temp folder, which the sandbox hides: these tests cover the stream
+        # handling, not the sandbox (which has its own tests in test_pipeline.py).
+        patcher = mock.patch.object(agent, "in_sandbox", lambda argv, cfg, workspace, config_dir: argv)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = make_cfg(Path(tempfile.mkdtemp()))
+
     def fake_claude(self, events):
         bin_dir = Path(tempfile.mkdtemp())
         script = bin_dir / "claude"
         lines = "\n".join(json.dumps(e) for e in events)
         script.write_text(f"#!/bin/sh\ncat > /dev/null\ncat <<'EOF'\n{lines}\nEOF\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
-        return {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        return {"PATH": f"{bin_dir}:{os.environ['PATH']}", "CLAUDE_CONFIG_DIR": str(bin_dir)}
 
     def test_logs_each_step_and_returns_the_answer(self):
         env = self.fake_claude([
@@ -83,7 +94,7 @@ class StreamingClaudeTest(unittest.TestCase):
             {"type": "result", "is_error": False, "session_id": "s-1", "num_turns": 3,
              "structured_output": {"summary": "Fixed the header."}},
         ])
-        session = ClaudeSession(Path(tempfile.mkdtemp()), env, label="MAR-9")
+        session = ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg, label="MAR-9")
         with self.assertLogs("shadowdev", "INFO") as logs:
             answer = session.ask("prompt", "Read", {"type": "object"})
         self.assertEqual(answer, {"summary": "Fixed the header."})
@@ -103,19 +114,19 @@ class StreamingClaudeTest(unittest.TestCase):
         result = json.dumps({"type": "result", "is_error": False, "session_id": "s-1", "structured_output": {}})
         script.write_text(f"#!/bin/sh\ncat > /dev/null\necho \"$@\" > {bin_dir}/args\necho '{result}'\n")
         script.chmod(script.stat().st_mode | stat.S_IEXEC)
-        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
-        ClaudeSession(Path(tempfile.mkdtemp()), env, model="sonnet", effort="medium").ask("p", "Read", {})
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "CLAUDE_CONFIG_DIR": str(bin_dir)}
+        ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg, model="sonnet", effort="medium").ask("p", "Read", {})
         self.assertIn("--model sonnet --effort medium", (bin_dir / "args").read_text())
-        ClaudeSession(Path(tempfile.mkdtemp()), env).ask("p", "Read", {})  # the account's default model
+        ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg).ask("p", "Read", {})  # the account's default model
         self.assertNotIn("--model", (bin_dir / "args").read_text())
 
     def test_errors_are_raised(self):
         env = self.fake_claude([{"type": "result", "is_error": True, "result": "Not logged in"}])
         with self.assertRaisesRegex(RuntimeError, "Not logged in"):
-            ClaudeSession(Path(tempfile.mkdtemp()), env).ask("p", "Read", {})
+            ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg).ask("p", "Read", {})
         env = self.fake_claude([{"type": "system"}])  # exits without a result
         with self.assertRaisesRegex(RuntimeError, "without a result"):
-            ClaudeSession(Path(tempfile.mkdtemp()), env).ask("p", "Read", {})
+            ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg).ask("p", "Read", {})
 
 
 if __name__ == "__main__":

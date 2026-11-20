@@ -33,6 +33,7 @@ from ..models.release import parse_rules
 from ..models.settings import Settings
 from ..models.user import MODES, Subscription, User
 from ..repositories.projects import ProjectRepository, Taken
+from ..repositories.subscriptions import SoleMember
 from ..repositories.users import UserRepository
 from .accounts import form_id
 from .errors import UserError
@@ -255,7 +256,7 @@ class ProjectService:
                             else "One of these Jira projects is already handled by another project.") from None
         if not existing:
             claude = user.claude_accounts[0].id if len(user.claude_accounts) == 1 else None
-            self.users.subscribe(user.id, Subscription(pid, jira_account.id, github_account.id, claude, "bugs", {}))
+            self.users.subscriptions.subscribe(user.id, Subscription(pid, jira_account.id, github_account.id, claude, "bugs", {}))
         self.users.record(user.id, "Edited a project" if existing else "Added a project", name)
         return pid
 
@@ -368,13 +369,22 @@ class ProjectService:
                                         [("In one of these statuses", tuple(split_list(chosen.auto_statuses)))], keys)
         if problems:
             raise UserError("Not saved:\n" + "\n".join(problems))
-        self.users.subscribe(user.id, Subscription(project.id, jira_account.id, github_account.id, claude_account.id,
-                                                   mode, bases, chosen))
+        self.users.subscriptions.subscribe(user.id, Subscription(project.id, jira_account.id, github_account.id,
+                                                                 claude_account.id, mode, bases, chosen))
         self.queue.limits_changed()  # its runs at the same time or priority may have changed
         self.users.record(user.id, "Saved the settings of a project", project.name)
 
     def leave(self, user: User, project_id: str) -> None:
+        """Leave a project. Its owner hands it on, in the same step, to its longest-standing other
+        member, who is told; an owner with nobody else in it is refused, and deletes it instead: a
+        former member must not keep the right to change what the others' runs execute."""
         project = self.visible_project(user, project_id)
+        try:
+            heir = self.users.subscriptions.leave(user.id, project.id)
+        except SoleMember:
+            raise UserError(f"You are the only member of {project.name}, so you can't leave it: delete the "
+                            "project instead.") from None
         self.queue.stop_runs(user.id, {project.id})
-        self.users.unsubscribe(user.id, project.id)
         self.users.record(user.id, "Left a project", project.name)
+        if heir:
+            self.users.record(heir, "Became the owner of a project", project.name)

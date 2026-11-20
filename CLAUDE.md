@@ -19,7 +19,7 @@ The Makefile has short names for these (`make` lists them): `make up`/`upd`/`dow
 
 ```bash
 .venv/bin/python -m unittest            # all tests (~25 s); needs git, bwrap, prlimit on PATH
-.venv/bin/python -m unittest tests.test_server.WebTest.test_stop_button   # one test
+.venv/bin/python -m unittest tests.test_server_runs.RunsWebTest.test_stop_button   # one test
 uv run ruff check                       # lint (config in pyproject.toml); `--fix` sorts imports and the like
 .venv/bin/python -m shadowdev           # the server (needs .env, bwrap, claude)
 .venv/bin/python -m shadowdev --reload  # the same, restarted whenever shadowdev/ or .env changes (development)
@@ -47,7 +47,8 @@ app.py builds everything (build_app); server.py dispatches to routes.ROUTES[(met
 - **services/** hold the rules. They take plain values (never a form or headers) and raise
   `services.errors.UserError` for anything the developer should see. Other exceptions are bugs.
 - **repositories/** hold all SQL. One `Database` (connections, schema, versions, Fernet), and
-  `UserRepository` (developers, their accounts, subscriptions), `ProjectRepository`,
+  `UserRepository` (developers and their accounts; `users.subscriptions` is a `SubscriptionRepository`, the
+  projects they joined), `ProjectRepository`,
   `SessionRepository`, `RunRepository` (runs, webhook events) on top of it. Open a new connection per
   call (`with closing(self.db.connect()) as conn, conn:`); the web threads and run workers share it.
 - **models/**: `User` holds its `JiraAccount`s (with `Site`s), `GitHubAccount`s, `ClaudeAccount`s
@@ -59,7 +60,8 @@ app.py builds everything (build_app); server.py dispatches to routes.ROUTES[(met
   that its answers are usable, `verify.py` runs setup/test commands and compares them with the
   base-branch baseline, `agent.py` runs the `claude` CLI, `limits.py` holds runs the Claude account's usage limits would
   cut off and waits for their reset, `sandbox.py` builds the bwrap command,
-  `gitops.py` runs git.
+  `gitops.py` runs git (every command names its git dir and work tree), `workspace.py` holds a run's
+  folders and the self-heal loop that pipeline and review share.
 
 - **views/static/**: the signed-in pages work as one app. `app.js` loads links between them and their
   forms with fetch and swaps `<main data-app>`; every other script registers with `ShadowDev.mount(fn)`,
@@ -105,12 +107,12 @@ Keep to these boundaries when adding code; docs/ARCHITECTURE.md "Adding things" 
     developer or a Jira account is removed, and when the key is rotated.
   - A run's log and the activity list are shown only to their own developer. Activity never holds a
     secret or Jira account data; run logs are deleted when one of the developer's Jira accounts goes.
-  - Routes anyone can call without signing in are rate limited (`routes/ratelimit.LIMITS`).
+  - Routes anyone can call without signing in are rate limited (each `Route` in `routes.ROUTES` gives its `limit`; `routes.LIMITS` is derived from them).
   - Every HTML value goes through `views.components.esc`. Notices are fixed strings looked up by key.
   - Pages run no script but `views/static/*.js` inlined by `components.script` with the CSP nonce: no inline
     handlers (`onclick=`), no other script sources. Images are only `data:` URIs (`components.LOGO`).
   - Webhooks need a valid HMAC signature and a fresh timestamp, and are accepted only once.
-  - A run's code is deleted when it ends (`pipeline.remove_code`); only a dry run keeps its change.
+  - A run's code is deleted when it ends (`workspace.remove_code`); only a dry run keeps its change.
     A run waiting for a Claude limit to reset has not ended; it waits at most `limits.RESETS_SOON`.
     Its transcript is deleted from every Claude config dir it may have used (`agent.config_dirs`).
   - A run uses another Claude account than its subscription's only with `Settings.switch_claude`
@@ -158,7 +160,7 @@ Keep to these boundaries when adding code; docs/ARCHITECTURE.md "Adding things" 
 ## Tests
 
 - `tests/test_pipeline.py` runs the real pipeline against local bare git repos with Claude, Jira
-  and GitHub faked; `test_server.py` drives the real HTTP server; `test_store.py` covers the repositories.
+  and GitHub faked; `test_server_*.py` (on `server_base.py`) drive the real HTTP server; `test_store.py` covers the repositories.
 - `tests/helpers.py` builds a config, developers with accounts (`add_developer`), projects
   (`add_project`) and subscriptions (`join`) in a real database.
 - Mocks patch names **where they are used**, so moving a function means updating the patch target:

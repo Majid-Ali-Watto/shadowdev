@@ -16,13 +16,15 @@ change, and the merge is pushed: never a rebase, so nothing anyone pushed is rew
 review_pr: the developer was asked in Slack to review a colleague's PR. Claude reads the diff
 and the code (read-only); its findings are posted as a review with comments, or the PR is
 approved, and the Slack thread is told. A PR someone approved already, or that another reviewer
-has commented on, is left alone: it is reviewed, or being reviewed, by them.
+has commented on, is left alone: it is reviewed, or being reviewed, by them. Every approval and
+review names the head commit it was made on, so a push after it is not approved with it.
 
-Like any run, both work in their own folders, which are deleted when they end.
+Like any run, both work in their own folders, which are deleted when they end (workspace.py).
 """
 import logging
 import re
 import time
+from collections.abc import Callable
 
 from ..clients.github import GitHub
 from ..clients.rest import HTTPError
@@ -33,23 +35,25 @@ from ..models.user import Actor
 from . import gitops, guidance
 from .agent import EDIT_TOOLS, MODELS, READ_ONLY_TOOLS, ClaudeSession, claude_envs, config_dirs
 from .cancel import NEVER, CancelToken
-from .pipeline import ask_for_review, escalating, heal, model_name, run_folders
+from .pipeline import ask_for_review
 from .prompts import (
     CHANGE_SCHEMA,
     REVIEW_SCHEMA,
     ask_usable,
     ci_prompt,
     conflict_prompt,
-    fix_problem,
+    fenced,
+    fix_check,
     fix_prompt,
     fix_schema,
     markers_left,
-    review_problem,
+    review_check,
     review_prompt,
-    summary_problem,
+    summary_check,
 )
 from .timing import Timings
 from .verify import Checkout
+from .workspace import escalating, heal, model_name, run_folders
 
 log = logging.getLogger("shadowdev")
 
@@ -106,6 +110,15 @@ def reviewed_by_others(pr: dict, reviews: list[dict], threads: list[dict], login
     return f"{others[0]} is already reviewing it" if others else None
 
 
+def _session(workspace, envs: list[dict], label: str, cfg: Config, cancel: CancelToken, on_model: Callable[[str], None],
+             model: str | None = None, effort: str | None = None) -> tuple[ClaudeSession, Callable[[], bool]]:
+    """The Claude session that changes a PR's code (standard model to start with, escalating when it can't
+    do a change) and its stronger() escalation, as heal() takes it."""
+    claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
+                           spares=envs[1:])
+    return claude, escalating(claude, on_model, label)
+
+
 def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] | None, project: Project, actor: Actor,
                    cfg: Config, github: GitHub, cancel: CancelToken = NEVER, on_model=lambda models: None,
                    later=None) -> tuple[str, str]:
@@ -128,19 +141,16 @@ def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] 
         log.info("%s: %d review thread(s) to address for %s", label, len(threads), actor.display_name)
         envs = claude_envs(cfg, actor)
         token = actor.github.token
-        with run_folders(cfg, project, f"fix-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
+        with run_folders(cfg, project, f"fix-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch, gits):
             worktree = workspace / repo.name
             with timings.step(f"clone {repo.name}"):
-                commit = gitops.clone(repo.github, branch, worktree, token)
-            checkout = Checkout(label, repo, branch, commit, worktree, cancel=cancel)
+                clone = gitops.clone(repo.github, branch, worktree, gits / repo.name, token)
+            checkout = Checkout(label, repo, branch, gitops.head(clone), clone, cancel=cancel)
             model, effort = MODELS["standard"]
-            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
-                                   spares=envs[1:])
-            stronger = escalating(claude, on_model, label)
+            claude, stronger = _session(workspace, envs, label, cfg, cancel, on_model, model, effort)
             with timings.step("Claude change"):
-                result = ask_usable(claude, fix_prompt(repo, number, threads, guidance.find(worktree, repo.name)), EDIT_TOOLS,
-                                    fix_schema(threads),
-                                    lambda r: fix_problem(r, threads), "summary")
+                result = ask_usable(claude, fix_prompt(repo, number, threads, guidance.find(clone, repo.name)), EDIT_TOOLS,
+                                    fix_schema(threads), fix_check(threads), "summary")
             answers = {t["id"]: t for t in result["threads"]}
             to_ship, summary, failures = heal(claude, [checkout], scratch, cfg, label, timings, cancel, result["summary"],
                                               stronger)
@@ -151,13 +161,16 @@ def address_review(repo: Repo, number: int, branch: str, slack: tuple[str, str] 
             cancel.check()
             if to_ship:
                 with timings.step("commit and push"):
-                    gitops.commit_all(worktree, f"Address review comments\n\n{summary}", actor.github.git_name,
+                    gitops.commit_all(clone, f"Address review comments\n\n{summary}", actor.github.git_name,
                                       actor.github.git_email)
-                    gitops.push(worktree, repo.github, branch, token)
+                    gitops.push(clone, repo.github, branch, token)
                 log.info("%s: review fixes pushed to %s", label, branch)
             with timings.step("answer and resolve threads"):
                 for thread in threads:
-                    answer = answers[thread["id"]]
+                    answer = answers.get(thread["id"])
+                    if answer is None:  # not answered by Claude: left as it is, neither answered nor resolved
+                        log.warning("%s: no answer for review thread %s", label, thread["id"])
+                        continue
                     try:
                         github.reply_to_thread(thread["id"], answer["reply"].strip() or summary)
                         if to_ship and answer["addressed"]:
@@ -202,7 +215,7 @@ def ci_output(github: GitHub, owner_repo: str, check: dict, label: str) -> str:
             text = LOG_NOISE_RE.sub("", github.job_log(owner_repo, check["job"], MAX_LOG_BYTES))
         except HTTPError as e:  # e.g. a token without Actions read access: the summary will do
             log.warning("%s: could not read the log of %s: %s", label, check["name"], e)
-    return f'<ci_check name="{check["name"]}">\n{text[-MAX_LOG_CHARS:] or "(no output)"}\n</ci_check>'
+    return fenced("ci_check", text[-MAX_LOG_CHARS:] or "(no output)", name=check["name"])
 
 
 def fix_ci(repo: Repo, number: int, branch: str, sha: str, project: Project, actor: Actor, cfg: Config, github: GitHub,
@@ -233,22 +246,20 @@ def fix_ci(repo: Repo, number: int, branch: str, sha: str, project: Project, act
                     raise
                 diff = "(too large to show: read the changed files)"
         envs = claude_envs(cfg, actor)
-        with run_folders(cfg, project, f"ci-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
+        with run_folders(cfg, project, f"ci-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch, gits):
             worktree = workspace / repo.name
             with timings.step(f"clone {repo.name}"):
-                commit = gitops.clone(repo.github, branch, worktree, actor.github.token)
+                clone = gitops.clone(repo.github, branch, worktree, gits / repo.name, actor.github.token)
+            commit = gitops.head(clone)
             if commit != sha:
                 outcome = "skipped"
                 return outcome, f"new commits were pushed to {url} since its CI failed; their CI is checked in turn"
-            checkout = Checkout(label, repo, branch, commit, worktree, cancel=cancel)
+            checkout = Checkout(label, repo, branch, commit, clone, cancel=cancel)
             model, effort = MODELS["standard"]
-            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
-                                   spares=envs[1:])
-            stronger = escalating(claude, on_model, label)
+            claude, stronger = _session(workspace, envs, label, cfg, cancel, on_model, model, effort)
             with timings.step("Claude change"):
-                summary = ask_usable(claude, ci_prompt(repo, pr, diff, [failures], guidance.find(worktree, repo.name)),
-                                     EDIT_TOOLS, CHANGE_SCHEMA,
-                                     summary_problem, "summary")["summary"]
+                summary = ask_usable(claude, ci_prompt(repo, pr, diff, [failures], guidance.find(clone, repo.name)),
+                                     EDIT_TOOLS, CHANGE_SCHEMA, summary_check, "summary")["summary"]
             to_ship, summary, left = heal(claude, [checkout], scratch, cfg, label, timings, cancel, summary, stronger)
             if left:
                 github.comment(repo.github, number, f"CI failed ({names}). I worked on a fix, but it doesn't pass the "
@@ -260,9 +271,9 @@ def fix_ci(repo: Repo, number: int, branch: str, sha: str, project: Project, act
                 github.comment(repo.github, number, f"CI failed ({names}). I looked into it and changed nothing: {summary}")
                 return outcome, f"looked into the failing CI of {url}; no code change: it needs a human"
             with timings.step("commit and push"):
-                gitops.commit_all(worktree, f"Fix failing CI checks\n\n{summary}", actor.github.git_name,
+                gitops.commit_all(clone, f"Fix failing CI checks\n\n{summary}", actor.github.git_name,
                                   actor.github.git_email)
-                gitops.push(worktree, repo.github, branch, actor.github.token)
+                gitops.push(clone, repo.github, branch, actor.github.token)
             log.info("%s: CI fix pushed to %s", label, branch)
             github.comment(repo.github, number, f"CI failed ({names}). Pushed a fix: {summary}")
             return outcome, f"fix for the failing CI pushed to {url}"
@@ -286,24 +297,22 @@ def fix_conflicts(repo: Repo, number: int, branch: str, project: Project, actor:
         outcome, base = "failed", pr["base"]["ref"]
         envs = claude_envs(cfg, actor)
         token, who = actor.github.token, (actor.github.git_name, actor.github.git_email)
-        with run_folders(cfg, project, f"merge-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
+        with run_folders(cfg, project, f"merge-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch, gits):
             worktree = workspace / repo.name
             with timings.step(f"clone {repo.name} and merge {base}"):
-                gitops.clone(repo.github, branch, worktree, token, shallow=False)
-                base_commit, files = gitops.start_merge(worktree, repo.github, base, token, *who)
+                clone = gitops.clone(repo.github, branch, worktree, gits / repo.name, token, shallow=False)
+                base_commit, files = gitops.start_merge(clone, repo.github, base, token, *who)
             log.info("%s: %s merged in; %d file(s) in conflict for %s", label, base, len(files), actor.display_name)
             # Tested like a change cut from the new base: only failures that base doesn't have count.
-            checkout = Checkout(label, repo, base, base_commit, worktree, cancel=cancel)
+            checkout = Checkout(label, repo, base, base_commit, clone, cancel=cancel)
             model, effort = MODELS["standard"]
-            claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, model=model, effort=effort,
-                                   spares=envs[1:])
-            stronger = escalating(claude, on_model, label)
+            claude, stronger = _session(workspace, envs, label, cfg, cancel, on_model, model, effort)
             summary = ""
             if files:
                 with timings.step("Claude resolves conflicts"):
-                    summary = ask_usable(claude, conflict_prompt(repo, pr, base, files, guidance.find(worktree, repo.name)),
+                    summary = ask_usable(claude, conflict_prompt(repo, pr, base, files, guidance.find(clone, repo.name)),
                                          EDIT_TOOLS, CHANGE_SCHEMA,
-                                         lambda r: summary_problem(r) or markers_left(worktree, files), "summary")["summary"]
+                                         lambda r: _conflict_check(r, markers_left(worktree, files)), "summary")["summary"]
             to_ship, summary, left = heal(claude, [checkout], scratch, cfg, label, timings, cancel, summary, stronger)
             if left:
                 github.comment(repo.github, number, f"This conflicts with {base} now. I merged {base} in and worked on "
@@ -315,8 +324,8 @@ def fix_conflicts(repo: Repo, number: int, branch: str, project: Project, actor:
                 outcome = "skipped"
                 return outcome, f"{url} already has everything of {base}"
             with timings.step("commit and push"):
-                gitops.commit_all(worktree, f"Merge {base} into {branch}" + (f"\n\n{summary}" if summary else ""), *who)
-                gitops.push(worktree, repo.github, branch, token)
+                gitops.commit_all(clone, f"Merge {base} into {branch}" + (f"\n\n{summary}" if summary else ""), *who)
+                gitops.push(clone, repo.github, branch, token)
             log.info("%s: %s merged into %s and pushed", label, base, branch)
             outcome = "done"
             resolved = f" and resolved the conflicts in {', '.join(files)}: {summary}" if files else "."
@@ -326,11 +335,17 @@ def fix_conflicts(repo: Repo, number: int, branch: str, project: Project, actor:
         timings.report(outcome)
 
 
+def _conflict_check(result: dict, markers: str | None) -> tuple[dict, str | None]:
+    """A conflict resolution's summary, and that no conflict marker is left in the files."""
+    cleaned, problem = summary_check(result)
+    return cleaned, problem or markers
+
+
 def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project, actor: Actor, cfg: Config,
               github: GitHub, cancel: CancelToken = NEVER, on_model=lambda models: None) -> tuple[str, str, str]:
     """`thread`: (channel, timestamp) of the Slack message that asked; ShadowDev answers there, as
     the developer. Returns (status, message, what became of the request: commented, approved,
-    or closed when there is nothing to review)."""
+    or closed when there is nothing to review, or the PR changed while it was read)."""
     label = f"{repo.github}#{number}"
     timings = Timings(label)
     outcome = "failed"
@@ -346,7 +361,7 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
 
     try:
         pr = github.pr(repo.github, number)
-        url = pr["html_url"]
+        url, sha = pr["html_url"], pr["head"]["sha"]  # the head commit this review is about
         refusal = ("it is closed" if pr["state"] != "open"
                    else "it is your own" if pr["user"]["login"].lower() == actor.github.login.lower()
                    else "it comes from a fork" if ((pr["head"].get("repo") or {}).get("full_name") or "").lower() != repo.github.lower()
@@ -363,7 +378,7 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
             # Between branches the developer chose: approval only. Nothing is said in Slack; the
             # message that asked gets its tick (services/reviews).
             cancel.check()
-            github.create_review(repo.github, number, "APPROVE", "")
+            github.create_review(repo.github, number, "APPROVE", "", commit_id=sha)
             outcome = "done"
             log.info("%s: approved for %s without a review (%s into %s)", label, actor.display_name, head, base)
             return outcome, f"approved {url} without a review: {head} into {base} needs approval only", "approved"
@@ -372,41 +387,43 @@ def review_pr(repo: Repo, number: int, thread: tuple[str, str], project: Project
         with timings.step("diff"):
             diff = cut_diff(github.pr_diff(repo.github, number))
         envs = claude_envs(cfg, actor)
-        with run_folders(cfg, project, f"review-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch):
+        with run_folders(cfg, project, f"review-{repo.name}-{number}", config_dirs(envs)) as (workspace, scratch, gits):
             with timings.step(f"clone {repo.name}"):
-                gitops.clone(repo.github, pr["head"]["ref"], workspace / repo.name, actor.github.token)
+                clone = gitops.clone(repo.github, head, workspace / repo.name, gits / repo.name, actor.github.token)
+            if gitops.head(clone) != sha:  # the branch moved on since the diff was read: that is not what is reviewed
+                outcome = "skipped"
+                return outcome, f"{url} was updated while it was read; not reviewed", "closed"
             with timings.step("instructions from the base branch"):
                 # The repository's instructions for AI tools, as on the base branch: the PR can't
                 # change how it is judged. Cloned outside the workspace; only those files are copied in.
-                base = scratch / "base" / repo.name
-                base.parent.mkdir(parents=True, exist_ok=True)
-                gitops.clone(repo.github, pr["base"]["ref"], base, actor.github.token)
-                guides = guidance.find(base, f"{guidance.COPY_DIR}/{repo.name}")
-                guidance.copy_into(guides, base, workspace)
+                base_clone = gitops.clone(repo.github, base, scratch / "base" / repo.name, gits / f"base-{repo.name}",
+                                          actor.github.token)
+                guides = guidance.find(base_clone, f"{guidance.COPY_DIR}/{repo.name}")
+                guidance.copy_into(guides, base_clone.path, workspace)
             claude = ClaudeSession(workspace, envs[0], label=label, cfg=cfg, cancel=cancel, spares=envs[1:])
             on_model(model_name(None, None))
             with timings.step("Claude review"):
                 result = ask_usable(claude, review_prompt(repo, pr, diff, threads, guides), READ_ONLY_TOOLS, REVIEW_SCHEMA,
-                                    review_problem, "review")
+                                    review_check, "review")
         cancel.check()
         outcome = "done"
         if result["verdict"] == "approve" and actor.settings.review_approve:
-            github.create_review(repo.github, number, "APPROVE", result["summary"])
+            github.create_review(repo.github, number, "APPROVE", result["summary"], commit_id=sha)
             say(f"Approved {link(url, f'PR {number}')} ✅")
             return outcome, f"approved {url}", "approved"
         if result["verdict"] == "approve":  # the developer approves themselves: say only that nothing must change
-            github.create_review(repo.github, number, "COMMENT", f"Nothing that must change. {result['summary']}")
+            github.create_review(repo.github, number, "COMMENT", f"Nothing that must change. {result['summary']}", commit_id=sha)
             say(f"Reviewed {link(url, f'PR {number}')}, nothing blocking")
             return outcome, f"reviewed {url}: nothing to change; not approved, as chosen", "approved"
         comments = result["comments"]
         try:
-            github.create_review(repo.github, number, "COMMENT", result["summary"], comments)
+            github.create_review(repo.github, number, "COMMENT", result["summary"], comments, commit_id=sha)
         except HTTPError as e:
             if e.status != 422:
                 raise
             # A comment was not on a line of the diff: GitHub refuses the whole review. Post them as text.
             listed = "\n".join(f"- `{c['path']}:{c['line']}` {c['body']}" for c in comments)
-            github.create_review(repo.github, number, "COMMENT", f"{result['summary']}\n\n{listed}")
+            github.create_review(repo.github, number, "COMMENT", f"{result['summary']}\n\n{listed}", commit_id=sha)
         say(f"Comments added on {link(url, f'PR {number}')} ({len(comments)})")
         return outcome, f"{len(comments)} review comment(s) on {url}", "commented"
     finally:

@@ -82,13 +82,13 @@ def _kind(source: str) -> str | None:
     return next((kind for pattern, kind in GUIDES if matches(source, pattern)), None)
 
 
-def find(root: Path, prefix: str) -> list[Entry]:
-    """The instruction files committed in the clone at `root`, for Claude to read at `prefix/<path>`
-    (the clone's folder in the workspace): the ones for all work first, in ALWAYS order."""
+def find(clone: gitops.Clone, prefix: str) -> list[Entry]:
+    """The instruction files committed in `clone`, for Claude to read at `prefix/<path>` (the clone's
+    folder in the workspace): the ones for all work first, in ALWAYS order."""
     entries = []
-    for source in gitops.git(root, "ls-files", "-z").split("\0"):
+    for source in gitops.git(clone, "ls-files", "-z").split("\0"):
         kind = _kind(source) if source else None
-        file = root / source
+        file = clone.path / source
         if not kind or file.is_symlink() or not file.is_file() or file.stat().st_size > MAX_FILE_BYTES:
             continue
         text = file.read_text(errors="replace")

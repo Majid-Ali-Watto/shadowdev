@@ -5,16 +5,24 @@
 // the button that goes ahead (red with data-confirm-danger); see views/components.confirm.
 // Each part of a page has its script register with ShadowDev.mount(fn): fn runs now and after every
 // swap, and what it returns (a function) is called before the next swap, to stop its timers, streams and
-// listeners on document. Without scripts every link and form works as a plain one; pages outside the app
-// (signing in, Atlassian) and forms marked data-reload load in full.
+// listeners on document. A part whose fn throws is reported and dropped: it does not run again on this page.
+// Without scripts every link and form works as a plain one; pages outside the app (signing in, Atlassian)
+// and forms marked data-reload load in full.
 (() => {
-  const mounts = [];
+  const mounts = new Set();  // the parts of the page: one entry per mount call, for as long as the page is loaded
   let cleanups = [];
+  // Runs a part; false when it threw, so that it is dropped.
   const start = fn => {
-    const stop = fn();
-    if (typeof stop === "function") cleanups.push(stop);
+    try {
+      const stop = fn();
+      if (typeof stop === "function") cleanups.push(stop);
+      return true;
+    } catch (e) {
+      console.error(e);
+      return false;
+    }
   };
-  window.ShadowDev = { mount(fn) { mounts.push(fn); start(fn); } };
+  window.ShadowDev = { mount(fn) { mounts.add(fn); if (!start(fn)) mounts.delete(fn); } };
 
   const main = document.querySelector("main");
   if (!main || !main.hasAttribute("data-app")) return;
@@ -71,7 +79,7 @@
     document.title = doc.title;
     main.replaceChildren(...next.childNodes);
     if (address) history[push ? "pushState" : "replaceState"](null, "", address);
-    mounts.forEach(start);
+    for (const fn of [...mounts]) if (!start(fn)) mounts.delete(fn);  // a part that throws is dropped
     return true;
   };
 

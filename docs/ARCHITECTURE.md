@@ -13,13 +13,15 @@ ShadowDev/
 │   ├── reload.py          --reload: the server in a child process, restarted when ShadowDev's files or .env change
 │   ├── config.py          .env settings
 │   ├── app.py             wires repositories and services together
+│   ├── dryrun.py          python -m shadowdev dry-run: a made-up issue, no Jira or GitHub (picks the developer and project itself)
 │   ├── server.py          HTTP server: dispatches each request to its route; stops gracefully on SIGTERM
 │   ├── logfiles.py        data/logs/: a private log file per day, kept 5 days
 │   ├── models/            plain dataclasses: User and its accounts and Limits, Subscription and its Settings, Actor, Project/Repo, Issue, Tokens, status rules (release.py), run search (run.py), the Overview (overview.py)
 │   ├── repositories/      SQLite, one class per table group
 │   │   ├── database.py    schema, connections, token encryption, key rotation, backups
 │   │   ├── migrations.py  upgrading a v1 database (and its projects/*.toml) in one transaction
-│   │   ├── users.py       developers, their Jira/GitHub/Claude accounts (encrypted), subscriptions, activity
+│   │   ├── users.py       developers, their Jira/GitHub/Claude/Slack accounts (encrypted), activity
+│   │   ├── subscriptions.py  the projects a developer joined (users.subscriptions): their accounts, settings, leaving
 │   │   ├── projects.py    projects: Jira site and keys, repos, workflow, webhook secret
 │   │   ├── sessions.py    web sessions (hashed)
 │   │   ├── runs.py        run history shown on the page (with each run's log and cost), accepted webhook events
@@ -29,14 +31,16 @@ ShadowDev/
 │   │   ├── accounts.py    sign-in, connect/remove Jira, GitHub and Claude accounts, pause, delete
 │   │   ├── projects.py    add/edit/delete projects, join/leave them
 │   │   ├── runs.py        run issues by hand, stop a run
-│   │   ├── run_queue.py   the pool of parallel runs, developers taking turns
+│   │   ├── run_queue.py   the pool of parallel runs: a Job per issue or group of issues, what ends each one
+│   │   ├── fair_queue.py  the waiting line of the runs: developers taking turns, each project's lanes
 │   │   ├── overview.py    what the Overview tab shows: runs needing the developer, numbers, PRs, Claude usage, held work
 │   │   ├── webhook.py     Jira webhook: signature, replay protection, matching the developer
 │   │   ├── privacy.py     Atlassian's personal data reporting: erase closed accounts, refresh changed ones
 │   │   ├── poller.py      Poll Jira (Settings): ask Jira for new assignments, each developer at their interval
 │   │   ├── releases.py    move complete tickets by the project's status rules, tell the developer in Slack what others miss
 │   │   ├── outbox.py      once a developer's working hours begin: open the PRs, post the replies and comments that waited
-│   │   └── reviews.py     at each developer's interval: review comments and CI on its PRs (GitHub), review requests (Slack)
+│   │   ├── reviews.py     at each developer's interval: review comments and CI on its PRs (GitHub), review requests (Slack)
+│   │   └── review_requests.py  what a Slack message asks: who is asked to review which PRs (pure parsing, no I/O)
 │   ├── routes/            HTTP only: parse the request, call a service, respond
 │   │   ├── request.py     Request helpers, security headers, the signed-in form guard
 │   │   ├── ratelimit.py   requests per client and minute, on the routes open to anyone
@@ -71,11 +75,11 @@ ShadowDev/
 │       ├── agent.py       headless Claude Code session, as the developer
 │       ├── limits.py      the Claude account's usage limits: holding runs, waiting for a reset
 │       ├── rules.py       release branches, fix versions, urgency by Jira priority
-│       ├── gitops.py      git as the developer: list branches, clone, commit, push
+│       ├── gitops.py      git as the developer: list branches, clone, commit, push (each command names its git dir, kept outside the sandbox)
+│       ├── workspace.py   a run's folders: clones, their git dirs, scratch; removing them; the self-heal loop
 │       ├── sandbox.py     bubblewrap sandbox for setup/test commands
 │       ├── cancel.py      stopping a run
-│       ├── runlog.py      what a run logged and what Claude reported it cost, kept with the run
-│       └── dryrun.py      python -m shadowdev dry-run: a made-up issue, no Jira or GitHub
+│       └── runlog.py      what a run logged and what Claude reported it cost, kept with the run
 ├── deploy/              the service on each system: service.sh (make service, make docker-service), the systemd unit, the Docker settings (deploy/README.md)
 ├── tests/
 ├── Makefile           short names for the commands: `make` lists them
@@ -143,13 +147,14 @@ the project and the developer afresh and calls `automation.pipeline.process_issu
 - **A setting**: a field on `Config` in `config.py`, read in `Config.from_env`, and a line in
   `.env.example`.
 - **A pipeline step**: `automation/pipeline.py` for the order of steps, `prompts.py` for what Claude
-  is asked, `verify.py` for anything that runs commands.
+  is asked, `verify.py` for anything that runs commands, `workspace.py` for a run's folders and the
+  self-heal loop (shared with reviews), `gitops.py` for git, `sandbox.py` for what runs in the sandbox.
 
 ## Tests
 
 ```bash
 make test                # .venv/bin/python -m unittest
-make test T=tests.test_server.WebTest.test_stop_button   # one test
+make test T=tests.test_server_runs.RunsWebTest.test_stop_button   # one test
 ```
 
 - `tests/test_pipeline.py` runs the whole pipeline against real local git repos, with the commands
@@ -157,8 +162,9 @@ make test T=tests.test_server.WebTest.test_stop_button   # one test
   developer's base branch and identity, the base-branch baseline, the self-heal retry, the give-up
   path, push permissions, repeat webhooks, untested repos, the default-branch fallback, and that
   commands can't see ShadowDev's secrets or change the code that is committed.
-- `tests/test_server.py` drives the real HTTP server through Jira OAuth sign-in, connecting
-  personal and office accounts, adding, joining and editing projects, and covers the state check,
+- `tests/test_server_*.py` (auth, pages, projects, runs, settings, webhook; shared setup in
+  `tests/server_base.py`) drive the real HTTP server through Jira OAuth sign-in, connecting
+  personal and office accounts, adding, joining and editing projects, and cover the state check,
   CSRF and Origin checks, webhook routing to projects, sites and developers, per-project webhook
   secrets, the run queue (parallel runs, turns, restarts, stopping, pausing, limits, graceful
   shutdown), run logs and costs, rate limits, /health, token warnings, recent activity, and config.
@@ -170,3 +176,7 @@ make test T=tests.test_server.WebTest.test_stop_button   # one test
 - `tests/test_rules.py` covers release branches, fix versions, urgency and issue types.
 - `tests/test_releases.py` covers the status rules: their checks (root cause on bugs only), moving
   complete tickets, the Slack message for incomplete ones, the schedule, and **Check now**.
+- `tests/test_rest.py` serves local HTTP: a redirect is never followed (so the token stays with its host), and a
+  body over the cap is refused. `tests/test_membership.py` covers leaving a project (ownership handed on, or refused
+  for the only member). `tests/test_run_queue.py` covers what ends a run's job and a job that never started.
+  `tests/test_review_requests.py` covers the Slack asks, and that a long message is matched in bounded time.

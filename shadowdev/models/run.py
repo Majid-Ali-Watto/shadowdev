@@ -50,8 +50,9 @@ class RunFilter:
     @classmethod
     def of(cls, text: str = "", status: str = "", project: str = "", kind: str = "", page: str = "") -> "RunFilter":
         """From what the address says; anything unknown is left out rather than refused."""
+        number = int(page) if len(page) < 6 and page.isascii() and page.isdigit() else 0  # isdigit() alone takes "²"
         return cls(text.strip()[:MAX_SEARCH], status if status in STATUSES else "", project.strip()[:200],
-                   kind if kind in KINDS else "", int(page) if page.isdigit() and 0 < int(page) < 10_000 else 1)
+                   kind if kind in KINDS else "", number if 0 < number < 10_000 else 1)
 
     def query(self, **changes) -> str:
         """This filter (with `changes`) as the query of the Recent runs tab's address, without the defaults."""

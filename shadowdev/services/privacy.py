@@ -50,8 +50,10 @@ class PrivacyReporter:
                 continue  # revoked or gone: the next account's token
 
     def report_due(self, now: float | None = None) -> float:
-        """Report every account not reported for a cycle, 90 at a time, and act on the answers.
-        Returns the seconds to wait before the next pass."""
+        """Report every account not reported for a cycle, 90 at a time, and act on the answers. An
+        account is marked reported only once its answer was acted on: one whose action failed is due
+        again on the next pass, and the others of its batch are not held up by it. Returns the seconds
+        to wait before the next pass."""
         now = now or time.time()
         while batch := self.users.accounts_to_report(now - self.cycle, MAX_REPORTED_ACCOUNTS):
             for token in self._tokens():
@@ -63,25 +65,35 @@ class PrivacyReporter:
                         continue
                     if e.status in (429, 503):
                         retry = e.retry_after or ""
-                        return float(retry) if retry.isdigit() else PASS_SECONDS
+                        return float(retry) if retry.isascii() and retry.isdigit() else PASS_SECONDS
                     raise
             else:
                 log.warning("personal data reporting: no stored Atlassian token was accepted; %d account(s) due", len(batch))
                 return PASS_SECONDS
             if cycle:
                 self.cycle = cycle
-            self.users.mark_reported([jira_id for jira_id, _, _ in batch], now)
-            for item in actions:
-                self._act(str(item.get("accountId") or ""), item.get("status"))
-            log.info("personal data reporting: %d account(s) reported, %d to act on", len(batch), len(actions))
+            statuses = {str(item.get("accountId") or ""): item.get("status") for item in actions}
+            handled = [jira_id for jira_id, account_id, _ in batch if self._act(account_id, statuses.get(account_id))]
+            self.users.mark_reported(handled, now)
+            log.info("personal data reporting: %d account(s) reported, %d to act on, %d done", len(batch),
+                     len(statuses), len(handled))
+            if not handled:  # the same accounts would be due again at once: the next pass tries them
+                break
         return PASS_SECONDS
 
-    def _act(self, account_id: str, status: str | None) -> None:
-        if status == "closed":
-            log.info("personal data reporting: Atlassian account %s was closed; erasing its data", account_id)
-            self.accounts.erase_closed_jira(account_id)
-        elif status == "updated":
-            try:
+    def _act(self, account_id: str, status: str | None) -> bool:
+        """Erase a closed account's data, or fetch an updated one's name and email again. True when
+        there is nothing (more) to do; False when it failed, so the account is due again."""
+        try:
+            if status == "closed":
+                log.info("personal data reporting: Atlassian account %s was closed; erasing its data", account_id)
+                self.accounts.erase_closed_jira(account_id)
+            elif status == "updated":
                 self.accounts.refresh_jira_profile(account_id)
-            except Exception as e:  # e.g. its access was revoked; reported again next cycle
-                log.warning("personal data reporting: could not refresh %s: %s", account_id, e)
+        except (HTTPError, JiraAccessLost) as e:  # e.g. its access was revoked
+            log.warning("personal data reporting: could not act on Atlassian account %s (%s): %s", account_id, status, e)
+            return False
+        except Exception:
+            log.exception("personal data reporting: could not act on Atlassian account %s (%s); due again", account_id, status)
+            return False
+        return True

@@ -9,6 +9,7 @@ from ..models.project import Repo
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+-[0-9]+\Z")
 ISSUE_KEYS_RE = re.compile(r"[A-Z][A-Z0-9_]+-[0-9]+")  # each key in a run's branch name, MAR-1_MAR-2
 MAX_KEYS = 50  # issues in one request, ranges expanded
+MAX_NOTE_CHARS = 2000  # a developer's note for a run they start by hand
 _KEY = r"[A-Z][A-Z0-9_]+-[0-9]+"
 # A run's branch: its keys joined by "_", three or more consecutive ones as a range: MAR-1-to-MAR-10_MAR-14.
 BRANCH_SEGMENT_RE = re.compile(rf"({_KEY})(?:-to-({_KEY}))?")
@@ -111,7 +112,7 @@ def branch_keys(branch: str) -> list[str] | None:
             return None
     return keys
 
-MAX_NOTE_CHARS = 2000  # a developer's note for a run they start by hand
+
 NOTE_KEY_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_]+-[0-9]+)\s*:\s*")
 
 
@@ -212,7 +213,6 @@ def reopened(fields: dict, review_status: str, me: str | None) -> bool:
     comments = comments_of(fields)
     listed = [i for i, c in enumerate(comments) if by_run(c, me) and c.text.startswith(PR_COMMENT_HEAD)]
     return bool(listed) and any(c.body.strip() and not by_run(c, me) for c in comments[listed[-1] + 1:])
-
 
 
 

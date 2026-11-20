@@ -103,8 +103,9 @@ class RepositoriesTest(unittest.TestCase):
         jira = {a.account_id: a.id for a in user.jira_accounts}
         gh = {g.label: g.id for g in user.github_accounts}
         cl = {c.label: c.id for c in user.claude_accounts}
-        self.users.subscribe(self.me, Subscription(work.id, jira["acc-1"], gh["office"], cl["office"], "bugs", {"fe": "develop"}))
-        self.users.subscribe(self.me, Subscription(home.id, jira["acc-home"], gh["personal"], cl["personal"], "all"))
+        self.users.subscriptions.subscribe(self.me, Subscription(work.id, jira["acc-1"], gh["office"], cl["office"], "bugs",
+                                                                 {"fe": "develop"}))
+        self.users.subscriptions.subscribe(self.me, Subscription(home.id, jira["acc-home"], gh["personal"], cl["personal"], "all"))
         user = self.users.get(self.me)
         office, personal = user.actor(work.id), user.actor(home.id)
         self.assertEqual((office.jira_account_id, office.github.login, office.claude.label, office.mode, office.base_branches),
@@ -410,3 +411,44 @@ class RunLogErasureTest(unittest.TestCase):
         users.remove_jira_account(uid, users.get(uid).jira_accounts[0].id)
         self.assertIsNone(runs.log(uid, run_id))
         self.assertEqual(runs.get(uid, run_id)["issue_key"], "MAR-1")  # the run itself stays
+
+
+class SchemaAndUnreadableTokensTest(unittest.TestCase):
+    def setUp(self):
+        self.path = Path(tempfile.mkdtemp()) / "data" / "shadowdev.db"
+        self.key = Fernet.generate_key().decode()
+        db = Database(self.path, self.key)
+        self.users = UserRepository(db)
+        self.me = add_developer(self.users, "acc-1")
+        self.sara = add_developer(self.users, "acc-sara")
+
+    def test_a_failing_upgrade_leaves_the_database_at_its_old_version(self):
+        from shadowdev.repositories import database
+        with closing(sqlite3.connect(self.path)) as conn, conn:  # as schema 19 left it: no urgency column
+            conn.execute("ALTER TABLE runs DROP COLUMN urgency")
+            conn.execute("PRAGMA user_version = 19")
+        broken = database.ADDED_COLUMNS + (("pull_requests", "broken", "NOT A COLUMN DEFINITION"),)
+        with mock.patch.object(database, "ADDED_COLUMNS", broken), self.assertRaises(sqlite3.OperationalError):
+            Database(self.path, self.key)
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 19)  # not 20
+            self.assertNotIn("urgency", {r[1] for r in conn.execute("PRAGMA table_info(runs)")})  # the ADD before it rolled back
+        Database(self.path, self.key)  # the real upgrade then goes through
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertIn("urgency", {r[1] for r in conn.execute("PRAGMA table_info(runs)")})
+
+    def test_a_developer_whose_tokens_cannot_be_read_is_left_out_of_the_loops(self):
+        other_key = Fernet(Fernet.generate_key())
+        with closing(sqlite3.connect(self.path)) as conn, conn:  # a token written under another key
+            conn.execute("UPDATE claude_accounts SET token = ? WHERE user_id = ?", (other_key.encrypt(b"x"), self.sara))
+        with self.assertLogs("shadowdev", "ERROR") as logs:
+            ids = [user.id for user in self.users.all()]
+            self.assertIsNone(self.users.loadable(self.sara))
+        self.assertEqual(ids, [self.me])
+        self.assertIn("cannot be decrypted", logs.output[0])
+        with self.assertNoLogs("shadowdev", "ERROR"):  # the loops keep going, and the report was made once
+            self.users.all()
+            self.users.loadable(self.sara)
+        with self.assertRaises(RuntimeError):  # a page asking for that developer shows the failure
+            self.users.get(self.sara)
+        self.assertEqual(self.users.loadable(self.me).id, self.me)

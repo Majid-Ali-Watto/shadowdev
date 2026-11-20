@@ -1,7 +1,10 @@
+import re
 from collections.abc import Callable
 from urllib.parse import urlencode
 
 from .rest import download, request_json
+
+ATTACHMENT_ID_RE = re.compile(r"[0-9]{1,20}")
 
 
 class Jira:
@@ -36,7 +39,10 @@ class Jira:
         )
 
     def attachment(self, attachment_id: str, max_bytes: int) -> bytes:
-        """A file attached to an issue. redirect=false: Jira sends the file itself, not a link to it."""
+        """A file attached to an issue. redirect=false: Jira sends the file itself, not a link to it.
+        Raises ValueError for an ID that is not a number (it goes into the URL)."""
+        if not ATTACHMENT_ID_RE.fullmatch(attachment_id):
+            raise ValueError(f"not an attachment ID: {attachment_id!r}")
         return download(f"{self.api_base}/rest/api/2/attachment/content/{attachment_id}?redirect=false",
                         {"Authorization": f"Bearer {self._access_token()}"}, max_bytes, "Jira")
 

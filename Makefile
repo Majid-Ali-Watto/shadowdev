@@ -35,7 +35,7 @@ stop: down  ## the same as down
 dev:  ## start the server, restarted whenever shadowdev/ or .env changes
 	$(PY) -m shadowdev --reload
 
-test:  ## run the tests; one of them: make test T=tests.test_server.WebTest.test_stop_button
+test:  ## run the tests; one of them: make test T=tests.test_server_runs.RunsWebTest.test_stop_button
 	$(PY) -m unittest $(T)
 
 lint:  ## check the code with ruff

@@ -16,7 +16,7 @@ from shadowdev.clients.slack import Slack
 from shadowdev.models.limits import Limits
 from shadowdev.models.project import Project
 from shadowdev.models.settings import Settings
-from shadowdev.services import reviews
+from shadowdev.services import review_requests, reviews
 from tests.helpers import OFFICE, add_developer, join, make_cfg, repo
 
 ME, SARA = "acc-majid", "acc-sara"
@@ -74,7 +74,7 @@ class WatcherTest(unittest.TestCase):
     def test_github_and_slack_are_read_each_at_the_developers_own_interval(self):
         self.reviews.track_pr(self.me, self.market.id, "fe", "acme/fe", 7, "MAR-1", ("C0REVIEWS1", "1.2"))
         self.app.users.set_limits(self.me, Limits(github_poll_minutes=0.5, slack_poll_minutes=5))
-        self.app.users.mark_slack_seen(self.me, self.market.id, f"{NOW - 60:.6f}")  # the channel was read before
+        self.app.users.subscriptions.mark_slack_seen(self.me, self.market.id, f"{NOW - 60:.6f}")  # the channel was read before
         read = lambda: (self.github.review_threads.call_count, self.slack.history.call_count)
         self.watcher.poll(NOW, due_only=True)
         self.assertEqual(read(), (1, 1))  # both, the first time
@@ -334,7 +334,7 @@ class WatcherTest(unittest.TestCase):
         ]
         self.assertEqual(self.poll(), [("marketplace", ["acme/fe#12"])])
         self.assertEqual(self.slack.history.call_args.args, ("C0REVIEWS1", 20))
-        self.assertEqual(self.app.users.slack_seen(self.me, self.market.id), "1800000013.000100")
+        self.assertEqual(self.app.users.subscriptions.slack_seen(self.me, self.market.id), "1800000013.000100")
         work, after = self.jobs[0][3:]
         user = self.app.users.get(self.me)
         with mock.patch.object(reviews, "review_pr", return_value=("done", "1 comment", "commented")) as review_pr:
@@ -373,7 +373,7 @@ class WatcherTest(unittest.TestCase):
         self.assertEqual(self.poll(), [("marketplace", ["acme/fe#21"])])
         self.assertEqual(self.slack.replies.call_args_list, [mock.call("C0REVIEWS1", "1799999300.000100", seen)])  # only that thread
         self.assertEqual(self.reviews.in_state("requested")[0]["ts"], "1799999300.000100")  # answered in that thread
-        self.assertEqual(self.app.users.slack_seen(self.me, self.market.id), "1800000050.000100")
+        self.assertEqual(self.app.users.subscriptions.slack_seen(self.me, self.market.id), "1800000050.000100")
         # Read again a minute later: nothing new, so no thread is fetched and nothing is asked twice.
         self.reviews.finish(self.reviews.in_state("requested")[0]["id"], "approved")
         self.slack.replies.reset_mock()
@@ -386,21 +386,21 @@ class WatcherTest(unittest.TestCase):
         fe, services = "https://github.com/acme/fe/pull", "https://github.com/acme/services/pull"
         text = (f"please review these PRs:\n<@U0000RAJA0> <@{MY_SLACK}|majid>\n<{fe}/830>\n<{fe}/831>\n\n"
                 f"<@U0000FASI0> <@U0000NABI0>\n<{services}/939>\n<{services}/940>")
-        self.assertEqual(reviews.asked_prs(text, MY_SLACK), [("acme/fe", 830), ("acme/fe", 831)])
-        self.assertEqual(reviews.asked_prs(text, "U0000NABI0"), [("acme/services", 939), ("acme/services", 940)])
-        self.assertEqual(reviews.asked_prs(f"{fe}/1 and {fe}/2, <@{MY_SLACK}> please, cc <@U0000LEAD0>", MY_SLACK),
+        self.assertEqual(review_requests.asked_prs(text, MY_SLACK), [("acme/fe", 830), ("acme/fe", 831)])
+        self.assertEqual(review_requests.asked_prs(text, "U0000NABI0"), [("acme/services", 939), ("acme/services", 940)])
+        self.assertEqual(review_requests.asked_prs(f"{fe}/1 and {fe}/2, <@{MY_SLACK}> please, cc <@U0000LEAD0>", MY_SLACK),
                          [("acme/fe", 1), ("acme/fe", 2)])  # links before the first mention belong to it
-        self.assertEqual(reviews.asked_prs(f"{fe}/1 <@U0000RAJA0>", MY_SLACK), [])
+        self.assertEqual(review_requests.asked_prs(f"{fe}/1 <@U0000RAJA0>", MY_SLACK), [])
 
     def test_a_pr_a_colleague_asked_with_me_reacted_eyes_to_first_is_theirs(self):
         fe = "https://github.com/acme/fe/pull"
         text = f"<@U0000RAJA0> <@{MY_SLACK}> {fe}/830 <@U0000FASI0> https://github.com/acme/services/pull/939"
         eyes = lambda *users: {"text": text, "reactions": [{"name": "thumbsup", "users": ["U0000RAJA0"]},
                                                             {"name": "eyes", "users": list(users)}]}
-        self.assertEqual(reviews.claimed_by(eyes("U0000RAJA0", MY_SLACK), MY_SLACK, "acme/fe", 830), "U0000RAJA0")
-        self.assertIsNone(reviews.claimed_by(eyes(MY_SLACK, "U0000RAJA0"), MY_SLACK, "acme/fe", 830))  # mine came first
-        self.assertIsNone(reviews.claimed_by(eyes("U0000FASI0"), MY_SLACK, "acme/fe", 830))  # not asked about it
-        self.assertIsNone(reviews.claimed_by({"text": text}, MY_SLACK, "acme/fe", 830))
+        self.assertEqual(review_requests.claimed_by(eyes("U0000RAJA0", MY_SLACK), MY_SLACK, "acme/fe", 830), "U0000RAJA0")
+        self.assertIsNone(review_requests.claimed_by(eyes(MY_SLACK, "U0000RAJA0"), MY_SLACK, "acme/fe", 830))  # mine came first
+        self.assertIsNone(review_requests.claimed_by(eyes("U0000FASI0"), MY_SLACK, "acme/fe", 830))  # not asked about it
+        self.assertIsNone(review_requests.claimed_by({"text": text}, MY_SLACK, "acme/fe", 830))
         # A review about to start is skipped.
         self.reviews.request(self.me, self.market.id, "acme/fe", 830, "C0REVIEWS1", "1800000010.000100", "1800000010.000100")
         self.slack.message.return_value = eyes("U0000RAJA0")
@@ -556,9 +556,9 @@ class AskingWordsTest(unittest.TestCase):
     def test_a_reply_asks_for_a_review_or_an_approval_in_words(self):
         me, parent = "U0000ME000", "<@U0000SARA0> https://github.com/acme/app/pull/7"
         for text in ("can you approve this?", "kindly approve", "approve these", "please review", "PTAL"):
-            self.assertEqual(reviews.asked_in_reply(f"<@{me}> {text}", parent, me), [("acme/app", 7)], text)
+            self.assertEqual(review_requests.asked_in_reply(f"<@{me}> {text}", parent, me), [("acme/app", 7)], text)
         for text in ("no need to approve", "thanks", "it was approved yesterday"):
-            self.assertEqual(reviews.asked_in_reply(f"<@{me}> {text}", parent, me), [], text)
+            self.assertEqual(review_requests.asked_in_reply(f"<@{me}> {text}", parent, me), [], text)
 
 
 if __name__ == "__main__":

@@ -56,22 +56,27 @@ class ReleaseMover:
 
     def poll(self, now: float | None = None) -> int:
         """Check the projects of every active developer who switched the moves on, that are due by
-        their interval. Returns how many tickets were moved."""
+        their interval. Returns how many tickets were moved. Developers with nothing due are not loaded."""
         now = now or time.time()
+        due: dict[int, set[int]] = {}  # developer -> projects due a check
+        for user_id, project_id, hours, last_checked in self.users.subscriptions.releasing():
+            if now - last_checked >= hours * 3600:
+                due.setdefault(user_id, set()).add(project_id)
         moved = 0
-        for user in self.users.all():
-            if user.paused:
+        for user_id, project_ids in due.items():
+            user = self.users.loadable(user_id)
+            if not user:
                 continue
             for project in self.projects.on_sites(list(user.sites)):
-                sub = user.subscriptions.get(project.id)
-                if not sub or not sub.settings.release_moves or not project.status_rules:
-                    continue
-                if now - self.users.released_at(user.id, project.id) < int(sub.settings.release_hours) * 3600:
+                if project.id not in project_ids or not project.status_rules:
                     continue
                 try:
                     moved += len(self._check(user, project, now).moved)
-                except Exception as e:  # e.g. revoked Jira access: the other projects still run
+                except (HTTPError, JiraAccessLost) as e:  # e.g. revoked Jira access: the other projects still run
                     log.warning("moving released tickets of %s for %s failed: %s", project.name, user.display_name, e)
+                except Exception:
+                    log.exception("moving released tickets of %s for %s failed; the other projects still run",
+                                  project.name, user.display_name)
         return moved
 
     def check_now(self, user: User, project_id: str) -> ReleaseReport:
@@ -131,7 +136,7 @@ class ReleaseMover:
         if gaps_of and (asked or set(held) - set(previous)):
             failed += self._tell(user, project, gaps_of)
         report = ReleaseReport(now, tuple(moved), tuple(held), tuple(failed))
-        self.users.save_release_report(user.id, project.id, report)
+        self.users.subscriptions.save_release_report(user.id, project.id, report)
         return report
 
     def _tell(self, user: User, project: Project, gaps_of: list[tuple[str, StatusRule, list[str]]]) -> list[str]:

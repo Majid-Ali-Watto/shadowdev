@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from shadowdev.automation import guidance
+from shadowdev.automation import gitops, guidance
 from shadowdev.automation.prompts import guidance_text
 
 FILES = {
@@ -47,7 +47,7 @@ class GuidanceTest(unittest.TestCase):
         (self.root / ".claude/agents/untracked.md").write_text("---\ndescription: local\n---\n")
 
     def test_finds_the_committed_instruction_files_of_every_ai_tool(self):
-        found = [(e.path, e.kind, e.note) for e in guidance.find(self.root, "app")]
+        found = [(e.path, e.kind, e.note) for e in guidance.find(gitops.existing(self.root, self.root / ".git"), "app")]
         self.assertEqual(found, [
             ("app/CLAUDE.md", "always", ""),  # Claude's own first, then the other tools'
             ("app/AGENTS.md", "always", ""),
@@ -63,18 +63,19 @@ class GuidanceTest(unittest.TestCase):
         ])  # no settings or hooks, no symlink, nothing uncommitted, no ordinary docs
 
     def test_the_prompt_lists_them_and_keeps_shadowdevs_workflow(self):
-        text = guidance_text({"app": guidance.find(self.root, "app"), "docs": []})
+        text = guidance_text({"app": guidance.find(gitops.existing(self.root, self.root / ".git"), "app"), "docs": []})
         self.assertIn('<repo_instructions repo="app">\nRead first:\n- app/CLAUDE.md\n- app/AGENTS.md', text)
         self.assertIn("For some files:\n- app/.cursor/rules/db.mdc: for files matching migrations/*.sql", text)
         self.assertIn("- app/.claude/agents/dev.md (agent): Senior developer for this stack.", text)
         self.assertIn("the instructions in this prompt decide how the work is\ndone", text)
         self.assertNotIn('repo="docs"', text)  # nothing to list
         self.assertEqual(guidance_text({"docs": []}), "")
-        self.assertIn("copied to\n_guidance/", guidance_text({"app": guidance.find(self.root, "app")}, review=True))
+        entries = guidance.find(gitops.existing(self.root, self.root / ".git"), "app")
+        self.assertIn("copied to\n_guidance/", guidance_text({"app": entries}, review=True))
 
     def test_a_review_reads_them_as_on_the_base_branch(self):
         workspace = Path(tempfile.mkdtemp())
-        entries = guidance.find(self.root, f"{guidance.COPY_DIR}/app")
+        entries = guidance.find(gitops.existing(self.root, self.root / ".git"), f"{guidance.COPY_DIR}/app")
         guidance.copy_into(entries, self.root, workspace)
         self.assertEqual((workspace / "_guidance/app/CLAUDE.md").read_text(), FILES["CLAUDE.md"])
         self.assertEqual(sorted(str(p.relative_to(workspace)) for p in workspace.rglob("*") if p.is_file()),

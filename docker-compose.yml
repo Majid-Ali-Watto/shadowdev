@@ -17,8 +17,7 @@ services:
       - ./.env:/app/.env:ro
       - ./data:/app/data  # the token database, per-developer Claude config, logs and backups
       - worktrees:/app/worktrees  # live run workspaces: a volume, fast on macOS and Windows too
-      - npm-cache:/home/shadowdev/.npm  # package caches the projects' setup commands fill
-      - cache:/home/shadowdev/.cache
+      - cache:/home/shadowdev/.cache  # package caches the projects' setup commands fill, one folder per project
     # What bwrap needs to build each run's sandbox inside the container (user namespaces, and a /proc
     # of its own). The container itself has no capabilities and can't gain any, and runs as a user.
     security_opt:
@@ -33,5 +32,4 @@ services:
 
 volumes:
   worktrees:
-  npm-cache:
   cache:

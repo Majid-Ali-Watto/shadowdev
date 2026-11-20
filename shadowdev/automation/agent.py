@@ -57,7 +57,7 @@ def claude_env(token: str, config_dir: Path) -> dict:
     if not variable:
         raise ValueError("not a Claude token")
     config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR") if k in os.environ}
+    env = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "TMPDIR", *sandbox.BUS_ENV) if k in os.environ}
     return {**env, "CLAUDE_CONFIG_DIR": str(config_dir), variable: token}
 
 
@@ -82,16 +82,15 @@ def _run(cmd: list[str], prompt: str, cwd: Path, env: dict, timeout: int) -> dic
     return result
 
 
-def in_sandbox(argv: list[str], cfg: Config | None, workspace: Path, config_dir: Path) -> list[str]:
-    """Claude processes untrusted ticket text, so besides --restricted it runs in the sandbox:
-    it can write only its workspace (not .git) and its own config dir, and sees nothing else
-    of ShadowDev or the server's home."""
-    if cfg is None:
-        return argv
-    return sandbox.wrap(argv, cfg, [workspace, config_dir], sandbox.git_dirs(workspace))
+def in_sandbox(argv: list[str], cfg: Config, workspace: Path, config_dir: Path) -> list[str]:
+    """Claude processes untrusted ticket text, so besides --restricted it runs in the sandbox,
+    under the same memory and process caps as a command: it can write only its workspace (not
+    .git) and its own config dir, and sees nothing else of ShadowDev or the server's home."""
+    return [*sandbox.limits_prefix(cfg),
+            *sandbox.wrap(argv, cfg, [workspace, config_dir], sandbox.git_mounts(workspace), sandbox.cache_key(workspace))]
 
 
-def check_token(token: str, config_dir: Path, cfg: Config | None = None) -> None:
+def check_token(token: str, config_dir: Path, cfg: Config) -> None:
     """One tiny request with the token; raises with Claude's error if it does not work."""
     with tempfile.TemporaryDirectory() as empty:
         try:
@@ -152,14 +151,13 @@ class ClaudeSession:
     the reset when it comes within limits.RESETS_SOON (see limits.py).
     """
 
-    def __init__(self, cwd: Path, env: dict, label: str = "claude", cfg: Config | None = None,
-                 cancel: CancelToken = NEVER, model: str | None = None, effort: str | None = None,
-                 spares: list[dict] | None = None):
+    def __init__(self, cwd: Path, env: dict, cfg: Config, label: str = "claude", cancel: CancelToken = NEVER,
+                 model: str | None = None, effort: str | None = None, spares: list[dict] | None = None):
         self.cwd = cwd
         self.env = env
         self.spares = spares if spares is not None else []  # shared by the sessions of a run
         self.label = label
-        self.cfg = cfg  # set: run in the sandbox
+        self.cfg = cfg  # Claude always runs in the sandbox
         self.cancel = cancel
         self.model = model  # None: the Claude account's default
         self.effort = effort
@@ -246,10 +244,10 @@ class ClaudeSession:
             cmd += ["--effort", self.effort]
         if resume:
             cmd += ["--resume", resume]
-        cmd = in_sandbox(cmd, self.cfg, self.cwd, Path(self.env["CLAUDE_CONFIG_DIR"])) if self.cfg else cmd
+        cmd = in_sandbox(cmd, self.cfg, self.cwd, Path(self.env["CLAUDE_CONFIG_DIR"]))
         self.cancel.check()
         started = time.monotonic()
-        timeout = self.cfg.claude_timeout_seconds if self.cfg else Config.claude_timeout_seconds
+        timeout = self.cfg.claude_timeout_seconds
         result, working = None, None
         with tempfile.TemporaryFile("w+") as stderr:
             proc = subprocess.Popen(cmd, cwd=self.cwd, env=self.env, text=True,

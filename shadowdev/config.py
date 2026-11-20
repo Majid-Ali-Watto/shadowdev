@@ -35,6 +35,17 @@ OAUTH_CALLBACK_PATH = "/oauth/jira/callback"
 SANDBOX_TOOLS = (".local/share/nvm", ".nvm", ".local/bin", ".local/share/uv", ".local/share/claude", ".cargo/bin",
                  ".rustup", ".pyenv", ".volta", ".bun", ".local/share/pnpm", ".deno")
 SANDBOX_CACHES = (".npm", ".cache/uv", ".cache/pip", ".cache/node-gyp", ".cache/pnpm", ".cache/ms-playwright")
+# Where each project's package caches live on the server: one folder per project, never shared between
+# projects, so a run can't poison what another project's commands run with (see SAFETY.md).
+CACHE_ROOT = Path.home() / ".cache" / "shadowdev-sandbox"
+
+
+def _cap(value: str | None, default: int, name: str) -> int:
+    if value is None:
+        return default
+    if not value.strip().isdigit():
+        raise SystemExit(f"{name} must be a whole number (0 turns the limit off), e.g. {default}")
+    return int(value)
 
 
 def _home_paths(value: str | None, default: tuple[str, ...], name: str) -> tuple[str, ...]:
@@ -83,6 +94,11 @@ class Config:
     command_timeout_seconds: int = round(_DEFAULT.command_timeout_minutes * 60)
     sandbox_tools: tuple[str, ...] = SANDBOX_TOOLS
     sandbox_caches: tuple[str, ...] = SANDBOX_CACHES
+    cache_root: Path = CACHE_ROOT  # the projects' package caches, <cache_root>/<project id>/<cache>
+    # Caps for a command or Claude, through a systemd scope (see sandbox.limits_prefix); 0 turns one off.
+    sandbox_memory_mb: int = 4096
+    sandbox_tasks_max: int = 2048
+    sandbox_tmp_mb: int = 1024  # size of the sandbox's /tmp and home (bwrap --size, when bwrap has it)
     data_dir: Path = PROJECT_ROOT / "data"  # database and per-developer Claude config; never in a sandbox
     worktree_root: Path = PROJECT_ROOT / "worktrees"
     smtp: Smtp | None = None  # optional: the account developers' emails are sent from (SMTP_*)
@@ -126,7 +142,7 @@ class Config:
         smtp = None
         if env.get("SMTP_HOST"):
             smtp_port = env.get("SMTP_PORT", "587")
-            if not smtp_port.isdigit():
+            if not (smtp_port.isascii() and smtp_port.isdigit()):
                 raise SystemExit("SMTP_PORT must be a number, e.g. 587")
             smtp = Smtp(env["SMTP_HOST"], int(smtp_port), required("SMTP_FROM"), env.get("SMTP_USERNAME", ""),
                         env.get("SMTP_PASSWORD", ""))
@@ -146,5 +162,8 @@ class Config:
             port=port,
             sandbox_tools=_home_paths(env.get("SANDBOX_HOME_TOOLS"), SANDBOX_TOOLS, "SANDBOX_HOME_TOOLS"),
             sandbox_caches=_home_paths(env.get("SANDBOX_HOME_CACHES"), SANDBOX_CACHES, "SANDBOX_HOME_CACHES"),
+            sandbox_memory_mb=_cap(env.get("SANDBOX_MEMORY_MB"), 4096, "SANDBOX_MEMORY_MB"),
+            sandbox_tasks_max=_cap(env.get("SANDBOX_TASKS_MAX"), 2048, "SANDBOX_TASKS_MAX"),
+            sandbox_tmp_mb=_cap(env.get("SANDBOX_TMP_MB"), 1024, "SANDBOX_TMP_MB"),
             smtp=smtp,
         )
