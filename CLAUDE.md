@@ -18,7 +18,7 @@ The Makefile has short names for these (`make` lists them): `make up`/`upd`/`dow
 `check`, `dry`, `backup`, `rotate`, `service`/`docker-service` (start by itself: deploy/service.sh).
 
 ```bash
-.venv/bin/python -m unittest            # all tests (~25 s); needs git, bwrap, prlimit on PATH
+.venv/bin/python -m unittest            # all tests (~1.5 min); needs git, bwrap, prlimit on PATH
 .venv/bin/python -m unittest tests.test_server_runs.RunsWebTest.test_stop_button   # one test
 uv run ruff check                       # lint (config in pyproject.toml); `--fix` sorts imports and the like
 .venv/bin/python -m shadowdev           # the server (needs .env, bwrap, claude)
