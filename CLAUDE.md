@@ -31,6 +31,11 @@ The Docker image must keep the sandbox working (the compose `security_opt` and `
 `bwrap` needs, nothing more; deploy/README.md, Docker) and must never contain `.env` or `data/`
 (`.dockerignore`). A new tool the server runs goes into the Dockerfile too.
 
+Releases are annotated tags `vX.Y.Z` on `main` with a GitHub Release, cut when an update needs attention
+(a schema change, a new `.env` key, changed behaviour). The commit that is tagged sets `version` in
+`pyproject.toml` to the same number. Release notes link files at the tag (`blob/vX.Y.Z/...`), not
+relatively, and when `database.VERSION` changed they say to `make backup` first: upgrades can't be undone.
+
 ## Layout and layering
 
 ```
