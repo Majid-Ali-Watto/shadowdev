@@ -41,7 +41,7 @@ WORKDIR /app
 COPY . .
 # data/ and worktrees/ are mounted over these; a new volume starts with their owner and mode.
 RUN install -d -m 700 -o shadowdev data worktrees \
- && install -d -o shadowdev /home/shadowdev/.npm /home/shadowdev/.cache
+ && install -d -o shadowdev /home/shadowdev/.cache
 
 USER shadowdev
 ENV HOST=0.0.0.0 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1

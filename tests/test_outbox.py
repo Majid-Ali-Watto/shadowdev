@@ -43,7 +43,7 @@ class OutboxTest(unittest.TestCase):
 
     def settings(self, chosen: Settings) -> None:
         sub = self.app.users.get(self.me).subscriptions[self.market.id]
-        self.app.users.subscribe(self.me, dataclasses.replace(sub, settings=chosen))
+        self.app.users.subscriptions.subscribe(self.me, dataclasses.replace(sub, settings=chosen))
 
     def test_sent_once_working_hours_begin(self):
         self.assertEqual(self.app.outbox.flush(), 0)  # outside them: nothing
@@ -88,8 +88,31 @@ class OutboxTest(unittest.TestCase):
         self.jira.comment.assert_called_with("MAR-1", "*Root cause:* the cache")
         self.assertEqual([c[0] for c in self.github.method_calls if c[0] != "create_pr"], ["reply_to_thread", "resolve_thread"])
 
+    def test_one_that_raises_does_not_drop_the_others_and_its_run_says_so(self):
+        other = self.app.runs.add("MAR-2", self.me, self.market.id, self.market.name)
+        self.app.runs.update(other, "done", "pushed; its PRs wait")
+        self.held.hold_publication(self.me, self.market.id, other, None,
+                                   Publication(("MAR-2",), "MAR-2", "MAR-2: Other", (Change("services", "main", "new", "Two"),)))
+
+        def create_pr(repo, **kwargs):
+            if repo == "acme/fe":
+                raise RuntimeError("the connection broke in the middle")  # not an HTTP answer: nothing says why
+            return f"https://github.com/{repo}/pull/9"
+        self.github.create_pr.side_effect = create_pr
+        self.settings(Settings())
+        self.app.users.save_slack(self.me, "xoxp-1", "U0000MEME0", "acme")
+        with self.assertLogs("shadowdev", "ERROR"):
+            self.assertEqual(self.app.outbox.flush(), 3)  # the failed PR, the other one and the Slack reply: all taken
+        first = next(r for r in self.app.runs.recent(self.me) if r["id"] == self.run_id)
+        self.assertEqual(first["status"], "failed")
+        self.assertIn("its PRs could not be opened: the connection broke", first["message"])
+        second = next(r for r in self.app.runs.recent(self.me) if r["id"] == other)
+        self.assertEqual((second["status"], second["message"]), ("done", "services into main: https://github.com/acme/services/pull/9"))
+        self.assertEqual(self.held.waiting(), [])  # each made or failed for good: none is sent again
+        self.assertEqual(self.app.outbox.flush(), 0)
+
     def test_dropped_when_the_developer_leaves_the_project(self):
-        self.app.users.unsubscribe(self.me, self.market.id)
+        self.app.users.subscriptions.unsubscribe(self.me, self.market.id)
         self.app.outbox.flush()
         self.github.create_pr.assert_not_called()
         self.assertEqual(self.held.waiting(), [])

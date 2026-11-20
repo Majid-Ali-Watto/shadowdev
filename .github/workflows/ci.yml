@@ -1,0 +1,31 @@
+# Lint and the test suite, on every push and pull request. The tests run the sandbox for real (bwrap,
+# prlimit), so the runner needs those tools, and Ubuntu 24.04 blocks unprivileged user namespaces
+# unless AppArmor's restriction is switched off. No secrets are used: the tests fake GitHub, Jira and Claude.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install bubblewrap, git and util-linux (prlimit)
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap git util-linux
+      - name: Allow bubblewrap's user namespaces (Ubuntu 24.04 blocks them)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d  # v10.4.0
+      - name: Install dependencies
+        run: uv sync
+      - name: Lint
+        run: uv run ruff check
+      - name: Test
+        run: uv run python -m unittest

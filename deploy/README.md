@@ -61,6 +61,17 @@ It then starts the service and says whether it runs. Check it any time with `sys
 shadowdev` and `curl http://127.0.0.1:8080/health` (with your `HOST` and `PORT`). After moving the
 checkout or installing a toolchain elsewhere, run `make service` again.
 
+## Behind a reverse proxy
+
+Put HTTPS in front (nginx, Caddy, or a named Cloudflare tunnel) with `PUBLIC_URL` set to its address.
+The server limits what it can: each request must arrive within 30 seconds, and the routes anyone can
+call are rate limited. It cannot limit request sizes or connections per address, so the proxy must:
+the largest body (`client_max_body_size` in nginx; 64 KB covers the forms, 1 MB the webhooks), how long
+a client may take to send its headers and body (`client_header_timeout`, `client_body_timeout`), and
+the connections per address (`limit_conn`). Recent runs' live updates are a stream of up to 5 minutes,
+so the proxy's read timeout must exceed that, and buffering stays off for it. See
+[docs/ADMIN.md](../docs/ADMIN.md#starting-and-stopping).
+
 ## Day to day
 
 | To | Run |
@@ -120,7 +131,7 @@ What the container gets, and why:
 | `seccomp`, `apparmor` and `systempaths` unconfined | what `bwrap` needs to build each run's sandbox inside the container: user namespaces, mounts, and a `/proc` of its own. Docker's default profiles refuse these to everything in a container |
 | `cap_drop: ALL`, `no-new-privileges` | in exchange: the container has no Linux capabilities and can't gain any, so code that got out of a run's sandbox is still an unprivileged user in a container |
 | `stop_grace_period: 16m`, tini as PID 1 | `docker compose stop` is graceful like `systemctl stop`: runs in progress get up to 15 minutes. A second `docker compose kill -s TERM shadowdev` while it stops stops them at once. tini reaps the processes runs leave behind |
-| Volumes for `worktrees/` and the package caches | live run workspaces stay off the host's file sharing, which is slow on macOS and Windows |
+| Volumes for `worktrees/` and `.cache/` | live run workspaces stay off the host's file sharing, which is slow on macOS and Windows. `.cache/` holds each project's package caches (`.cache/shadowdev-sandbox/<project id>/`) |
 
 Projects' setup and test commands run in this container (in the sandbox), so it has what they
 usually need: node 22 with npm, and uv for Python. A project that needs more (another node version

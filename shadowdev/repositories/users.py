@@ -1,16 +1,18 @@
-"""Developers, the Jira, GitHub and Claude accounts they connected (tokens encrypted), and the
-projects they joined."""
-import json
+"""Developers, and the Jira, GitHub, Claude and Slack accounts they connected (tokens encrypted), and
+their activity. Their subscriptions (the projects they joined) are in subscriptions.py, as
+`users.subscriptions`."""
+import logging
 import sqlite3
 import time
 from contextlib import closing
 
 from ..models.limits import Limits
-from ..models.release import ReleaseReport
-from ..models.settings import Settings
 from ..models.tokens import Tokens
-from ..models.user import MODES, ClaudeAccount, GitHubAccount, JiraAccount, Site, SlackAccount, Subscription, User
+from ..models.user import ClaudeAccount, GitHubAccount, JiraAccount, Site, SlackAccount, User
 from .database import Database
+from .subscriptions import SubscriptionRepository, pass_ownership, subscription_of
+
+log = logging.getLogger("shadowdev")
 
 KEPT_ACTIVITY = 200  # entries of a developer's activity; older ones are dropped
 ACTIVITY_PAGE = 25  # entries on a page of the Activity tab
@@ -23,6 +25,8 @@ class AccountInUse(Exception):
 class UserRepository:
     def __init__(self, db: Database):
         self.db = db
+        self.subscriptions = SubscriptionRepository(db)
+        self._unreadable: set[int] = set()  # developers whose stored tokens were reported as unreadable
 
     # Jira accounts and sign-in
 
@@ -61,16 +65,23 @@ class UserRepository:
 
     def remove_jira_account(self, user_id: int, jira_account_id: int) -> None:
         """Also removes the subscriptions that used it (ON DELETE CASCADE). A developer named after
-        it is renamed after their next Jira account, and their runs' logs (which name them) are
-        deleted, so none of its personal data is left."""
+        it is renamed after their next Jira account. Their runs' logs are deleted, and the name and
+        email of the account are taken out of their runs' messages and questions, so none of its
+        personal data is left."""
         with closing(self.db.connect()) as conn, conn:
             gone = conn.execute("DELETE FROM jira_accounts WHERE id = ? AND user_id = ? RETURNING display_name, email",
                                 (jira_account_id, user_id)).fetchone()
             if gone:
                 conn.execute("DELETE FROM run_logs WHERE run_id IN (SELECT id FROM runs WHERE user_id = ?)", (user_id,))
+                for text in (gone["display_name"], gone["email"]):  # what the runs said may name the account
+                    if text:
+                        conn.execute("UPDATE runs SET message = replace(message, ?, '[removed]'), "
+                                     "questions = replace(questions, ?, '[removed]') WHERE user_id = ?",
+                                     (text, text, user_id))
                 conn.execute("UPDATE users SET (display_name, email) = (SELECT display_name, email FROM jira_accounts "
                              "WHERE user_id = users.id ORDER BY id LIMIT 1) WHERE id = ? AND display_name = ? AND email = ? "
-                             "AND EXISTS (SELECT 1 FROM jira_accounts WHERE user_id = users.id)", (user_id, *gone))
+                             "AND EXISTS (SELECT 1 FROM jira_accounts WHERE user_id = users.id)",
+                             (user_id, gone["display_name"], gone["email"]))
         self.db.forget_copies()
 
     def update_jira_profile(self, jira_account_id: int, display_name: str, email: str) -> None:
@@ -128,7 +139,7 @@ class UserRepository:
             row = conn.execute("SELECT user_id FROM jira_accounts WHERE account_id = ?", (account_id,)).fetchone()
         return row[0] if row else None
 
-    # GitHub and Claude accounts
+    # GitHub, Claude and Slack accounts
 
     def save_github(self, user_id: int, label: str, token: str, login: str, git_name: str, git_email: str,
                     expires: float = 0) -> int:
@@ -162,18 +173,6 @@ class UserRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("DELETE FROM slack_accounts WHERE user_id = ?", (user_id,))
 
-    def slack_seen(self, user_id: int, project_id: int) -> str:
-        """Timestamp of the last message read, as the developer, in the project's Slack channel."""
-        with closing(self.db.connect()) as conn:
-            row = conn.execute("SELECT slack_seen FROM subscriptions WHERE user_id = ? AND project_id = ?",
-                               (user_id, project_id)).fetchone()
-        return row[0] if row else ""
-
-    def mark_slack_seen(self, user_id: int, project_id: int, ts: str) -> None:
-        with closing(self.db.connect()) as conn, conn:
-            conn.execute("UPDATE subscriptions SET slack_seen = ? WHERE user_id = ? AND project_id = ?",
-                         (ts, user_id, project_id))
-
     def remove_github(self, user_id: int, github_account_id: int) -> None:
         """Subscriptions that used it are kept, without a GitHub account (ON DELETE SET NULL)."""
         with closing(self.db.connect()) as conn, conn:
@@ -189,13 +188,44 @@ class UserRepository:
     # The developer
 
     def get(self, user_id: int) -> User | None:
+        """The developer with their accounts. Raises RuntimeError when one of their stored tokens cannot
+        be decrypted: a request shows that, and a loop that goes on with other developers uses `loadable`."""
         with closing(self.db.connect()) as conn:
             row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
             return self._load(conn, row) if row else None
 
-    def all(self) -> list[User]:
+    def loadable(self, user_id: int) -> User | None:
+        """`get` for a loop over developers: one whose stored tokens cannot be decrypted is logged and
+        left out (None), rather than stopping the loop for everyone."""
         with closing(self.db.connect()) as conn:
-            return [self._load(conn, row) for row in conn.execute("SELECT * FROM users ORDER BY display_name")]
+            row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+            return self._loaded(conn, row) if row else None
+
+    def all(self) -> list[User]:
+        """Every developer, loaded with their accounts (decrypting their tokens); those whose tokens can't be
+        decrypted are left out (see `loadable`). The loops that need only some of them use `timings` first."""
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute("SELECT * FROM users ORDER BY display_name").fetchall()
+            return [user for row in rows if (user := self._loaded(conn, row))]
+
+    def timings(self) -> dict[int, tuple[bool, Limits]]:
+        """Each developer's (paused, limits), read without loading or decrypting their accounts."""
+        with closing(self.db.connect()) as conn:
+            return {row["id"]: (bool(row["paused"]), Limits.from_json(row["limits"]))
+                    for row in conn.execute("SELECT id, paused, limits FROM users")}
+
+    def _loaded(self, conn: sqlite3.Connection, row: sqlite3.Row) -> User | None:
+        """The developer, or None when one of their stored tokens cannot be decrypted (a v1 token
+        under another key, or a changed key): logged once, and left out, rather than stopping every
+        loop that reads all developers."""
+        try:
+            return self._load(conn, row)
+        except RuntimeError:  # Database.decrypt: no secret is in the message
+            if row["id"] not in self._unreadable:
+                self._unreadable.add(row["id"])
+                log.exception("developer %s's stored tokens cannot be decrypted: they are left out until it is fixed "
+                              "(SHADOWDEV_SECRET_KEY changed?)", row["id"])
+            return None
 
     def _load(self, conn: sqlite3.Connection, row: sqlite3.Row) -> User:
         uid = row["id"]
@@ -211,68 +241,12 @@ class UserRepository:
                        for g in conn.execute("SELECT * FROM github_accounts WHERE user_id = ? ORDER BY id", (uid,)))
         claude = tuple(ClaudeAccount(c["id"], c["label"], self.db.decrypt(c["token"]), c["config_key"])
                        for c in conn.execute("SELECT * FROM claude_accounts WHERE user_id = ? ORDER BY id", (uid,)))
-        subs = {s["project_id"]: Subscription(s["project_id"], s["jira_account_id"], s["github_account_id"],
-                                              s["claude_account_id"], s["mode"], json.loads(s["base_branches"]),
-                                              Settings.from_json(s["settings"]), ReleaseReport.from_json(s["release_report"]),
-                                              _json_object(s["tests_sent"]))
+        subs = {s["project_id"]: subscription_of(s)
                 for s in conn.execute("SELECT * FROM subscriptions WHERE user_id = ?", (uid,))}
         s = conn.execute("SELECT * FROM slack_accounts WHERE user_id = ?", (uid,)).fetchone()
         slack = SlackAccount(self.db.decrypt(s["token"]), s["slack_user_id"], s["team"]) if s else None
         return User(uid, row["display_name"], row["email"], bool(row["paused"]), jira, github, claude, subs, slack,
                     Limits.from_json(row["limits"]))
-
-    def subscribe(self, user_id: int, sub: Subscription) -> None:
-        if sub.mode not in MODES:
-            raise ValueError(f"unknown mode {sub.mode!r}")
-        with closing(self.db.connect()) as conn, conn:
-            conn.execute(
-                "INSERT INTO subscriptions (user_id, project_id, jira_account_id, github_account_id, claude_account_id, mode, "
-                "base_branches, settings, joined) VALUES (?, ?, ?, ?, ?, ?, ?, ?, "
-                "(SELECT COALESCE(MAX(joined), 0) + 1 FROM subscriptions)) "
-                "ON CONFLICT (user_id, project_id) DO UPDATE SET jira_account_id = excluded.jira_account_id, "
-                "github_account_id = excluded.github_account_id, claude_account_id = excluded.claude_account_id, "
-                "mode = excluded.mode, base_branches = excluded.base_branches, settings = excluded.settings",
-                (user_id, sub.project_id, sub.jira_account_id, sub.github_account_id, sub.claude_account_id, sub.mode,
-                 json.dumps(sub.base_branches), sub.settings.to_json()))
-
-    def settings(self, user_id: int, project_id: int) -> Settings:
-        """A subscription's settings alone, without loading (and decrypting) the developer's accounts;
-        the defaults when they left the project."""
-        with closing(self.db.connect()) as conn:
-            row = conn.execute("SELECT settings FROM subscriptions WHERE user_id = ? AND project_id = ?",
-                               (user_id, project_id)).fetchone()
-        return Settings.from_json(row[0] if row else None)
-
-    def save_tests_sent(self, user_id: int, project_id: int, sent: dict) -> None:
-        with closing(self.db.connect()) as conn, conn:
-            conn.execute("UPDATE subscriptions SET tests_sent = ? WHERE user_id = ? AND project_id = ?",
-                         (json.dumps(sent), user_id, project_id))
-
-    def polled_at(self, user_id: int, project_id: int) -> float:
-        with closing(self.db.connect()) as conn:
-            row = conn.execute("SELECT polled_at FROM subscriptions WHERE user_id = ? AND project_id = ?",
-                               (user_id, project_id)).fetchone()
-        return row[0] if row else 0.0
-
-    def mark_polled(self, user_id: int, project_id: int, at: float) -> None:
-        with closing(self.db.connect()) as conn, conn:
-            conn.execute("UPDATE subscriptions SET polled_at = ? WHERE user_id = ? AND project_id = ?",
-                         (at, user_id, project_id))
-
-    def released_at(self, user_id: int, project_id: int) -> float:
-        with closing(self.db.connect()) as conn:
-            row = conn.execute("SELECT released_at FROM subscriptions WHERE user_id = ? AND project_id = ?",
-                               (user_id, project_id)).fetchone()
-        return row[0] if row else 0.0
-
-    def save_release_report(self, user_id: int, project_id: int, report: ReleaseReport) -> None:
-        with closing(self.db.connect()) as conn, conn:
-            conn.execute("UPDATE subscriptions SET released_at = ?, release_report = ? WHERE user_id = ? AND project_id = ?",
-                         (report.at, report.to_json(), user_id, project_id))
-
-    def unsubscribe(self, user_id: int, project_id: int) -> None:
-        with closing(self.db.connect()) as conn, conn:
-            conn.execute("DELETE FROM subscriptions WHERE user_id = ? AND project_id = ?", (user_id, project_id))
 
     def set_paused(self, user_id: int, paused: bool) -> None:
         with closing(self.db.connect()) as conn, conn:
@@ -317,17 +291,7 @@ class UserRepository:
         Returns the config keys of their Claude accounts, so those dirs can be deleted."""
         with closing(self.db.connect()) as conn, conn:
             keys = [r[0] for r in conn.execute("SELECT config_key FROM claude_accounts WHERE user_id = ?", (user_id,))]
-            conn.execute("UPDATE projects SET owner_id = (SELECT s.user_id FROM subscriptions s WHERE s.project_id = projects.id "
-                         "AND s.user_id != ? ORDER BY s.joined LIMIT 1) WHERE owner_id = ? AND EXISTS (SELECT 1 FROM "
-                         "subscriptions s WHERE s.project_id = projects.id AND s.user_id != ?)", (user_id, user_id, user_id))
+            pass_ownership(conn, user_id)
             conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
         self.db.forget_copies()
         return keys
-
-
-def _json_object(text: str | None) -> dict:
-    try:
-        value = json.loads(text or "{}")
-    except ValueError:
-        return {}
-    return value if isinstance(value, dict) else {}

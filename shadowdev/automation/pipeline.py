@@ -18,20 +18,20 @@ on one branch, acting as the developer they are assigned to. A single issue is a
 An issue sent back after its PRs (reopened, with a comment saying why) continues on its branch,
 and an open PR is updated rather than a new one opened.
 
-No code stays on the server: when the run ends, however it ends, the workspace, the test
-reports and Claude's transcript of the run are deleted. Only a dry run keeps its workspace.
+No code stays on the server: when the run ends, however it ends, the workspace, the git dirs, the
+test reports and Claude's transcript of the run are deleted. Only a dry run keeps its workspace.
 
-Prompts and answer checks are in prompts.py; running and judging the tests in verify.py.
+Prompts and answer checks are in prompts.py; running and judging the tests in verify.py; the run's
+folders and the self-heal loop in workspace.py.
 """
 import logging
-import os
 import re
-import shutil
 import smtplib
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 
@@ -58,28 +58,27 @@ from .agent import (
     ClaudeSession,
     claude_envs,
     config_dirs,
-    forget_claude_sessions,
 )
 from .cancel import NEVER, Cancelled, CancelToken
 from .prompts import (
     CHANGE_SCHEMA,
     REGRESSION_SCHEMA,
     TRIAGE_SCHEMA,
-    analysis_problem,
+    analysis_check,
     analysis_prompt,
     analysis_schema,
     ask_usable,
     change_prompt,
-    regression_problem,
+    regression_check,
     regression_prompt,
     regression_retry_prompt,
     reopened_text,
-    retry_prompt,
-    summary_problem,
+    summary_check,
     triage_prompt,
 )
 from .timing import Timings
-from .verify import Checkout, changed, changed_paths, check, reproduces
+from .verify import Checkout, changed_paths, reproduces
+from .workspace import escalating, heal, run_folders
 
 log = logging.getLogger("shadowdev")
 
@@ -159,6 +158,18 @@ def fetch_attachments(jira: Jira, issues: list[Issue], workspace: Path, label: s
             log.info("%s: %d attachment(s) of %s for Claude to read", label, len(issue.attachments), issue.key)
 
 
+# Review requests in Slack, as the developer
+
+def _mentions(members) -> str:
+    return " ".join(f"<@{member}>" for member in members)
+
+
+def _titled(title: str, project: Project) -> str:
+    """A PR's title for Slack, with the issue keys it starts with linked to Jira: "MAR-12: summary"."""
+    keys = rules.ISSUE_KEYS_RE.findall(title.partition(": ")[0])
+    return link_issues(slack_escape(title), project.site_url, keys)
+
+
 def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tuple[Repo, str]], label: str,
                    thread: tuple[str, str] | None = None, again: bool = False, done: str = "",
                    later: Callable[[str, str, str], None] | None = None) -> tuple[str, str] | None:
@@ -172,10 +183,8 @@ def ask_for_review(actor: Actor, project: Project, title: str, opened: list[tupl
     if not (actor.slack and channel and opened):
         return None
     ask = f"Kindly review {'this PR' if len(opened) == 1 else 'these PRs'}{' again' if again else ''}"
-    # The title starts with its issue keys ("MAR-12: summary", "MAR-1 to MAR-4: …"): those become links.
-    keys = rules.ISSUE_KEYS_RE.findall(title.partition(": ")[0])
-    ask = f"{done} {ask}".lstrip() + (f": {link_issues(slack_escape(title), project.site_url, keys)}" if title else ".")
-    lines = [f"• {repo.name}: {link(url)} {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip() for repo, url in opened]
+    ask = f"{done} {ask}".lstrip() + (f": {_titled(title, project)}" if title else ".")
+    lines = [f"• {repo.name}: {link(url)} {_mentions(repo.reviewers)}".rstrip() for repo, url in opened]
     text = "\n".join([ask, *lines, "Thanks"])
     if later and thread and not actor.settings.at_work(time.time()):
         later(channel, text, thread[1])
@@ -203,9 +212,8 @@ def ask_for_reviews(actor: Actor, project: Project, entries: list[tuple[str, Rep
         prs = [(title, url) for title, r, url in entries if r.name == repo.name]
         if not prs:
             continue
-        head = f"*{repo.name}* {' '.join(f'<@{member}>' for member in repo.reviewers)}".rstrip()
-        lines = [f"• {link_issues(slack_escape(title), project.site_url, rules.ISSUE_KEYS_RE.findall(title.partition(': ')[0]))}"
-                 f"\n   {link(url)}" for title, url in prs]
+        head = f"*{repo.name}* {_mentions(repo.reviewers)}".rstrip()
+        lines = [f"• {_titled(title, project)}\n   {link(url)}" for title, url in prs]
         sections.append("\n".join([head, *lines]))
     try:
         ts = Slack(actor.slack.token).post(project.slack_channel, "\n\n".join(["Kindly review these PRs:", *sections, "Thanks"]))
@@ -272,65 +280,10 @@ def comment_all(jira: Jira, issues: list[Issue], text: str) -> None:
         jira.comment(issue.key, text)
 
 
-def delete_tree(path: Path) -> None:
-    """Delete a run's folder. The setup and test commands ran code Claude wrote in it, which may
-    have left folders without write or read permission; those are opened up first, so that
-    nothing of the run stays behind."""
-    if not path.exists():
-        return
-    for root, dirs, _ in os.walk(path):  # top-down: each folder is opened up before it is entered
-        for name in [".", *dirs]:
-            folder = os.path.join(root, name)
-            if not os.path.islink(folder):
-                try:
-                    os.chmod(folder, 0o700)
-                except OSError:
-                    pass
-    shutil.rmtree(path, ignore_errors=True)
-    if path.exists():
-        log.error("%s could not be deleted completely; remove it by hand", path)
-
-
-def remove_code(workspace: Path, scratch: Path, claude_dirs: list[Path]) -> None:
-    delete_tree(workspace)
-    delete_tree(scratch)
-    for claude_dir in claude_dirs:
-        forget_claude_sessions(claude_dir, workspace)
-
-
-@contextmanager
-def run_folders(cfg: Config, project: Project, name: str, claude_dirs: list[Path], keep_change: bool = False):
-    """The folders of one run, as (workspace, scratch). The run's code lives only in the workspace
-    (Claude's) and scratch (baselines, reports), side by side so Claude can't see scratch and
-    `git add -A` never picks it up. Both, and Claude's transcript (in `claude_dirs`: the config
-    dirs of the Claude accounts the run may work with), are deleted when the run ends, however it
-    ends; `keep_change` (a dry run) keeps only the workspace, for inspection."""
-    workspace = cfg.worktree_root / workspace_name(project, name)
-    scratch = cfg.worktree_root / f"{workspace.name}.shadowdev"
-    remove_code(workspace, scratch, claude_dirs)  # left by a crashed earlier run
-    cfg.worktree_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    cfg.worktree_root.chmod(0o700)  # other local users must not read or write live code
-    workspace.mkdir(mode=0o700)
-    try:
-        yield workspace, scratch
-    finally:
-        if keep_change:
-            delete_tree(scratch)
-            for claude_dir in claude_dirs:
-                forget_claude_sessions(claude_dir, workspace)
-        else:
-            remove_code(workspace, scratch, claude_dirs)
-            log.info("%s: code removed from the server", name)
-
-
-def workspace_name(project: Project, branch: str) -> str:
-    """Per project, so the same key on two Jira sites (MAR-1 at work and at home) never collides."""
-    return f"{project.id}-{branch}"
-
-
 def select_issues(keys: list[str], project: Project, actor: Actor, jira: Jira) -> tuple[list[Issue], list[str]]:
     """The issues this run may work on, fetched from Jira itself rather than trusting the
-    webhook payload or the form; and why the others are skipped."""
+    webhook payload or the form; and why the others are skipped. The reasons are kept on the
+    run's page, so they never name the developer."""
     issues, skipped = [], []
     for key in keys:
         fields = jira.get_issue(key)["fields"]
@@ -338,7 +291,7 @@ def select_issues(keys: list[str], project: Project, actor: Actor, jira: Jira) -
         if (fields.get("project") or {}).get("key") not in project.jira_projects:
             skipped.append(f"{key}: not in a Jira project of {project.name}")
         elif rules.assignee(fields) != actor.jira_account_id:
-            skipped.append(f"{key}: not assigned to {actor.display_name}")
+            skipped.append(f"{key}: not assigned to you")
         elif not rules.wanted(kind, actor.mode):
             skipped.append(f"{key}: issue type {(fields.get('issuetype') or {}).get('name')!r} is not automated for you")
         else:
@@ -371,6 +324,8 @@ def earlier_work(project: Project, branch: str, remote: dict[str, list[str]], gi
     return kept
 
 
+# Regression tests: a bug fix must come with one that fails without the fix
+
 def regression_tests(checkouts: list[Checkout], named: list[str], scratch: Path) -> list[tuple[Checkout, list[str]]]:
     """The test files Claude named (repo/path) per repo, kept only when the change adds or modifies them."""
     found = []
@@ -396,7 +351,7 @@ def prove_regression(claude, checkouts: list[Checkout], to_ship: list[Checkout],
         if not testable:
             return to_ship, [], ""
         with timings.step("Claude regression tests"):
-            answer = ask_usable(claude, regression_prompt(), READ_ONLY_TOOLS, REGRESSION_SCHEMA, regression_problem, "answer")
+            answer = ask_usable(claude, regression_prompt(), READ_ONLY_TOOLS, REGRESSION_SCHEMA, regression_check, "answer")
         named = regression_tests(testable, answer["tests"], scratch)
         if not named:
             reason = answer["reason"] or "none of the files named is a test this change adds or modifies"
@@ -418,13 +373,15 @@ def prove_regression(claude, checkouts: list[Checkout], to_ship: list[Checkout],
             return to_ship, [], (f"**Regression test:** {', '.join(f'`{f}`' for f in files)} passes without the fix "
                                  "too, so it does not prove the fix; review it.")
         with timings.step("Claude regression test again"):
-            summary = ask_usable(claude, regression_retry_prompt(files), EDIT_TOOLS, CHANGE_SCHEMA, summary_problem,
+            summary = ask_usable(claude, regression_retry_prompt(files), EDIT_TOOLS, CHANGE_SCHEMA, summary_check,
                                  "summary")["summary"]
         to_ship, _, failures = heal(claude, checkouts, scratch, cfg, label, timings, cancel, summary, stronger)
         if failures or not to_ship:
             return to_ship, failures, ""
     return to_ship, [], ""
 
+
+# Choosing branches and models
 
 def resolve_base(repo: Repo, chosen: str | None, branches: list[str], token: str) -> str | None:
     """The developer's base branch, else the latest release branch, else the repo's default branch."""
@@ -450,70 +407,7 @@ def choose_model(session, issues: list[Issue], note: str, label: str) -> tuple[s
     return model, effort
 
 
-def model_name(model: str | None, effort: str | None) -> str:
-    return (model or "default") + (f" ({effort})" if effort else "")
-
-
-def step_up(claude) -> bool:
-    """Give the session the next stronger model (it keeps its conversation). False when it
-    already has the strongest: the Claude account's default."""
-    tiers = list(MODELS.values())  # weakest first
-    at = tiers.index((claude.model, claude.effort)) if (claude.model, claude.effort) in tiers else len(tiers) - 1
-    if at == len(tiers) - 1:
-        return False
-    claude.model, claude.effort = tiers[at + 1]
-    return True
-
-
-def escalating(claude, on_model: Callable[[str], None], label: str) -> Callable[[], bool]:
-    """Reports the session's model to `on_model`, and returns stronger(): what the model could not
-    do, the next stronger one tries. False when there is none."""
-    models = [model_name(claude.model, claude.effort)]
-    on_model(models[0])
-
-    def stronger() -> bool:
-        if not step_up(claude):
-            return False
-        models.append(model_name(claude.model, claude.effort))
-        on_model(" → ".join(models))
-        log.info("%s: %s could not do it; continuing with %s", label, models[-2], models[-1])
-        return True
-
-    return stronger
-
-
-def heal(claude, checkouts: list[Checkout], scratch: Path, cfg: Config, label: str, timings: Timings, cancel: CancelToken,
-         summary: str, stronger: Callable[[], bool], redo: str | None = None) -> tuple[list[Checkout], str, list[str]]:
-    """Test every repo Claude changed, and feed new failures back to it (self-heal), up to
-    cfg.max_fix_attempts test runs. `redo`: what to ask the next stronger model when nothing was
-    changed. Returns (the changed checkouts: none when nothing was changed; Claude's last summary;
-    the failures left: none when the tests pass)."""
-    for attempt in range(1, cfg.max_fix_attempts + 1):
-        to_ship = changed(checkouts)
-        while not to_ship and redo and stronger():
-            with timings.step("Claude change (stronger model)"):
-                summary = ask_usable(claude, redo, EDIT_TOOLS, CHANGE_SCHEMA, summary_problem, "summary")["summary"]
-            to_ship = changed(checkouts)
-        if not to_ship:
-            return [], summary, []
-        failures = []
-        for c in to_ship:
-            # The first check of a repo includes its setup and the base branch baseline (unless cached).
-            with timings.step(f"test {c.repo.name} (attempt {attempt})"):
-                passed, output = check(c, scratch, cfg)
-            log.info("%s: %s tests %s (attempt %d/%d)", label, c.repo.name,
-                     "passed" if passed else "failed", attempt, cfg.max_fix_attempts)
-            if not passed:
-                failures.append(output)
-        cancel.check()
-        if not failures or attempt == cfg.max_fix_attempts:
-            return to_ship, summary, failures
-        stronger()
-        log.info("%s: Claude fixing the test failures", label)
-        with timings.step(f"Claude fix (attempt {attempt})"):
-            summary = ask_usable(claude, retry_prompt(failures), EDIT_TOOLS, CHANGE_SCHEMA, summary_problem,
-                                 "summary")["summary"]
-
+# The run
 
 def process_issues(keys: list[str], project: Project, actor: Actor, cfg: Config, jira: Jira, github: GitHub,
                    publish: bool = True, cancel: CancelToken = NEVER, note: str = "",
@@ -594,24 +488,8 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
         with timings.step("earlier branches and PRs"):
             continued = earlier_work(project, branch, remote, github, token, publish, label)
 
-    # Resolve and check every repo before creating anything.
     with timings.step("base branches and push access"):
-        targets = []
-        for repo in project.repos:
-            base = resolve_base(repo, actor.base_branches.get(repo.name), remote[repo.name], token)
-            if not base:
-                raise RuntimeError(f"{repo.name}: no base branch on {repo.github} (no '{repo.release_prefix}*' "
-                                   "branch and no default branch)")
-            if base not in remote[repo.name]:
-                raise RuntimeError(f"{repo.name}: your base branch {base} does not exist on {repo.github}")
-            if continued.get(repo.name):  # an open PR keeps the base it has
-                base = continued[repo.name]["base"]["ref"]
-            targets.append((repo, base))
-        with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
-            no_push = [r.github for r, ok in zip(project.repos, pool.map(lambda r: github.can_push(r.github), project.repos), strict=True)
-                       if not ok]
-        if no_push:
-            raise RuntimeError(f"your GitHub account {actor.github.login} cannot push to {', '.join(no_push)}")
+        targets = _targets(project, actor, remote, continued, github, token)
     cancel.check()
     if actor.settings.jira_status:
         with timings.step("Jira status to start"):
@@ -621,7 +499,7 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
     envs = claude_envs(cfg, actor)
     pushed: list[str] = []  # repos whose branch reached GitHub
     put_back = True
-    with run_folders(cfg, project, branch, config_dirs(envs), keep_change=not publish) as (workspace, scratch):
+    with run_folders(cfg, project, branch, config_dirs(envs), keep_change=not publish) as (workspace, scratch, _gits):
         try:
             outcome = _work(issues, skipped, branch, targets, continued, reopened, workspace, scratch, envs,
                             project, actor, cfg, jira, github, publish, cancel, timings, note, on_model, on_pr, pushed,
@@ -640,6 +518,28 @@ def _process(keys: list[str], project: Project, actor: Actor, cfg: Config, jira:
                         log.exception("%s: could not move the issue back", issue.key)
 
 
+def _targets(project: Project, actor: Actor, remote: dict[str, list[str]], continued: dict[str, dict | None],
+             github: GitHub, token: str) -> list[tuple[Repo, str]]:
+    """Resolve and check every repo before anything is created: (repo, the base branch its PR goes into)."""
+    targets = []
+    for repo in project.repos:
+        base = resolve_base(repo, actor.base_branches.get(repo.name), remote[repo.name], token)
+        if not base:
+            raise RuntimeError(f"{repo.name}: no base branch on {repo.github} (no '{repo.release_prefix}*' "
+                               "branch and no default branch)")
+        if base not in remote[repo.name]:
+            raise RuntimeError(f"{repo.name}: your base branch {base} does not exist on {repo.github}")
+        if continued.get(repo.name):  # an open PR keeps the base it has
+            base = continued[repo.name]["base"]["ref"]
+        targets.append((repo, base))
+    with ThreadPoolExecutor(max_workers=min(8, len(project.repos))) as pool:
+        no_push = [r.github for r, ok in zip(project.repos, pool.map(lambda r: github.can_push(r.github), project.repos), strict=True)
+                   if not ok]
+    if no_push:
+        raise RuntimeError(f"your GitHub account {actor.github.login} cannot push to {', '.join(no_push)}")
+    return targets
+
+
 def tested(c: Checkout) -> str:
     """What the PR says about its tests, as the developer would."""
     if c.baseline is None:
@@ -647,6 +547,17 @@ def tested(c: Checkout) -> str:
     already = len(c.baseline.failures)
     return (f"**Tests:** pass locally, with no new failures against `{c.base}`"
             + (f" ({already} already failing there)." if already else "."))
+
+
+@dataclass
+class Plan:
+    """What Claude decided the change is, from the analysis: per issue its analysis and questions, and the
+    repos and assumptions. `for_developer`: technical questions, asked to the developer alone."""
+    analyses: dict[str, str]
+    questions: dict[str, list[str]]
+    for_developer: dict[str, list[str]]
+    repos: list[str]
+    assumptions: list[str]
 
 
 def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tuple[Repo, str]],
@@ -659,24 +570,14 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     label = branch
     token = actor.github.token
     pr_base = {repo.name: base for repo, base in targets}
+    settings = actor.settings
 
     # 1. Per repo: a shallow clone of the base branch, on the run's branch; or of the run's branch,
     # continued. The tests then compare against what the clone started from.
-    checkouts = []
-    for repo, base in targets:
-        cancel.check()
-        worktree = workspace / repo.name
-        start = branch if repo.name in continued else base
-        with timings.step(f"clone {repo.name}"):
-            commit = gitops.clone(repo.github, start, worktree, token)
-            if start != branch:
-                gitops.git(worktree, "checkout", "--quiet", "-b", branch)
-        checkouts.append(Checkout(label, repo, start, commit, worktree, cancel=cancel))
-        log.info("%s: %s cloned at %s (%s), on branch %s", label, repo.name, start, commit[:10], branch)
-
+    checkouts = _clone_repos(targets, continued, branch, workspace, token, label, cancel, timings)
     with timings.step("Jira attachments"):
         fetch_attachments(jira, issues, workspace, label)
-    guides = {c.repo.name: guidance.find(c.worktree, c.repo.name) for c in checkouts}  # the projects' own AI instructions
+    guides = {c.repo.name: guidance.find(c.clone, c.repo.name) for c in checkouts}  # the projects' own AI instructions
     for name, found in guides.items():
         if found:
             log.info("%s: %s keeps %d instruction file(s) for AI tools: %s", label, name, len(found),
@@ -684,18 +585,14 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
 
     # 2. Per issue: root cause (bug) or plan (task) on the ticket; fix version for bugs.
     session = partial(ClaudeSession, workspace, envs[0], label=label, cfg=cfg, cancel=cancel, spares=envs[1:])
-    if actor.settings.model == "auto":
+    if settings.model == "auto":
         with timings.step("Claude model choice"):
             model, effort = choose_model(session, issues, note, label)
     else:  # the developer chose the model for every issue
-        model, effort = FIXED_MODELS[actor.settings.model]
+        model, effort = FIXED_MODELS[settings.model]
     claude = session(model=model, effort=effort)
     stronger = escalating(claude, on_model, label)
     log.info("%s: Claude analysing", label)
-    keys_here = [i.key for i in issues]
-    # Claude may ask the reporter instead of guessing, a few times per issue, on the ticket; a
-    # developer's note is their answer.
-    settings = actor.settings
     may_ask = (settings.ask_questions and settings.jira_comments and not note
                and all(rules.questions_asked(i.fields, i.me) < rules.MAX_QUESTION_ROUNDS for i in issues))
     may_ask_developer = settings.ask_developer and not note  # the note of the next run is their answer
@@ -705,71 +602,46 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
         result = ask_usable(claude, analysis_prompt(issues, checkouts, note, may_ask, again, guides, may_ask_developer,
                                                     answered, only),
                             READ_ONLY_TOOLS, analysis_schema(issues, project.repos, may_ask, may_ask_developer),
-                            lambda r: analysis_problem(r, keys_here), "analysis")
-    analyses = {item["key"]: item["analysis"] for item in result["issues"]}
-    questions = {item["key"]: item["questions"] for item in result["issues"] if may_ask and item["questions"]}
-    for_developer = {item["key"]: item["developer_questions"] for item in result["issues"]
-                     if may_ask_developer and item["developer_questions"]}
-    assumptions = result["assumptions"]
-    target_repos = result["repos"]
-    # The developer chose the repos to change. What the fix needs beyond them is theirs to decide:
-    # they are asked once, and the run after that keeps to what they then chose.
-    beyond = [r for r in target_repos if only and r not in only]
+                            lambda r: analysis_check(r, [i.key for i in issues], [c.repo.name for c in checkouts]),
+                            "analysis")
+    plan = _plan(result, issues, may_ask, may_ask_developer)
+    beyond = [r for r in plan.repos if only and r not in only]
     if beyond and settings.ask_developer and not any(i.key in asked for i in issues):
-        for_developer.setdefault(issues[0].key, []).append(
+        plan.for_developer.setdefault(issues[0].key, []).append(
             f"The fix needs changes in {', '.join(beyond)} too, but you chose to change only {', '.join(only)}. Run it "
             f"again with {', '.join(beyond)} ticked too to change them, or as it is to keep to {', '.join(only)}.")
     elif beyond:
-        target_repos = [r for r in target_repos if r in only] or list(only)
-        assumptions = [*assumptions, f"Only {', '.join(target_repos)} was changed, as chosen; the fix also needs "
-                                     f"changes in {', '.join(beyond)}."]
+        plan.repos = [r for r in plan.repos if r in only] or list(only)
+        plan.assumptions = [*plan.assumptions, f"Only {', '.join(plan.repos)} was changed, as chosen; the fix also needs "
+                                               f"changes in {', '.join(beyond)}."]
     work_on = [c for c in checkouts if not only or c.repo.name in only]  # what is outside is never committed
     cancel.check()
-    if questions:
+
+    # Questions go to the reporter (on the ticket) or to the developer (for them alone, never on the ticket).
+    if plan.questions:
         with timings.step("Jira questions"):
             for issue in issues:
-                if issue.key in questions:
-                    jira.comment(issue.key, rules.questions_comment(questions[issue.key], issue.reporter))
-                    log.info("%s: asked its reporter: %s", issue.key, " | ".join(questions[issue.key]))
-    if for_developer:  # technical: for the developer alone, never on the ticket
-        subject, message = decision_message(for_developer)
+                if issue.key in plan.questions:
+                    jira.comment(issue.key, rules.questions_comment(plan.questions[issue.key], issue.reporter))
+                    log.info("%s: asked its reporter: %s", issue.key, " | ".join(plan.questions[issue.key]))
+    if plan.for_developer:
+        subject, message = decision_message(plan.for_developer)
         log.info("%s: asked %s: %s", label, actor.display_name, " | ".join(message.splitlines()[1:-1]))
         notify_developer(actor, cfg, "decisions", subject, message, label,
-                         project.site_url, list(for_developer), emails.decision(for_developer, project.site_url))
-        on_questions(for_developer)
-        return "question", message + ("\nIts questions for the reporter are on the ticket too." if questions else "")
-    if questions:
-        return "waiting", (f"waiting for answers: the reporter was asked on {', '.join(questions)} what the work "
+                         project.site_url, list(plan.for_developer), emails.decision(plan.for_developer, project.site_url))
+        on_questions(plan.for_developer)
+        return "question", message + ("\nIts questions for the reporter are on the ticket too." if plan.questions else "")
+    if plan.questions:
+        return "waiting", (f"waiting for answers: the reporter was asked on {', '.join(plan.questions)} what the work "
                            "needs to know; it runs again once someone answers there")
     with timings.step("Jira analysis updates"):
-        version = None
-        if settings.jira_fix_version and project.uses_fix_versions and any(i.kind == "bug" for i in issues):
-            # By the project's pick, replacing what the ticket had (e.g. a wrong one from an earlier run).
-            version = rules.fix_version(jira.project_versions(issues[0].fields["project"]["key"]),
-                                        project.fix_version_pick, [pr_base[r] for r in target_repos if r in pr_base])
-            if not version:
-                log.warning("%s: no unreleased numbered Jira version found; fix version not set", label)
-        for issue in issues:
-            analysis = analyses[issue.key]
-            log.info("%s: %s (repos: %s): %s", issue.key, "root cause" if issue.kind == "bug" else "plan",
-                     ", ".join(target_repos), analysis)
-            if issue.kind == "bug" and project.root_cause_field:
-                if settings.jira_root_cause:
-                    jira.set_field(issue.key, project.root_cause_field, analysis)
-                    log.info("%s: Jira %s (root cause) set", issue.key, project.root_cause_field)
-            elif settings.jira_comments:
-                heading = ROOT_CAUSE_HEAD if issue.kind == "bug" else PLAN_HEAD
-                jira.comment(issue.key, f"{heading}\n{analysis}")
-                log.info("%s: Jira comment with the %s posted", issue.key, heading.strip("*:").lower())
-            if issue.kind == "bug" and version:
-                jira.set_fix_versions(issue.key, [version])
-                log.info("%s: Jira fix version set to %s", issue.key, version)
+        _record_analysis(jira, issues, plan, project, settings, pr_base, label)
 
     # 3. Change, test every changed repo, self-heal.
-    log.info("%s: Claude making the change in %s", label, ", ".join(target_repos))
+    log.info("%s: Claude making the change in %s", label, ", ".join(plan.repos))
     with timings.step("Claude change"):
-        change = change_prompt(issues, target_repos, settings.regression_tests, beyond)
-        summary = ask_usable(claude, change, EDIT_TOOLS, CHANGE_SCHEMA, summary_problem, "summary")["summary"]
+        change = change_prompt(issues, plan.repos, settings.regression_tests, beyond)
+        summary = ask_usable(claude, change, EDIT_TOOLS, CHANGE_SCHEMA, summary_check, "summary")["summary"]
     to_ship, summary, failures = heal(claude, work_on, scratch, cfg, label, timings, cancel, summary, stronger,
                                       redo=change)
     proof = ""
@@ -795,44 +667,12 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
         return "done", f"dry run: tests pass; change in {changed_repos} kept at {workspace}, nothing pushed"
 
     # 4. Per changed repo: commit and push as the developer, PR into the base branch.
-    if len(issues) == 1:
-        title = f"{issues[0].key}: {issues[0].summary or ('bug fix' if issues[0].kind == 'bug' else 'task')}"
-        if len(title) > MAX_TITLE_CHARS:
-            title = title[:MAX_TITLE_CHARS - 1].rstrip() + "…"
-    else:
-        title = f"{rules.compact_keys(keys_here, ', ', ' to ')}: {len(issues)} issues fixed together"
-    per_issue = "\n\n".join(
-        f"### {i.key}: {i.summary}\n**{'Root cause' if i.kind == 'bug' else 'Plan'}:** {analyses[i.key]}" for i in issues)
-    commit_details = "\n\n".join(
-        f"{i.key}: {i.summary}\n{'Root cause' if i.kind == 'bug' else 'Plan'}: {analyses[i.key]}" for i in issues)
-    links = ", ".join(f"[{i.key}]({project.site_url}/browse/{i.key})" for i in issues)
-    proven = f"{proof}\n\n" if proof else ""
-    if assumptions:  # what Claude decided that the issue left open: for the reviewers to check
-        proven += "**Assumptions** (the issue left these open):\n" + "\n".join(
-            f"- {a}" for a in assumptions) + "\n\n"
-    changes = []
-    for c in to_ship:
-        cancel.check()  # last chance: nothing is pushed for a stopped run
-        base, existing = pr_base[c.repo.name], continued.get(c.repo.name)
-        with timings.step(f"commit and push {c.repo.name}"):
-            name, email = actor.github.git_name, actor.github.git_email
-            gitops.commit_all(c.worktree, f"{title}\n\n{summary}\n\n{commit_details}", name, email)
-            log.info("%s: %s committed as %s <%s>; pushing branch %s to %s", label, c.repo.name, name, email, branch,
-                     c.repo.github)
-            gitops.push(c.worktree, c.repo.github, branch, token)
-            pushed.append(c.repo.name)
-        if existing:  # the issue was sent back while its PR is open: the push updated it
-            changes.append(Change(c.repo.name, base, "update", f"Pushed more changes for {', '.join(keys_here)} after it "
-                                  f"was reopened.\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}",
-                                  existing["number"], existing["html_url"]))
-        elif settings.publish == "branch":  # the developer opens the PR
-            changes.append(Change(c.repo.name, base, "branch", url=compare_url(c.repo.github, base, branch)))
-        else:
-            changes.append(Change(c.repo.name, base, "new",
-                                  f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}"))
-    cancel.check()
-    publication = Publication(tuple(keys_here), branch, title, tuple(changes), again=bool(continued))
+    keys_here = [i.key for i in issues]
+    title = _title(issues, keys_here)
+    changes = _commit_and_push(to_ship, issues, plan, title, summary, proof, branch, pr_base, continued,
+                               project, actor, pushed, cancel, timings)
     skips = [f"skipped {s}" for s in skipped]
+    publication = Publication(tuple(keys_here), branch, title, tuple(changes), again=bool(continued))
     now = time.time()
     if hold and publication.involves_others and not settings.at_work(now):
         # PRs and their review request are for other people: they wait for the developer's working hours.
@@ -846,6 +686,120 @@ def _work(issues: list[Issue], skipped: list[str], branch: str, targets: list[tu
     return status, "; ".join([message, *skips]) if status == "done" else message
 
 
+def _clone_repos(targets: list[tuple[Repo, str]], continued: dict[str, dict | None], branch: str, workspace: Path,
+                 token: str, label: str, cancel: CancelToken, timings: Timings) -> list[Checkout]:
+    """A clone of each repo: of its base branch, on the run's branch; or of the run's branch, continued."""
+    checkouts = []
+    for repo, base in targets:
+        cancel.check()
+        start = branch if repo.name in continued else base
+        with timings.step(f"clone {repo.name}"):
+            clone = gitops.clone(repo.github, start, workspace / repo.name, gitops.gitdirs_of(workspace) / repo.name, token)
+            if start != branch:
+                gitops.checkout_new(clone, branch)
+            commit = gitops.head(clone)
+        checkouts.append(Checkout(label, repo, start, commit, clone, cancel=cancel))
+        log.info("%s: %s cloned at %s (%s), on branch %s", label, repo.name, start, commit[:10], branch)
+    return checkouts
+
+
+def _plan(result: dict, issues: list[Issue], may_ask: bool, may_ask_developer: bool) -> Plan:
+    """The analysis answer, as what the run acts on."""
+    return Plan(
+        analyses={item["key"]: item["analysis"] for item in result["issues"]},
+        questions={item["key"]: item["questions"] for item in result["issues"] if may_ask and item["questions"]},
+        for_developer={item["key"]: item["developer_questions"] for item in result["issues"]
+                       if may_ask_developer and item["developer_questions"]},
+        repos=result["repos"],
+        assumptions=result["assumptions"],
+    )
+
+
+def _record_analysis(jira: Jira, issues: list[Issue], plan: Plan, project: Project, settings, pr_base: dict[str, str],
+                     label: str) -> None:
+    """The analysis on the tickets: the root cause or plan (a field, or a comment), and for bugs the fix version."""
+    version = None
+    if settings.jira_fix_version and project.uses_fix_versions and any(i.kind == "bug" for i in issues):
+        # By the project's pick, replacing what the ticket had (e.g. a wrong one from an earlier run).
+        version = rules.fix_version(jira.project_versions(issues[0].fields["project"]["key"]),
+                                    project.fix_version_pick, [pr_base[r] for r in plan.repos if r in pr_base])
+        if not version:
+            log.warning("%s: no unreleased numbered Jira version found; fix version not set", label)
+    for issue in issues:
+        analysis = plan.analyses[issue.key]
+        log.info("%s: %s (repos: %s): %s", issue.key, "root cause" if issue.kind == "bug" else "plan",
+                 ", ".join(plan.repos), analysis)
+        if issue.kind == "bug" and project.root_cause_field:
+            if settings.jira_root_cause:
+                jira.set_field(issue.key, project.root_cause_field, analysis)
+                log.info("%s: Jira %s (root cause) set", issue.key, project.root_cause_field)
+        elif settings.jira_comments:
+            heading = ROOT_CAUSE_HEAD if issue.kind == "bug" else PLAN_HEAD
+            jira.comment(issue.key, f"{heading}\n{analysis}")
+            log.info("%s: Jira comment with the %s posted", issue.key, heading.strip("*:").lower())
+        if issue.kind == "bug" and version:
+            jira.set_fix_versions(issue.key, [version])
+            log.info("%s: Jira fix version set to %s", issue.key, version)
+
+
+def _title(issues: list[Issue], keys: list[str]) -> str:
+    """The PR's title: the issue's key and summary, or the keys of the issues fixed together."""
+    if len(issues) == 1:
+        title = f"{issues[0].key}: {issues[0].summary or ('bug fix' if issues[0].kind == 'bug' else 'task')}"
+        return title[:MAX_TITLE_CHARS - 1].rstrip() + "…" if len(title) > MAX_TITLE_CHARS else title
+    return f"{rules.compact_keys(keys, ', ', ' to ')}: {len(issues)} issues fixed together"
+
+
+def _commit_and_push(to_ship: list[Checkout], issues: list[Issue], plan: Plan, title: str, summary: str, proof: str,
+                     branch: str, pr_base: dict[str, str], continued: dict[str, dict | None], project: Project,
+                     actor: Actor, pushed: list[str], cancel: CancelToken, timings: Timings) -> list[Change]:
+    """Commit each changed repo as the developer and push the branch. Returns what each repo's PR is
+    to be: a new one, an update of the open PR the push went to, or the branch for the developer to open."""
+    settings = actor.settings
+    keys_here = [i.key for i in issues]
+    per_issue = "\n\n".join(
+        f"### {i.key}: {i.summary}\n**{'Root cause' if i.kind == 'bug' else 'Plan'}:** {plan.analyses[i.key]}" for i in issues)
+    commit_details = "\n\n".join(
+        f"{i.key}: {i.summary}\n{'Root cause' if i.kind == 'bug' else 'Plan'}: {plan.analyses[i.key]}" for i in issues)
+    links = ", ".join(f"[{i.key}]({project.site_url}/browse/{i.key})" for i in issues)
+    proven = f"{proof}\n\n" if proof else ""
+    if plan.assumptions:  # what Claude decided that the issue left open: for the reviewers to check
+        proven += "**Assumptions** (the issue left these open):\n" + "\n".join(
+            f"- {a}" for a in plan.assumptions) + "\n\n"
+    changes = []
+    for c in to_ship:
+        cancel.check()  # last chance: nothing is pushed for a stopped run
+        base, existing = pr_base[c.repo.name], continued.get(c.repo.name)
+        with timings.step(f"commit and push {c.repo.name}"):
+            name, email = actor.github.git_name, actor.github.git_email
+            gitops.commit_all(c.clone, f"{title}\n\n{summary}\n\n{commit_details}", name, email)
+            log.info("%s: %s committed as %s <%s>; pushing branch %s to %s", c.label, c.repo.name, name, email, branch,
+                     c.repo.github)
+            gitops.push(c.clone, c.repo.github, branch, actor.github.token)
+            pushed.append(c.repo.name)
+        if existing:  # the issue was sent back while its PR is open: the push updated it
+            changes.append(Change(c.repo.name, base, "update", f"Pushed more changes for {', '.join(keys_here)} after it "
+                                  f"was reopened.\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}",
+                                  existing["number"], existing["html_url"]))
+        elif settings.publish == "branch":  # the developer opens the PR
+            changes.append(Change(c.repo.name, base, "branch", url=compare_url(c.repo.github, base, branch)))
+        else:
+            changes.append(Change(c.repo.name, base, "new",
+                                  f"Resolves {links}\n\n{per_issue}\n\n## Change\n{summary}\n\n{proven}{tested(c)}"))
+    return changes
+
+
+@dataclass
+class _Opened:
+    """What opening a run's PRs produced: the lines for its message, the PRs open now, the PRs
+    this run opened, the table for Jira, and the repos whose PR could not be opened."""
+    prs: list[str] = field(default_factory=list)
+    unopened: list[str] = field(default_factory=list)
+    opened: list[tuple[Repo, str]] = field(default_factory=list)
+    rows: list[tuple[Repo, str, str]] = field(default_factory=list)
+    new: list[tuple[Repo, str]] = field(default_factory=list)
+
+
 def open_prs(pub: Publication, project: Project, actor: Actor, jira: Jira, github: GitHub, label: str,
              on_pr: Callable[..., None] = lambda *pr: None, announce: Callable[..., None] | None = None,
              timings: Timings | None = None) -> tuple[str, str]:
@@ -856,79 +810,110 @@ def open_prs(pub: Publication, project: Project, actor: Actor, jira: Jira, githu
     tickets stay in progress, with where to open it by hand)."""
     settings = actor.settings
     step = timings.step if timings else (lambda name: nullcontext())
-    prs, unopened, opened, rows, new = [], [], [], [], []
+    out = _Opened()
     for c in pub.changes:
         repo = project.repo(c.repo)
         if not repo:  # removed from the project since its run
             continue
-        kind = "branch" if c.kind == "new" and settings.publish == "branch" else c.kind
-        if kind == "branch":
-            url = c.url or compare_url(repo.github, c.base, pub.branch)
-            prs.append(f"{repo.name}: branch {pub.branch} pushed; open its PR into {c.base} at {url}")
-            rows.append((repo, c.base, url))
-            log.info("%s: %s branch %s pushed; no PR opened, as chosen", label, repo.name, pub.branch)
-            continue
-        with step(f"open PR {repo.name}"):
-            if kind == "update":
-                pr_url = c.url
-                try:
-                    github.comment(repo.github, c.pr, c.text)
-                except HTTPError as e:
-                    log.warning("%s: could not comment on %s: %s", label, pr_url, e)
-            else:
-                try:
-                    pr_url = github.create_pr(repo.github, base=c.base, head=pub.branch, title=pub.title, body=c.text,
-                                              draft=settings.publish == "draft")
-                    new.append((repo, pr_url))
-                except HTTPError as e:  # the change is on GitHub: say where, so the PR can be opened by hand
-                    found = _open_pr(github, repo.github, pub.branch) if e.status == 422 else None
-                    if not found:
-                        log.warning("%s: %s branch pushed, but the PR could not be opened: %s", label, repo.name, e)
-                        unopened.append(f"{repo.name}: branch {pub.branch} is pushed, but its PR into {c.base} could not be "
-                                        f"opened (GitHub answered {e.status}); open it at "
-                                        f"{compare_url(repo.github, c.base, pub.branch)}")
-                        continue
-                    pr_url = found  # opened since, by a later run of the same branch
-        prs.append(f"{repo.name} into {c.base}: {pr_url}{' (updated)' if kind == 'update' else ''}")
-        opened.append((repo, pr_url))
-        rows.append((repo, c.base, pr_url))
-        log.info("%s: %s PR %s%s", label, repo.name, pr_url, " updated" if kind == "update" else "")
-    if unopened:
-        # Not in review until every PR is open: the issue stays in progress, for its developer.
-        with step("Jira: PRs to open by hand"):
-            lines = "\n".join(f"* {line}" for line in [*unopened, *(f"opened {p}" for p in prs)])
-            for key in pub.keys:
-                if settings.jira_comments:
-                    try:
-                        jira.comment(key, f"{PRS_UNOPENED}\n" + lines)
-                    except HTTPError as e:
-                        log.warning("%s: could not comment the branches to open PRs for: %s", key, e)
-                if settings.jira_status:
-                    move_issue(jira, key, project.start_statuses)
-        return "failed", "; ".join([*unopened, *(f"opened {p}" for p in prs)])
-    asked = None
-    if settings.slack_review_request and settings.publish == "pr" and opened:  # a draft is not ready for review yet
-        with step("Slack review request"):
-            if announce:  # one request for all the runs started with this one, once the last has ended
-                announce(pub.title, opened, pub.branch)
-            else:
-                asked = ask_for_review(actor, project, pub.title, opened, label, again=pub.again)
-    for repo, pr_url in new:  # an updated PR is watched already
+        _open_one(c, repo, pub, settings, github, label, step, out)
+    if out.unopened:
+        _hold_for_hand(pub, project, jira, settings, out, step)
+        return "failed", "; ".join([*out.unopened, *(f"opened {p}" for p in out.prs)])
+    asked = _request_review(pub, project, actor, out, label, announce, step)
+    for repo, pr_url in out.new:  # an updated PR is watched already
         on_pr(repo, int(pr_url.rstrip("/").rsplit("/", 1)[1]), pub.branch, asked)
+    unreported = _jira_pr_links(pub, project, jira, settings, out, step)
+    return "done", "; ".join([*out.prs, *unreported])
+
+
+def _open_one(c: Change, repo: Repo, pub: Publication, settings, github: GitHub, label: str, step, out: _Opened) -> None:
+    """Open (or update, or leave to the developer) the PR of one repo's change, recording the outcome in `out`."""
+    kind = "branch" if c.kind == "new" and settings.publish == "branch" else c.kind
+    if kind == "branch":
+        url = c.url or compare_url(repo.github, c.base, pub.branch)
+        out.prs.append(f"{repo.name}: branch {pub.branch} pushed; open its PR into {c.base} at {url}")
+        out.rows.append((repo, c.base, url))
+        log.info("%s: %s branch %s pushed; no PR opened, as chosen", label, repo.name, pub.branch)
+        return
+    with step(f"open PR {repo.name}"):
+        if kind == "update":
+            pr_url = c.url
+            try:
+                github.comment(repo.github, c.pr, c.text)
+            except HTTPError as e:
+                log.warning("%s: could not comment on %s: %s", label, pr_url, e)
+        else:
+            pr_url = _create_pr(c, repo, pub, settings, github, label, out)
+            if pr_url is None:
+                return
+    out.prs.append(f"{repo.name} into {c.base}: {pr_url}{' (updated)' if kind == 'update' else ''}")
+    out.opened.append((repo, pr_url))
+    out.rows.append((repo, c.base, pr_url))
+    log.info("%s: %s PR %s%s", label, repo.name, pr_url, " updated" if kind == "update" else "")
+
+
+def _create_pr(c: Change, repo: Repo, pub: Publication, settings, github: GitHub, label: str, out: _Opened) -> str | None:
+    """A new PR for the change. When GitHub refuses it, the PR already open for the branch is used, if
+    there is one; otherwise None, with the line saying where to open it by hand."""
+    try:
+        pr_url = github.create_pr(repo.github, base=c.base, head=pub.branch, title=pub.title, body=c.text,
+                                  draft=settings.publish == "draft")
+        out.new.append((repo, pr_url))
+        return pr_url
+    except HTTPError as e:  # the change is on GitHub: say where, so the PR can be opened by hand
+        found = _open_pr(github, repo.github, pub.branch) if e.status == 422 else None
+        if found:  # opened since, by a later run of the same branch
+            return found
+        log.warning("%s: %s branch pushed, but the PR could not be opened: %s", label, repo.name, e)
+        out.unopened.append(f"{repo.name}: branch {pub.branch} is pushed, but its PR into {c.base} could not be "
+                            f"opened (GitHub answered {e.status}); open it at {compare_url(repo.github, c.base, pub.branch)}")
+        return None
+
+
+def _hold_for_hand(pub: Publication, project: Project, jira: Jira, settings, out: _Opened, step) -> None:
+    """Not in review until every PR is open: the issue stays in progress, for its developer."""
+    with step("Jira: PRs to open by hand"):
+        lines = "\n".join(f"* {line}" for line in [*out.unopened, *(f"opened {p}" for p in out.prs)])
+        for key in pub.keys:
+            if settings.jira_comments:
+                try:
+                    jira.comment(key, f"{PRS_UNOPENED}\n" + lines)
+                except HTTPError as e:
+                    log.warning("%s: could not comment the branches to open PRs for: %s", key, e)
+            if settings.jira_status:
+                move_issue(jira, key, project.start_statuses)
+
+
+def _request_review(pub: Publication, project: Project, actor: Actor, out: _Opened, label: str,
+                    announce, step) -> tuple[str, str] | None:
+    """Ask for the PRs' review in Slack (a draft is not ready for review yet). Returns the message's
+    (channel, timestamp), None when it was not asked here."""
+    settings = actor.settings
+    if not (settings.slack_review_request and settings.publish == "pr" and out.opened):
+        return None
+    with step("Slack review request"):
+        if announce:  # one request for all the runs started with this one, once the last has ended
+            announce(pub.title, out.opened, pub.branch)
+            return None
+        return ask_for_review(actor, project, pub.title, out.opened, label, again=pub.again)
+
+
+def _jira_pr_links(pub: Publication, project: Project, jira: Jira, settings, out: _Opened, step) -> list[str]:
+    """Comment the PR links on each ticket, and move it to review. Returns what could not be reported."""
     unreported = []
     with step("Jira PR links and review status"):
         for key in pub.keys:
             others = [k for k in pub.keys if k != key]
             if settings.jira_comments:
                 try:  # the work is pushed: a Jira error now must not make the run look failed
-                    jira.comment(key, rules.pr_links_comment(rows, others))
+                    jira.comment(key, rules.pr_links_comment(out.rows, others))
                     log.info("%s: Jira comment with the PR links posted", key)
                 except HTTPError as e:
                     log.warning("%s: could not comment the PR links: %s", key, e)
                     unreported.append(f"{key}: the PR links could not be commented on the ticket")
-            if settings.jira_status and opened:  # in review once there is a PR to review
+            if settings.jira_status and out.opened:  # in review once there is a PR to review
                 move_issue(jira, key, project.review_statuses)
-    return "done", "; ".join([*prs, *unreported])
+    return unreported
 
 
 def _open_pr(github: GitHub, owner_repo: str, branch: str) -> str | None:

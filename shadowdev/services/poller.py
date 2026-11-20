@@ -11,7 +11,8 @@ import time
 from datetime import datetime
 
 from ..automation import rules
-from ..clients.atlassian import AtlassianOAuth, jira_client
+from ..clients.atlassian import AtlassianOAuth, JiraAccessLost, jira_client
+from ..clients.rest import HTTPError
 from ..models.project import Project
 from ..models.user import User
 from ..repositories.projects import ProjectRepository
@@ -53,24 +54,29 @@ class Poller:
 
     def poll(self, now: float | None = None) -> int:
         """Poll the projects of every active developer who polls, that are due by their interval.
-        Returns how many issues were queued."""
+        Returns how many issues were queued. Developers who don't poll are not even loaded."""
         now = now or time.time()
         queued = 0
-        for user in self.users.all():
-            if user.paused or not user.limits.jira_polling:
+        for user_id, (paused, limits) in self.users.timings().items():
+            if paused or not limits.jira_polling:
+                continue
+            user = self.users.loadable(user_id)
+            if not user:
                 continue
             for project in self.projects.on_sites(list(user.sites)):
                 actor = user.actor(project.id)
                 if actor and actor.settings.auto_start:
                     try:
                         queued += self._poll_project(user, project, now)
-                    except Exception as e:  # e.g. revoked Jira access: the other projects still run
+                    except (HTTPError, JiraAccessLost) as e:  # e.g. revoked Jira access: the other projects still run
                         log.warning("polling %s for %s failed: %s", project.name, user.display_name, e)
+                    except Exception:
+                        log.exception("polling %s for %s failed; the other projects still run", project.name, user.display_name)
         return queued
 
     def _poll_project(self, user: User, project: Project, now: float) -> int:
         actor = user.actor(project.id)
-        last, interval = self.users.polled_at(user.id, project.id), user.limits.jira_poll_minutes
+        last, interval = self.users.subscriptions.polled_at(user.id, project.id), user.limits.jira_poll_minutes
         if last and now - last < interval * 60:
             return 0
         # A project never polled before: the issues updated in the last interval (whole minutes, for the JQL).
@@ -99,5 +105,5 @@ class Poller:
                 queued += 1
         log.info("polled Jira for %s in %s: %d issue(s) found, %d started", user.display_name, project.name,
                  len(issues), queued)
-        self.users.mark_polled(user.id, project.id, now)
+        self.users.subscriptions.mark_polled(user.id, project.id, now)
         return queued

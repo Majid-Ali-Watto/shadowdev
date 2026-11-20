@@ -8,7 +8,7 @@ dependencies = ["cryptography>=42"]
 [project.scripts]
 shadowdev = "shadowdev.__main__:main"
 
-# ShadowDev runs from its checkout (it reads projects/ and .env there), so install it editable:
+# ShadowDev runs from its checkout (it reads .env and keeps data/ there), so install it editable:
 #   pip install -e .     or     uv run shadowdev
 [build-system]
 requires = ["setuptools>=69"]

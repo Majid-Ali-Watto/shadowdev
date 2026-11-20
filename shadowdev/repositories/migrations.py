@@ -15,19 +15,9 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from ..models.project import CUSTOM_FIELD_RE, GITHUB_REPO_RE, JIRA_PROJECT_RE, REPO_NAME_RE
-from .database import SCHEMA, VERSION
+from .database import SCHEMA, VERSION, statements
 
 log = logging.getLogger("shadowdev")
-
-
-def statements(script: str):
-    """The SQL statements of a script, one by one (executescript would commit midway)."""
-    buffer = ""
-    for line in script.splitlines(keepends=True):
-        buffer += line
-        if sqlite3.complete_statement(buffer):
-            yield buffer
-            buffer = ""
 
 
 def legacy_project(path: Path) -> dict:

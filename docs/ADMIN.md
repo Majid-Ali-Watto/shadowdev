@@ -102,10 +102,22 @@ runs in progress at once, as their Stop button does. A Jira webhook sent while t
 is delivered again by Jira.
 
 `GET /health` answers `{"status": "ok"}` while the server runs and can read its database, for a
-reverse proxy or a monitor. Starting a sign-in and the OAuth callback take at most 30 requests a
-minute from one client, and `/webhook` 600; more are answered `429` with `Retry-After`. Behind a
-reverse proxy or tunnel on the same machine, the client is the address the proxy puts last in
-`X-Forwarded-For`.
+reverse proxy or a monitor. The routes anyone can call without signing in are limited per client
+address and minute: `/` (the login page) 120, `/health` 60, starting a sign-in and the OAuth callback
+30 each, and `/webhook` 600; more are answered `429` with `Retry-After`. The test messages of a
+project are limited to 6 a minute. Behind a reverse proxy or tunnel on the same machine, the client
+is the address the proxy puts last in `X-Forwarded-For`.
+
+The server holds at most 64 connections at once. It gives a request 30 seconds to arrive in full
+(its request line, headers and body) and waits at most 20 seconds between two sends from a client,
+so a client that trickles its request in is cut off. It does not limit the size of what a client
+sends beyond the routes' own limits (1 MB for a webhook, 64 KB for a form), and it cannot limit how
+many connections one address opens. **The reverse proxy in front must do that**: a limit on request
+size and on the time a client may take to send its headers and body, and a limit on connections per
+address. With nginx, `client_max_body_size`, `client_header_timeout` and `client_body_timeout` (and
+`limit_conn` for connections per address). Recent runs' live updates are a stream that lasts up to
+5 minutes, so the proxy's read timeout must be longer than that, and buffering must stay off for it
+(ShadowDev sends `X-Accel-Buffering: no`, which nginx obeys).
 
 ## Backups and the key
 

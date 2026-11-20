@@ -10,7 +10,7 @@ from ..models.user import User
 from ..repositories.projects import ProjectRepository
 from ..repositories.runs import KEPT_RUNS, RunRepository
 from ..repositories.users import UserRepository
-from .accounts import form_id
+from .accounts import ID_RE, form_id
 from .errors import UserError
 from .projects import run_all
 from .run_queue import RunQueue
@@ -160,7 +160,7 @@ class RunService:
     def delete(self, user: User, run_ids: list[str]) -> None:
         """Remove finished runs from the developer's Recent runs. Queued and running ones are not
         removed (stop them first); the tickets and PRs they made are not touched."""
-        ids = list(dict.fromkeys(int(i) for i in run_ids if i.isdigit()))[:KEPT_RUNS]
+        ids = list(dict.fromkeys(int(i) for i in run_ids if ID_RE.fullmatch(i)))[:KEPT_RUNS]
         if not ids:
             raise UserError("Select the runs to delete.")
         if not self.runs.delete_finished(user.id, ids):
@@ -168,5 +168,5 @@ class RunService:
 
     def stop(self, user: User, run_id: str) -> None:
         """Stop one of the developer's queued or running runs. Its ticket is left as it was."""
-        if not run_id.isdigit() or not self.queue.stop_run(int(run_id), user.id):
+        if not ID_RE.fullmatch(run_id) or not self.queue.stop_run(int(run_id), user.id):
             raise UserError("That run has already finished, or is not yours.")

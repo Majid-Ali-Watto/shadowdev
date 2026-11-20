@@ -53,7 +53,7 @@ def main() -> None:
                   "Now remove the old key from SHADOWDEV_SECRET_KEY in .env, and restart the server.")
     elif args.command == "dry-run":
         from .app import database
-        from .automation.dryrun import dry_run
+        from .dryrun import dry_run
         from .repositories.projects import ProjectRepository
         from .repositories.users import UserRepository
 
@@ -62,10 +62,12 @@ def main() -> None:
         dry_run(cfg, UserRepository(db), ProjectRepository(db), args.project, args.who,
                 args.type, args.summary, description, args.note.strip())
     else:
+        from .automation import sandbox
         from .logfiles import write_to_files
         from .server import serve
 
         write_to_files(cfg.data_dir / "logs")
+        sandbox.probe(cfg)  # logs which resource limits runs get
         serve(cfg)
 
 

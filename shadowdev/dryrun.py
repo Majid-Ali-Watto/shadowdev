@@ -10,14 +10,15 @@ import dataclasses
 import logging
 import time
 
-from ..config import Config
-from ..models.project import Project
-from ..models.user import Actor, User
-from ..repositories.projects import ProjectRepository
-from ..repositories.users import UserRepository
-from . import gitops
-from .pipeline import process_issues, workspace_name
-from .timing import END, duration
+from .automation import gitops
+from .automation.pipeline import process_issues
+from .automation.timing import END, duration
+from .automation.workspace import workspace_name
+from .config import Config
+from .models.project import Project
+from .models.user import Actor, User
+from .repositories.projects import ProjectRepository
+from .repositories.users import UserRepository
 
 log = logging.getLogger("shadowdev")
 
@@ -116,11 +117,15 @@ def dry_run(cfg: Config, users: UserRepository, projects: ProjectRepository, pro
 
         print(f"\nResult: {status}: {message}")
         workspace = cfg.worktree_root / workspace_name(project, key)
+        gits = gitops.gitdirs_of(workspace)
         for repo in project.repos:
-            worktree = workspace / repo.name
-            if worktree.exists() and gitops.git(worktree, "status", "--porcelain"):
-                print(f"\n{repo.name}: changed files (?? = new file)\n{gitops.git(worktree, 'status', '--short')}")
-                print(f"  full diff: git -C {worktree} diff    (new files: open them in {worktree})")
+            worktree, gitdir = workspace / repo.name, gits / repo.name
+            if worktree.exists() and gitdir.exists():
+                clone = gitops.existing(worktree, gitdir)
+                if gitops.git(clone, "status", "--porcelain"):
+                    print(f"\n{repo.name}: changed files (?? = new file)\n{gitops.git(clone, 'status', '--short')}")
+                    print(f"  full diff: git --git-dir={gitdir} --work-tree={worktree} diff    "
+                          f"(new files: open them in {worktree})")
         if workspace.exists():
             print(f"\nThe next dry run replaces {workspace}.")
     finally:

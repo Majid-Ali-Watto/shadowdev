@@ -95,7 +95,7 @@ def from_form(values: dict[str, str]) -> Limits:
         picked[name] = float(text)
     for name, (low, high) in COUNTS.items():
         text = (values.get(name) or "").strip()
-        if not text.isdigit() or not low <= int(text) <= high:
+        if not (len(text) < 10 and text.isascii() and text.isdigit()) or not low <= int(text) <= high:
             raise ValueError(f"{LABELS[name]} must be a whole number from {low} to {high}.")
         picked[name] = int(text)
     return Limits(**picked)

@@ -1,6 +1,7 @@
 """A developer's account: sign in with Jira, connect more Jira accounts and any number of GitHub
 and Claude accounts (e.g. personal and office), pause, and delete. Every token is checked
 against Jira, GitHub or Claude before it is saved."""
+import re
 import secrets
 import shutil
 import time
@@ -20,6 +21,7 @@ from .errors import UserError
 from .run_queue import RunQueue
 
 MAX_ACCOUNTS = 10  # of each kind, per developer
+ID_RE = re.compile(r"[0-9]{1,18}")
 
 
 def without_whitespace(token: str) -> str:
@@ -34,7 +36,8 @@ def clean_label(label: str, default: str) -> str:
 
 
 def form_id(value: str) -> int | None:
-    return int(value) if value.isdigit() else None
+    """An ID from a form or URL: digits only, short enough to be an ID (isdigit() also takes other digits)."""
+    return int(value) if ID_RE.fullmatch(value) else None
 
 
 class AccountService:

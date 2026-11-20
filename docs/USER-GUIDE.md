@@ -38,6 +38,8 @@ Open the ShadowDev page and:
 
    You own the projects you add: only you can change or delete them, and you join them
    automatically. Your page shows each one's **Jira webhook** URL and secret, for instant runs.
+   Leaving a project you own hands it to its longest-standing other member, who then sees the webhook
+   secret and can change it; if nobody else is in it, delete it instead.
 
 Saving checks each step: the GitHub and Claude tokens are tried, the GitHub account must be able
 to push to every repo of the project, your Jira account must be able to see its Jira projects,

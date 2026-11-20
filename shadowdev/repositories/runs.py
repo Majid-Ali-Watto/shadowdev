@@ -224,3 +224,13 @@ class RunRepository:
         with closing(self.db.connect()) as conn, conn:
             conn.execute("DELETE FROM webhook_events WHERE at < ?", (forget_before,))
             return conn.execute("INSERT OR IGNORE INTO webhook_events VALUES (?, ?)", (event_id, at)).rowcount == 1
+
+    def forget_event(self, event_id: str) -> None:
+        """Forget a webhook event that was not processed, so that Jira's retry of it is processed."""
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute("DELETE FROM webhook_events WHERE id = ?", (event_id,))
+
+    def ping(self) -> None:
+        """Raises when the database can't be read: what the health check asks (reads nothing)."""
+        with closing(self.db.connect()) as conn:
+            conn.execute("SELECT 1")

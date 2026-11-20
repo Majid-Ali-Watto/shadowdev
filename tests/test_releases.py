@@ -132,7 +132,7 @@ class ReleaseMoverTest(unittest.TestCase):
     def test_off_by_default(self):
         self.assertEqual(Settings().release_moves, False)
         self.assertEqual(self.app.projects.get(self.market.id).status_rules, (RULE,))
-        self.app.users.save_release_report(self.me, self.market.id, ReleaseReport(0))
+        self.app.users.subscriptions.save_release_report(self.me, self.market.id, ReleaseReport(0))
         join(self.app.users, self.me, self.market, ME)  # switched off
         self.found = [ticket("MAR-1", **{ROOT_CAUSE: "x"})]
         self.assertEqual(self.app.releases.poll(), 0)

@@ -13,7 +13,7 @@ from ..views.auth import login_page
 from ..views.home import NOTICES, home_page
 from ..views.overview import overview_panel
 from ..views.runs import run_results
-from .request import COOKIE, FormPost, Request, form_action
+from .request import COOKIE, FormPost, Request, Route, form_action, id_text, parse_id
 
 STREAM_SECONDS = 300  # a live update stream ends after this, and the browser opens another
 CHECK_SECONDS = 1  # how often a stream looks for changes
@@ -21,6 +21,7 @@ BEAT_SECONDS = 15  # with no change for this long, it sends a comment
 MAX_STREAMS = 16  # of all developers at once
 MAX_LIVE_RUNS = 50  # runs one Live logs request may say it has seen; more are ignored
 MAX_STREAMS_EACH = 3  # of one developer (their open tabs): browsers allow 6 connections to a server
+PAGE_LIMIT = 120  # per client and minute: the page, which anyone gets (the login page) and every app swap loads
 
 
 def render(req: Request, user: User, csrf: str, tab: str = "", error: str = "", notice: str = "", status: int = 200,
@@ -44,8 +45,8 @@ def show(req: Request) -> None:
         return req.html(login_page(req.app.cfg.public_url, nonce, req.theme()), nonce)
     tab, notice = NOTICES.get(req.arg("ok"), ("", ""))
     # ?answer=<run>: the form filled in to answer the questions that run asked (only the developer's own).
-    answer = req.arg("answer")
-    run = req.app.runs.get(user.id, int(answer)) if answer.isdigit() else None
+    run_id = parse_id(req.arg("answer"))
+    run = req.app.runs.get(user.id, run_id) if run_id is not None else None
     answering = run if run and run["status"] == "question" else None
     render(req, user, session[2], tab="runs" if answering else req.arg("tab") or tab, notice=notice, answering=answering,
            run_filter=_run_filter(req))
@@ -78,8 +79,9 @@ def live_logs(req: Request) -> None:
     seen = {}
     for pair in req.arg("seen").split(",")[:MAX_LIVE_RUNS]:
         run, _, count = pair.partition(":")
-        if run.isdigit() and count.isdigit() and len(run) < 12 and len(count) < 12:
-            seen[int(run)] = int(count)
+        run_id, lines = parse_id(run), parse_id(count)
+        if run_id is not None and lines is not None:
+            seen[run_id] = lines
     body = json.dumps({"runs": req.app.run_service.live(session[1], seen)}).encode()
     req.send(200, body, "application/json", [("Cache-Control", "no-store")])
 
@@ -144,19 +146,22 @@ STREAMS = Streams()
 def run_log(req: Request) -> None:
     """What was logged while one of the developer's own runs worked (so far, while it works), as plain text."""
     session = req.session()
-    run = req.arg("run")
-    log = req.app.queue.log(session[1], int(run)) if session and run.isdigit() else None
+    run_id = parse_id(req.arg("run"))
+    log = req.app.queue.log(session[1], run_id) if session and run_id is not None else None
     if log is None:
         return req.json(404, "not found")  # also another developer's run, so IDs can't be probed
     req.text(log)
 
 
 def _page(arg: str) -> int:
-    return int(arg) if arg.isdigit() and 0 < int(arg) < 10_000 else 1
+    number = parse_id(arg)
+    return number if number and number < 10_000 else 1
 
 
 def _run_filter(req: Request) -> RunFilter:
-    return RunFilter.of(req.arg("q"), req.arg("status"), req.arg("project"), req.arg("kind"), req.arg("page"))
+    # The page number is read by the model as digits too: one that is not is the first page.
+    return RunFilter.of(req.arg("q"), req.arg("status"), req.arg("project"), req.arg("kind"),
+                        id_text(req.arg("page")) or "1")
 
 
 def action(notice: str, do: Callable[[Request, FormPost], None]) -> Callable[[Request], None]:
@@ -179,34 +184,36 @@ def delete_account(req: Request, post: FormPost) -> None:
 
 
 ROUTES = {
-    ("GET", "/"): show,
-    ("GET", "/runs"): runs,
-    ("GET", "/overview"): overview,
-    ("GET", "/logs/live"): live_logs,
-    ("GET", "/runs/log"): run_log,
-    ("GET", "/runs/events"): run_events,
-    ("POST", "/jira/remove"): action("jira-removed", lambda req, p: req.app.accounts.remove_jira(
-        p.user, p.form.get("jira_account_id", ""))),
-    ("POST", "/github"): action("github", lambda req, p: req.app.accounts.connect_github(
-        p.user, p.form.get("github_token", ""), p.form.get("github_label", ""))),
-    ("POST", "/github/remove"): action("github-removed", lambda req, p: req.app.accounts.remove_github(
-        p.user, p.form.get("github_account_id", ""))),
-    ("POST", "/claude"): action("claude", lambda req, p: req.app.accounts.connect_claude(
-        p.user, p.form.get("claude_token", ""), p.form.get("claude_label", ""))),
-    ("POST", "/claude/remove"): action("claude-removed", lambda req, p: req.app.accounts.remove_claude(
-        p.user, p.form.get("claude_account_id", ""))),
-    ("POST", "/slack"): action("slack", lambda req, p: req.app.accounts.connect_slack(p.user, p.form.get("slack_token", ""))),
-    ("POST", "/slack/remove"): action("slack-removed", lambda req, p: req.app.accounts.remove_slack(p.user)),
-    ("POST", "/run"): action("queued", lambda req, p: req.app.run_service.request(
+    ("GET", "/"): Route(show, anonymous=True, limit=PAGE_LIMIT),  # the login page, to anyone
+    ("GET", "/runs"): Route(runs),
+    ("GET", "/overview"): Route(overview),
+    ("GET", "/logs/live"): Route(live_logs),
+    ("GET", "/runs/log"): Route(run_log),
+    ("GET", "/runs/events"): Route(run_events),
+    ("POST", "/jira/remove"): Route(action("jira-removed", lambda req, p: req.app.accounts.remove_jira(
+        p.user, id_text(p.form.get("jira_account_id", ""))))),
+    ("POST", "/github"): Route(action("github", lambda req, p: req.app.accounts.connect_github(
+        p.user, p.form.get("github_token", ""), p.form.get("github_label", "")))),
+    ("POST", "/github/remove"): Route(action("github-removed", lambda req, p: req.app.accounts.remove_github(
+        p.user, id_text(p.form.get("github_account_id", ""))))),
+    ("POST", "/claude"): Route(action("claude", lambda req, p: req.app.accounts.connect_claude(
+        p.user, p.form.get("claude_token", ""), p.form.get("claude_label", "")))),
+    ("POST", "/claude/remove"): Route(action("claude-removed", lambda req, p: req.app.accounts.remove_claude(
+        p.user, id_text(p.form.get("claude_account_id", ""))))),
+    ("POST", "/slack"): Route(action("slack", lambda req, p: req.app.accounts.connect_slack(
+        p.user, p.form.get("slack_token", "")))),
+    ("POST", "/slack/remove"): Route(action("slack-removed", lambda req, p: req.app.accounts.remove_slack(p.user))),
+    ("POST", "/run"): Route(action("queued", lambda req, p: req.app.run_service.request(
         p.user, p.form.get("issue_keys", ""), together=p.form.get("grouping") == "together",
-        project_id=p.form.get("project_id", ""), note=p.form.get("note", ""), repos=p.lists.get("repos", []),
+        project_id=id_text(p.form.get("project_id", "")), note=p.form.get("note", ""), repos=p.lists.get("repos", []),
         one_message=p.form.get("message") == "one", sequence=p.form.get("grouping") == "sequence",
-        delay_minutes=p.form.get("delay", ""))),
-    ("POST", "/runs/delete"): action("runs-deleted", lambda req, p: req.app.run_service.delete(
-        p.user, p.lists.get("run_id", []))),
-    ("POST", "/stop"): action("stopping", lambda req, p: req.app.run_service.stop(p.user, p.form.get("run_id", ""))),
-    ("POST", "/pause"): action("paused", lambda req, p: req.app.accounts.set_paused(p.user, True)),
-    ("POST", "/resume"): action("resumed", lambda req, p: req.app.accounts.set_paused(p.user, False)),
-    ("POST", "/limits"): action("limits", lambda req, p: req.app.accounts.set_limits(p.user, p.form)),
-    ("POST", "/delete-account"): delete_account,
+        delay_minutes=p.form.get("delay", "")))),
+    ("POST", "/runs/delete"): Route(action("runs-deleted", lambda req, p: req.app.run_service.delete(
+        p.user, [i for i in p.lists.get("run_id", []) if id_text(i)]))),
+    ("POST", "/stop"): Route(action("stopping", lambda req, p: req.app.run_service.stop(
+        p.user, id_text(p.form.get("run_id", ""))))),
+    ("POST", "/pause"): Route(action("paused", lambda req, p: req.app.accounts.set_paused(p.user, True))),
+    ("POST", "/resume"): Route(action("resumed", lambda req, p: req.app.accounts.set_paused(p.user, False))),
+    ("POST", "/limits"): Route(action("limits", lambda req, p: req.app.accounts.set_limits(p.user, p.form))),
+    ("POST", "/delete-account"): Route(delete_account),
 }

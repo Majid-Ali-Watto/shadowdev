@@ -4,6 +4,7 @@ app in the Atlassian developer console (see docs/ADMIN.md).
 
 https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/
 """
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -29,7 +30,12 @@ class JiraAccessLost(RuntimeError):
     """The developer's grant expired or was revoked; they must sign in again."""
 
 
+CLOUD_ID_RE = re.compile(r"[A-Za-z0-9-]{1,64}")  # Atlassian's site IDs (UUIDs); it goes into a URL path
+
+
 def jira_api_base(cloud_id: str) -> str:
+    if not CLOUD_ID_RE.fullmatch(cloud_id):
+        raise ValueError(f"not an Atlassian site ID: {cloud_id!r}")
     return f"{API}/ex/jira/{cloud_id}"
 
 
@@ -122,4 +128,4 @@ def report_accounts(token: str, accounts: list[tuple[str, float]]) -> tuple[list
     body = {"accounts": [{"accountId": a, "updatedAt": rfc3339(at)} for a, at in accounts]}
     data, headers = request("POST", REPORT_URL, {"Authorization": f"Bearer {token}"}, body, "Atlassian")
     cycle = (headers.get("Cycle-Period") or "").strip()
-    return list((data or {}).get("accounts") or []), int(cycle) if cycle.isdigit() and int(cycle) > 0 else None
+    return list((data or {}).get("accounts") or []), int(cycle) if cycle.isascii() and cycle.isdigit() and int(cycle) > 0 else None

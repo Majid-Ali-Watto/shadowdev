@@ -21,7 +21,9 @@ def project_page(cfg: Config, user: User, form: dict, project: Project | None, s
     site_field = (f'<label>Jira site <select name="cloud_id" required>{options(sites, form.get("cloud_id") or (sites[0][0] if len(sites) == 1 else None), "Choose…")}</select></label>'
                   if not project else f'<label>Jira site <input value="{esc(user.sites[project.cloud_id].name)}" disabled></label>')
     github = [(g.id, f"{g.label} (@{g.login})") for g in user.github_accounts]
-    chosen = int(form["github_account_id"]) if str(form.get("github_account_id") or "").isdigit() else (
+    chosen_text = str(form.get("github_account_id") or "")
+    # ASCII digits only: isdigit() also accepts "²", which int() refuses.
+    chosen = int(chosen_text) if chosen_text.isascii() and chosen_text.isdigit() else (
         github[0][0] if len(github) == 1 else None)
     repos = "".join(_repo_fields(r) for r in form.get("repos") or [{}])
     title = f"Edit {project.name}" if project else "Add a project"

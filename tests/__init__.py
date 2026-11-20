@@ -4,7 +4,7 @@ import atexit
 import tempfile
 from pathlib import Path
 
-from shadowdev.automation.pipeline import delete_tree
+from shadowdev.automation.workspace import delete_tree
 
 tempfile.tempdir = tempfile.mkdtemp(prefix="shadowdev-tests-")
 atexit.register(delete_tree, Path(tempfile.tempdir))

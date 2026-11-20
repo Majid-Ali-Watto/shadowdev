@@ -19,7 +19,8 @@ TOKENS = Tokens("access", "refresh", 0)
 def make_cfg(tmp: Path, **overrides) -> Config:
     values = dict(jira_sites=(OFFICE.url, HOME.url), atlassian_client_id="cid", atlassian_client_secret="cs",
                   public_url="http://localhost:8080", webhook_secret="hook-secret", secret_key=Fernet.generate_key().decode(),
-                  max_fix_attempts=1, host="127.0.0.1", port=0, data_dir=tmp / "data", worktree_root=tmp / "worktrees")
+                  max_fix_attempts=1, host="127.0.0.1", port=0, data_dir=tmp / "data", worktree_root=tmp / "worktrees",
+                  cache_root=tmp / "cache")
     return Config(**{**values, **overrides})
 
 
@@ -55,4 +56,4 @@ def join(users: UserRepository, user_id: int, project: Project, account_id: str,
     jira = next(a for a in user.jira_accounts if a.account_id == account_id)
     github = next(g for g in user.github_accounts if g.login == (github_login or account_id))
     claude = next(c for c in user.claude_accounts if c.label == (claude_label or account_id))
-    users.subscribe(user_id, Subscription(project.id, jira.id, github.id, claude.id, mode, bases or {}, settings))
+    users.subscriptions.subscribe(user_id, Subscription(project.id, jira.id, github.id, claude.id, mode, bases or {}, settings))

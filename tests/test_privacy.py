@@ -122,6 +122,33 @@ class PrivacyReporterTest(unittest.TestCase):
         me = self.users.get(self.me)
         self.assertEqual((me.display_name, me.email), (ME_HOME, f"{ME_HOME}@x"))
 
+    def test_what_the_runs_said_about_a_removed_account_is_taken_out(self):
+        run = self.app.runs.add("MAR-1", self.me, self.market.id, self.market.name)
+        self.app.runs.update(run, "skipped", f"MAR-1 is not assigned to {ME}")
+        self.app.runs.set_questions(run, {"MAR-1": [f"Should {ME} keep the old API?"]})
+        self.users.remove_jira_account(self.me, self.users.get(self.me).jira_accounts[0].id)
+        kept = next(r for r in self.app.runs.recent(self.me) if r["id"] == run)
+        self.assertEqual(kept["message"], "MAR-1 is not assigned to [removed]")
+        self.assertNotIn(ME, self.app.runs.get(self.me, run)["questions"])
+        self.assertIn("[removed]", self.app.runs.get(self.me, run)["questions"])
+
+    def test_a_failing_account_is_due_again_and_the_others_are_erased(self):
+        self.answers = [([{"accountId": SARA, "status": "closed"}, {"accountId": ME_HOME, "status": "closed"}], None),
+                        ([{"accountId": SARA, "status": "closed"}], None)]  # the second answer: Sara again, still due
+        real_erase = self.app.accounts.erase_closed_jira
+
+        def erase(account_id):
+            if account_id == SARA:
+                raise RuntimeError("the database was locked")
+            return real_erase(account_id)
+        with mock.patch.object(self.app.accounts, "erase_closed_jira", erase), self.assertLogs("shadowdev", "ERROR"):
+            self.app.privacy.report_due()
+        self.assertEqual([a.account_id for a in self.users.get(self.me).jira_accounts], [ME])  # Majid's closed one: erased
+        self.assertIsNotNone(self.users.get(self.sara))  # Sara's erase failed: she stays, and is not marked reported
+        due = [account_id for _, account_id, _ in self.users.accounts_to_report(time.time() - 60, 90)]
+        self.assertEqual(due, [SARA])
+        self.assertEqual(len(self.reports), 2)  # the pass stopped when a batch had nothing handled
+
     def test_a_schema_2_database_gets_the_reporting_columns(self):
         path = self.cfg.data_dir / "shadowdev.db"
         with sqlite3.connect(path) as db:

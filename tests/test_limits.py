@@ -8,9 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from shadowdev.automation import limits
+from shadowdev.automation import agent, limits
 from shadowdev.automation.agent import CONTINUE, ClaudeSession
 from shadowdev.automation.cancel import Cancelled, CancelToken
+from tests.helpers import make_cfg
 
 HOUR = 3600
 
@@ -23,6 +24,12 @@ def info(five=0.2, week=0.3, five_in=2 * HOUR, week_in=3 * 24 * HOUR, **more):
 
 class LimitsTest(unittest.TestCase):
     def setUp(self):
+        # The stand-in claude lives in a temp folder, which the sandbox hides: these tests cover the stream
+        # handling, not the sandbox (which has its own tests in test_pipeline.py).
+        patcher = mock.patch.object(agent, "in_sandbox", lambda argv, cfg, workspace, config_dir: argv)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = make_cfg(Path(tempfile.mkdtemp()))
         limits.USAGE.clear()
         self.addCleanup(limits.USAGE.clear)
         for name, value in (("POLL", 0.02), ("AFTER_RESET", 0)):
@@ -116,7 +123,7 @@ if [ "$n" = 0 ]; then cat {bin_dir}/first; else echo '{done}'; fi
                                        self.LIMIT])
         told = []
         with limits.telling(told.append):
-            self.assertEqual(ClaudeSession(Path(tempfile.mkdtemp()), env).ask("the work", "Read", {}), {"ok": 1})
+            self.assertEqual(ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg).ask("the work", "Read", {}), {"ok": 1})
         self.assertIn("waiting for the Claude limit to reset at", told[0])
         self.assertEqual(told[-1], "")
         self.assertIn("--resume s-1", (calls / "calls" / "1.args").read_text())  # the conversation it had begun
@@ -136,7 +143,7 @@ if [ "$n" = 0 ]; then cat {bin_dir}/first; else echo '{done}'; fi
         spares = [{**env, "CLAUDE_CONFIG_DIR": str(spare)}]
         told = []
         with limits.telling(told.append):
-            session = ClaudeSession(cwd, env, spares=spares)
+            session = ClaudeSession(cwd, env, self.cfg, spares=spares)
             started = time.monotonic()
             self.assertEqual(session.ask("the work", "Read", {}), {"ok": 1})
         self.assertLess(time.monotonic() - started, 5)  # no waiting, though its own limit resets in 6 hours
@@ -151,13 +158,13 @@ if [ "$n" = 0 ]; then cat {bin_dir}/first; else echo '{done}'; fi
     def test_a_spare_account_at_its_limit_too_is_not_switched_to(self):
         calls, env = self.fake_claude([self.refused(0.2), self.LIMIT])
         limits.USAGE.record("spare", info(five=0.99))
-        session = ClaudeSession(Path(tempfile.mkdtemp()), env, spares=[{**env, "CLAUDE_CONFIG_DIR": "spare"}])
+        session = ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg, spares=[{**env, "CLAUDE_CONFIG_DIR": "spare"}])
         self.assertEqual(session.ask("the work", "Read", {}), {"ok": 1})  # waited for its own reset
         self.assertEqual((calls / "calls" / "1.dir").read_text().strip(), "acc")
 
     def test_a_request_refused_before_claude_began_is_asked_again(self):
         calls, env = self.fake_claude([self.refused(0.1), self.LIMIT])
-        session = ClaudeSession(Path(tempfile.mkdtemp()), env)
+        session = ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg)
         session.session_id = "s-0"  # an earlier answer of this conversation
         self.assertEqual(session.ask("the work", "Read", {}), {"ok": 1})
         self.assertIn("--resume s-0", (calls / "calls" / "1.args").read_text())
@@ -167,18 +174,18 @@ if [ "$n" = 0 ]; then cat {bin_dir}/first; else echo '{done}'; fi
     def test_a_limit_that_resets_too_late_or_another_error_fails_the_run_as_before(self):
         _, env = self.fake_claude([self.refused(6 * HOUR), self.LIMIT])
         with self.assertRaisesRegex(RuntimeError, "hit your session limit"):
-            ClaudeSession(Path(tempfile.mkdtemp()), env).ask("the work", "Read", {})
+            ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg).ask("the work", "Read", {})
         limits.USAGE.clear()
         _, env = self.fake_claude([{"type": "result", "is_error": True, "result": "Not logged in"}])
         with self.assertRaisesRegex(RuntimeError, "Not logged in"):
-            ClaudeSession(Path(tempfile.mkdtemp()), env).ask("the work", "Read", {})
+            ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg).ask("the work", "Read", {})
 
     def test_a_waiting_run_can_be_stopped(self):
         _, env = self.fake_claude([self.refused(HOUR), self.LIMIT])
         token = CancelToken()
         threading.Timer(0.3, token.cancel).start()
         with self.assertRaises(Cancelled):
-            ClaudeSession(Path(tempfile.mkdtemp()), env, cancel=token).ask("the work", "Read", {})
+            ClaudeSession(Path(tempfile.mkdtemp()), env, self.cfg, cancel=token).ask("the work", "Read", {})
 
 
 if __name__ == "__main__":

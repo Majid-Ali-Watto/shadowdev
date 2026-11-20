@@ -127,7 +127,7 @@ class RestTest(unittest.TestCase):
             response.__enter__.return_value.read.return_value = outcome
             return response
 
-        with mock.patch.object(rest.urllib.request, "urlopen", urlopen), mock.patch.object(rest.time, "sleep") as sleep:
+        with mock.patch.object(rest._direct, "open", urlopen), mock.patch.object(rest.time, "sleep") as sleep:
             try:
                 return rest.request_json(method, "https://x.test/a?b=1", {}), sleep.call_count, outcomes
             except rest.HTTPError as e:
@@ -143,6 +143,24 @@ class RestTest(unittest.TestCase):
         error, sleeps, left = self.call("GET", [TimeoutError("timed out")] * 3)  # unreachable: status 0
         self.assertEqual((error.status, sleeps, left), (0, 2, []))
         self.assertIn("could not be reached", str(error))
+
+
+class PathsTest(unittest.TestCase):
+    """IDs that go into a URL path are checked first: a value with a slash or a dot never reaches the URL."""
+
+    def test_a_site_id_must_look_like_one(self):
+        self.assertEqual(atlassian.jira_api_base("1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d"),
+                         "https://api.atlassian.com/ex/jira/1a2b3c4d-5e6f-7a8b-9c0d-1e2f3a4b5c6d")
+        for bad in ("", "../admin", "a/b", "x?y=1", "a b", "é", "a" * 65):
+            with self.assertRaises(ValueError, msg=bad):
+                atlassian.jira_api_base(bad)
+
+    def test_an_attachment_id_must_be_digits(self):
+        from shadowdev.clients.jira import Jira
+        jira = Jira("https://api.atlassian.com/ex/jira/c1", lambda: "tok")
+        for bad in ("", "1/../2", "12?x=1", "١٢", "1" * 21):
+            with self.assertRaises(ValueError, msg=bad):
+                jira.attachment(bad, 100)
 
 
 if __name__ == "__main__":

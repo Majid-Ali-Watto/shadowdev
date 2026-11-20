@@ -271,6 +271,16 @@ V18_STATUS_RULES = ('[{"from_status": "Ready for Release", "to_status": "Done", 
 V18_AUTO_STATUSES = "To Do, Backlog, Ready for Pickup, Reopened"
 
 
+def statements(script: str):
+    """The SQL statements of a script, one by one (executescript would commit midway)."""
+    buffer = ""
+    for line in script.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            yield buffer
+            buffer = ""
+
+
 def _keep_v18_defaults(db: sqlite3.Connection) -> None:
     """Upgrading to 19: what relied on schema 18's defaults keeps working as it did."""
     db.execute("UPDATE projects SET status_rules = ? WHERE status_rules IS NULL", (V18_STATUS_RULES,))
@@ -283,6 +293,28 @@ def _keep_v18_defaults(db: sqlite3.Connection) -> None:
             settings["auto_statuses"] = V18_AUTO_STATUSES
             db.execute("UPDATE subscriptions SET settings = ? WHERE user_id = ? AND project_id = ?",
                        (json.dumps(settings, sort_keys=True), row["user_id"], row["project_id"]))
+
+
+def _upgrade_schema(db: sqlite3.Connection, version: int) -> None:
+    """Create the tables that are missing, add the columns of the newer schemas and record VERSION: one
+    transaction, DDL included, so a failure leaves the database as it was, at its old version."""
+    db.isolation_level = None  # explicit transaction, not the sqlite3 module's implicit one
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in statements(SCHEMA):
+            db.execute(statement)
+        for table, column, definition in ADDED_COLUMNS:
+            if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")  # noqa: S608 (fixed names above)
+        if 0 < version < 19:
+            _keep_v18_defaults(db)
+        db.execute(f"PRAGMA user_version = {VERSION}")
+        db.execute("COMMIT")
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    finally:
+        db.isolation_level = ""
 
 
 class Database:
@@ -310,14 +342,7 @@ class Database:
             elif version > VERSION:
                 raise SystemExit(f"{path} is from a newer ShadowDev (schema {version}); upgrade ShadowDev")
             else:
-                with db:
-                    db.executescript(SCHEMA)
-                    for table, column, definition in ADDED_COLUMNS:
-                        if column not in {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}:
-                            db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
-                    if 0 < version < 19:
-                        _keep_v18_defaults(db)
-                    db.execute(f"PRAGMA user_version = {VERSION}")
+                _upgrade_schema(db, version)
         path.chmod(0o600)
         self.forget_copies(older_than=time.time() - COPY_DAYS * 86400)
 

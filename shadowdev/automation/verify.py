@@ -45,10 +45,14 @@ class Checkout:
     repo: Repo
     base: str  # branch the work is cut from and the PR goes into
     base_commit: str
-    worktree: Path  # this run's clone
+    clone: gitops.Clone  # this run's clone
     prepared: bool = False  # setup command has run successfully
     baseline: TestRun | None = None  # test run on the untouched base branch
     cancel: CancelToken = NEVER
+
+    @property
+    def worktree(self) -> Path:
+        return self.clone.path
 
 
 def run_command(cwd: Path, command: str, cfg: Config, label: str, cancel: CancelToken = NEVER, **env: str) -> tuple[bool, str]:
@@ -58,7 +62,8 @@ def run_command(cwd: Path, command: str, cfg: Config, label: str, cancel: Cancel
     first_line = command.strip().splitlines()[0]
     log.info("%s: $ %s%s", label, first_line, " …" if "\n" in command.strip() else "")
     started, timeout = time.monotonic(), cfg.command_timeout_seconds
-    argv = ["prlimit", f"--fsize={MAX_FILE_BYTES}", "--core=0", "--", *sandbox.wrap_command(command, cfg, cwd)]
+    argv = [*sandbox.limits_prefix(cfg), "prlimit", f"--fsize={MAX_FILE_BYTES}", "--core=0", "--",
+            *sandbox.wrap_command(command, cfg, cwd)]
     proc = subprocess.Popen(argv, cwd=cwd, env=sandbox.env(Path.home(), **env),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     watchdog = threading.Timer(timeout, proc.kill)
@@ -122,7 +127,7 @@ def measure_baseline(c: Checkout, commit: str, scratch: Path, cfg: Config) -> Te
     outside Claude's workspace."""
     path = scratch / "baseline" / c.repo.name
     label = f"{c.label}: {c.repo.name} baseline on {c.base}"
-    gitops.git(c.worktree, "worktree", "add", "--detach", str(path), commit)
+    gitops.git(c.clone, "worktree", "add", "--detach", str(path), commit)
     try:
         if c.repo.setup:
             ok, output = run_command(path, c.repo.setup, cfg, f"{label}, setup", c.cancel)
@@ -136,7 +141,7 @@ def measure_baseline(c: Checkout, commit: str, scratch: Path, cfg: Config) -> Te
             )
         return run
     finally:
-        gitops.git(c.worktree, "worktree", "remove", "--force", str(path))
+        gitops.git(c.clone, "worktree", "remove", "--force", str(path))
 
 
 class Baselines:
@@ -195,9 +200,9 @@ def check(c: Checkout, scratch: Path, cfg: Config) -> tuple[bool, str]:
         c.baseline = BASELINES.get(c, scratch, cfg)
     scratch.mkdir(parents=True, exist_ok=True)
     index = scratch / f"{c.repo.name}.index"
-    before = gitops.snapshot(c.worktree, index)
+    before = gitops.snapshot(c.clone, index)
     result = _check(c, scratch, cfg)
-    altered = gitops.changed_files(c.worktree, before, gitops.snapshot(c.worktree, index))
+    altered = gitops.changed_files(c.clone, before, gitops.snapshot(c.clone, index))
     if altered:
         raise RuntimeError(f"{c.repo.name}: its setup/test commands changed files that would be committed "
                            f"({', '.join(altered[:10])}); nothing was pushed. Make them leave the code as it is "
@@ -212,17 +217,21 @@ def _check(c: Checkout, scratch: Path, cfg: Config) -> tuple[bool, str]:
             return False, f"[{c.repo.name}] $ {c.repo.setup}\n{output}"
         c.prepared = True
     run = run_tests(c.repo, c.worktree, scratch / "reports" / c.repo.name, cfg, f"{c.label}: {c.repo.name} change, tests", c.cancel)
-    if run.ok:
-        return True, run.output
+    # A report the base branch's tests write and this change's don't is a failure, even at exit 0: the
+    # suite was skipped or lost its reports, so nothing shows it passed.
     missing = c.baseline.reports - run.reports
+    if run.ok and not missing:
+        return True, run.output
     new = sorted(run.failures - c.baseline.failures)
     if run.reports and not missing and not new:
         return True, run.output  # only failures that already exist on the base branch
     problems = []
-    if not run.reports:
+    if not run.ok and not run.reports:
         problems.append("The test command failed before producing any test report.")
     if missing:
-        problems.append(f"No test report from: {', '.join(sorted(missing))} (suite crashed?).")
+        problems.append(f"No test report from: {', '.join(sorted(missing))}, which the base branch's tests write "
+                        + ("(the command exited 0, so its tests were skipped or their reports lost)." if run.ok
+                           else "(suite crashed?)."))
     if new:
         problems.append(f"Tests that pass on {c.base} but fail now:\n" + "\n".join(new[:50]))
     return False, "\n".join(problems) + "\n" + run.output
@@ -231,8 +240,8 @@ def _check(c: Checkout, scratch: Path, cfg: Config) -> tuple[bool, str]:
 def changed_paths(c: Checkout, scratch: Path) -> set[str]:
     """Files the change adds or modifies in the repo, as git names them (relative to the repo)."""
     scratch.mkdir(parents=True, exist_ok=True)
-    tree = gitops.snapshot(c.worktree, scratch / f"{c.repo.name}.paths-index")
-    return set(gitops.changed_files(c.worktree, gitops.git(c.worktree, "rev-parse", "HEAD^{tree}"), tree))
+    tree = gitops.snapshot(c.clone, scratch / f"{c.repo.name}.paths-index")
+    return set(gitops.changed_files(c.clone, gitops.git(c.clone, "rev-parse", "HEAD^{tree}"), tree))
 
 
 def reproduces(c: Checkout, tests: list[str], scratch: Path, cfg: Config) -> list[str]:
@@ -242,7 +251,7 @@ def reproduces(c: Checkout, tests: list[str], scratch: Path, cfg: Config) -> lis
     not reproduce the bug. Needs the baseline, so call it after check()."""
     path = scratch / "regression" / c.repo.name
     label = f"{c.label}: {c.repo.name} regression tests on {c.base}"
-    gitops.git(c.worktree, "worktree", "add", "--detach", str(path), c.base_commit)
+    gitops.git(c.clone, "worktree", "add", "--detach", str(path), c.base_commit)
     try:
         for test in tests:
             source = c.worktree / test
@@ -258,10 +267,10 @@ def reproduces(c: Checkout, tests: list[str], scratch: Path, cfg: Config) -> lis
         run = run_tests(c.repo, path, scratch / "reports" / f"{c.repo.name}.regression", cfg, f"{label}, tests", c.cancel)
         return sorted(run.failures - c.baseline.failures)
     finally:
-        gitops.git(c.worktree, "worktree", "remove", "--force", str(path))
+        gitops.git(c.clone, "worktree", "remove", "--force", str(path))
 
 
 def changed(checkouts: list[Checkout]) -> list[Checkout]:
-    return [c for c in checkouts if gitops.git(c.worktree, "status", "--porcelain")]
+    return [c for c in checkouts if gitops.git(c.clone, "status", "--porcelain")]
 
 

@@ -6,7 +6,7 @@ from ..config import OAUTH_CALLBACK_PATH
 from ..repositories.sessions import SESSION_SECONDS
 from ..services.errors import UserError
 from ..views.auth import continue_page, login_page
-from .request import COOKIE, FormPost, Request, form_action
+from .request import COOKIE, FormPost, Request, Route, form_action
 from .settings import render
 
 # Ties the OAuth callback to the browser that started it, and says what it is for:
@@ -62,6 +62,10 @@ def finish_sign_in(req: Request) -> None:
         return fail(str(e))
     if user:
         return req.redirect(public_url + "/?ok=jira", clear_state)
+    # A new sign-in replaces the browser's previous session: an old cookie must not stay valid.
+    previous = req.cookie(COOKIE)
+    if previous:
+        req.app.sessions.end(previous)
     req.redirect(public_url + "/", clear_state, req.set_cookie(COOKIE, req.app.sessions.create(user_id), SESSION_SECONDS))
 
 
@@ -71,9 +75,11 @@ def sign_out(req: Request, post: FormPost) -> None:
     req.redirect("/", req.set_cookie(COOKIE, "", 0))
 
 
+SIGN_IN_LIMIT = 30  # per client and minute: starting a sign-in, and its callbacks
+
 ROUTES = {
-    ("GET", "/login/jira"): start_sign_in,
-    ("POST", "/jira/connect"): connect_jira,
-    ("GET", OAUTH_CALLBACK_PATH): finish_sign_in,
-    ("POST", "/logout"): sign_out,
+    ("GET", "/login/jira"): Route(start_sign_in, anonymous=True, limit=SIGN_IN_LIMIT),
+    ("POST", "/jira/connect"): Route(connect_jira),
+    ("GET", OAUTH_CALLBACK_PATH): Route(finish_sign_in, anonymous=True, limit=SIGN_IN_LIMIT),
+    ("POST", "/logout"): Route(sign_out),
 }
